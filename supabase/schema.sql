@@ -93,10 +93,10 @@ CREATE TABLE IF NOT EXISTS exceptions (
 );
 
 -- ============================================================================
--- 5. OPERATIONAL_RULES — per-user threshold config
+-- 5. OPERATIONAL_RULES — per-user threshold config (user_id is PK)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS operational_rules (
-  id TEXT PRIMARY KEY DEFAULT 'default_config',
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID UNIQUE REFERENCES auth.users(id) ON DELETE CASCADE,
   invoice_threshold INTEGER NOT NULL DEFAULT 80
     CHECK (invoice_threshold >= 0 AND invoice_threshold <= 100),

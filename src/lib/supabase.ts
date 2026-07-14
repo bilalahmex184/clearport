@@ -120,6 +120,80 @@ export async function invokeEdgeFunction<T = any>(
 }
 
 // ============================================================================
+// API ROUTE HELPERS
+// These wrap fetch() calls to the new /api/* Next.js route handlers.
+// The routes require a Bearer JWT (from the anonymous Supabase session) so
+// they can build a user-scoped client and enforce RLS on every query.
+// ============================================================================
+
+/**
+ * Returns the current session's access token (or null if no session / no
+ * client). Used as the Bearer token for /api/* route calls.
+ */
+export async function getAuthToken(): Promise<string | null> {
+  const client = getSupabase();
+  if (!client) return null;
+  try {
+    const { data: { session } } = await client.auth.getSession();
+    return session?.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Thin fetch() wrapper that:
+ *  1. Ensures the anonymous session exists (so a JWT is available).
+ *  2. Attaches `Authorization: Bearer <jwt>` to every request.
+ *  3. Sets `Content-Type: application/json` for requests with a body.
+ *  4. Throws an Error on non-2xx responses (with the response body text for
+ *     debugging) so callers can try/catch and fall back to seed data.
+ *
+ * Returns the parsed JSON body. For non-JSON responses (e.g. CSV), pass
+ * `raw: true` to get the Response object back instead.
+ */
+export async function apiFetch<T = any>(
+  path: string,
+  options: RequestInit & { raw?: boolean } = {},
+): Promise<T> {
+  const client = getSupabase();
+  if (client) {
+    await ensureAuthenticated();
+  }
+
+  const token = await getAuthToken();
+
+  const headers: Record<string, string> = {
+    ...(options.headers as Record<string, string> || {}),
+  };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  // Only set Content-Type for requests with a body (GET shouldn't set it
+  // because some browsers/proxies complain about a Content-Type with no body).
+  if (options.body && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const res = await fetch(path, { ...options, headers });
+
+  if (!res.ok) {
+    let detail = '';
+    try {
+      detail = await res.text();
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`API ${path} failed (${res.status}): ${detail}`);
+  }
+
+  if (options.raw) {
+    return res as unknown as T;
+  }
+  return res.json() as Promise<T>;
+}
+
+// ============================================================================
 // MAPPING — DB rows (snake_case) → Frontend state (camelCase)
 // ============================================================================
 

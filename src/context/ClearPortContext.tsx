@@ -7,9 +7,7 @@ import {
   ensureAuthenticated,
   getCurrentUserEmail,
   invokeEdgeFunction,
-  fetchShipmentsDirect,
-  fetchRulesDirect,
-  fetchLogsDirect,
+  apiFetch,
   seedEntries,
   seedRules,
   seedLogs,
@@ -135,68 +133,53 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       const email = await getCurrentUserEmail();
       setCurrentUser(email);
 
-      // Try edge function first
+      // Try the new /api/shipments route (replaces both the get-shipments
+      // edge function call AND the fetchShipmentsDirect fallback).
       try {
-        const response = await invokeEdgeFunction<any>('get-shipments');
-        if (response?.success && Array.isArray(response.shipments)) {
-          if (response.shipments.length > 0) {
-            setEntries(response.shipments);
+        const response = await apiFetch<{
+          data: ShipmentEntry[];
+          pagination: { total: number };
+        }>('/api/shipments?page=1&limit=100');
+
+        if (response?.data && Array.isArray(response.data)) {
+          // Only use DB shipments if they have fields/exceptions data (new
+          // schema). Old-schema shipments have empty arrays — fall back to
+          // seed data so the demo UX is preserved.
+          const hasRealData = response.data.some(
+            (s) => s.fields.length > 0 || s.exceptions.length > 0,
+          );
+
+          if (hasRealData) {
+            setEntries(response.data);
             // Select first shipment if current selection doesn't exist
-            if (!response.shipments.find((s: any) => s.id === selectedEntryIdRef.current)) {
-              const first = response.shipments[0];
+            if (!response.data.find((s) => s.id === selectedEntryIdRef.current)) {
+              const first = response.data[0];
               setSelectedEntryId(first.id);
               if (first.exceptions?.length > 0) {
-                const unresolved = first.exceptions.find((e: any) => e.status === 'Unresolved');
+                const unresolved = first.exceptions.find((e) => e.status === 'Unresolved');
                 setSelectedExceptionId(unresolved ? unresolved.id : first.exceptions[0].id);
               }
             }
           }
+          // else: keep seed entries (demo mode)
+
           setEdgeFunctionStatus('live');
           setSupabaseStatus('connected');
 
-          const [dbRules, dbLogs] = await Promise.all([
-            fetchRulesDirect(),
-            fetchLogsDirect(),
+          // Fetch rules + logs in parallel via the new API routes.
+          const [rulesRes, logsRes] = await Promise.all([
+            apiFetch<{ rules: OperationalRules }>('/api/rules').catch(() => null),
+            apiFetch<{ logs: AuditLog[] }>('/api/audit-logs').catch(() => null),
           ]);
-          if (dbRules) setRules(dbRules);
-          if (dbLogs && dbLogs.length > 0) setAuditLogs(dbLogs);
+          if (rulesRes?.rules) setRules(rulesRes.rules);
+          if (logsRes?.logs && logsRes.logs.length > 0) setAuditLogs(logsRes.logs);
           return;
         }
-      } catch (edgeErr) {
-        console.warn('[ctx] Edge function unavailable, trying direct query:', edgeErr);
+      } catch (apiErr) {
+        console.warn('[ctx] /api/shipments failed, falling back to seed data:', apiErr);
       }
 
-      // Fallback: direct query
-      const dbShipments = await fetchShipmentsDirect();
-      if (dbShipments === null) {
-        setSupabaseStatus('error_tables');
-        setEdgeFunctionStatus('fallback');
-        return;
-      }
-
-      // Only use DB shipments if they have fields data (new schema).
-      // Old schema shipments have empty fields/exceptions — fall back to seed data.
-      if (dbShipments.length > 0 && dbShipments.some(s => s.fields.length > 0 || s.exceptions.length > 0)) {
-        setEntries(dbShipments);
-        // Select first shipment if current selection doesn't exist
-        if (!dbShipments.find(s => s.id === selectedEntryIdRef.current)) {
-          const first = dbShipments[0];
-          setSelectedEntryId(first.id);
-          if (first.exceptions.length > 0) {
-            const unresolved = first.exceptions.find(e => e.status === 'Unresolved');
-            setSelectedExceptionId(unresolved ? unresolved.id : first.exceptions[0].id);
-          }
-        }
-      }
-      // else: keep seed entries (demo mode)
-
-      const [dbRules, dbLogs] = await Promise.all([
-        fetchRulesDirect(),
-        fetchLogsDirect(),
-      ]);
-      if (dbRules) setRules(dbRules);
-      if (dbLogs && dbLogs.length > 0) setAuditLogs(dbLogs);
-
+      // Fallback: seed data (demo mode)
       setSupabaseStatus('connected');
       setEdgeFunctionStatus('fallback');
     } catch (err) {
@@ -342,36 +325,19 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         } by ${currentUser}.`;
         addAuditLog(logText, status === 'Rejected' ? 'warning' : 'success', entryId);
 
-        if (isSupabaseConfigured() && supabase) {
-          supabase.from('exceptions').update({
-            status: status as ExceptionStatus,
-            corrected_value: status === 'Corrected' ? newValue : null,
-            resolved_at: new Date().toISOString(),
-            resolved_by: currentUser,
-            history: updatedEntry.exceptions.find(e => e.id === exceptionId)?.history,
-          }).eq('id', exceptionId).then(({ error }) => {
-            if (error) console.warn('[ctx] exception update failed:', error.message);
+        // Persist via the /api/exceptions/:id route (handles exception update,
+        // document_field sync, shipment confidence recompute, and audit log
+        // in one server-side transaction).
+        if (isSupabaseConfigured()) {
+          apiFetch(`/api/exceptions/${exceptionId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              status,
+              correctedValue: status === 'Corrected' ? newValue : undefined,
+            }),
+          }).catch((err) => {
+            console.warn('[ctx] exception update failed:', err instanceof Error ? err.message : err);
           });
-
-          supabase.from('shipments').update({
-            status: updatedEntry.status,
-            current_confidence: updatedEntry.currentConfidence,
-            updated_at: new Date().toISOString(),
-          }).eq('id', entryId).then(({ error }) => {
-            if (error) console.warn('[ctx] shipment update failed:', error.message);
-          });
-
-          const fieldEntry = updatedEntry.fields.find(f => f.exceptionId === exceptionId);
-          if (fieldEntry) {
-            supabase.from('document_fields').update({
-              is_flagged: false,
-              reviewer_action: status,
-              corrected_value: status === 'Corrected' ? newValue : null,
-              updated_at: new Date().toISOString(),
-            }).eq('id', fieldEntry.id).then(({ error }) => {
-              if (error) console.warn('[ctx] field update failed:', error.message);
-            });
-          }
         }
       }
     },
@@ -500,26 +466,18 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           entryId
         );
 
-        if (isSupabaseConfigured() && supabase) {
-          updatedExceptions.forEach(ex => {
-            if (ex.status === 'Accepted' && ex.resolvedAt) {
-              supabase.from('exceptions').update({
-                status: 'Accepted',
-                resolved_at: ex.resolvedAt,
-                resolved_by: currentUser,
-                history: ex.history,
-              }).eq('id', ex.id).then(({ error }) => {
-                if (error) console.warn('[ctx] batch accept failed:', error.message);
-              });
-            }
-          });
-
-          supabase.from('shipments').update({
-            status: newStatus,
-            current_confidence: newConfidence,
-            updated_at: new Date().toISOString(),
-          }).eq('id', entryId).then(({ error }) => {
-            if (error) console.warn('[ctx] batch shipment update failed:', error.message);
+        // Persist via the /api/exceptions/batch-accept route (accepts each
+        // qualifying exception, syncs document_fields, recomputes shipment
+        // confidence + status, and writes a batch-level audit log).
+        if (isSupabaseConfigured()) {
+          apiFetch('/api/exceptions/batch-accept', {
+            method: 'POST',
+            body: JSON.stringify({
+              shipmentId: entryId,
+              threshold: cutoff,
+            }),
+          }).catch((err) => {
+            console.warn('[ctx] batch accept failed:', err instanceof Error ? err.message : err);
           });
         }
 
@@ -720,15 +678,13 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setRules(prev => {
       const updated = { ...prev, ...newRules };
 
-      if (isSupabaseConfigured() && supabase) {
-        supabase.from('operational_rules').upsert({
-          id: 'default_config',
-          invoice_threshold: updated.invoiceThreshold,
-          hts_threshold: updated.htsThreshold,
-          parties_threshold: updated.partiesThreshold,
-          updated_at: new Date().toISOString(),
-        }).then(({ error }) => {
-          if (error) console.warn('[ctx] rules upsert failed:', error.message);
+      // Persist via the /api/rules route (upserts the user's rules row).
+      if (isSupabaseConfigured()) {
+        apiFetch('/api/rules', {
+          method: 'PATCH',
+          body: JSON.stringify(newRules),
+        }).catch((err) => {
+          console.warn('[ctx] rules update failed:', err instanceof Error ? err.message : err);
         });
       }
 
@@ -742,29 +698,34 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const entry = entries.find(e => e.id === entryId);
     if (!entry) return;
 
+    // Try the /api/export/:id route first (generates CSV server-side from the
+    // DB-backed shipment data and returns it as text/csv).
     if (isSupabaseConfigured()) {
       try {
-        const response = await invokeEdgeFunction<any>('export-csv', { shipmentId: entryId });
-        if (response?.csv) {
-          const blob = new Blob([response.csv], { type: 'text/csv' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = `ClearPort_Audit_${entryId}.csv`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
+        const res = await apiFetch<Response>(`/api/export/${entryId}`, { raw: true });
+        if (res.ok) {
+          const csv = await res.text();
+          if (csv) {
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `ClearPort_Audit_${entryId}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
 
-          addAuditLog(`Audit logs exported to CSV for ${entryId}.`, 'success', entryId);
-          return;
+            addAuditLog(`Audit logs exported to CSV for ${entryId}.`, 'success', entryId);
+            return;
+          }
         }
       } catch (err) {
-        console.warn('[csv] edge function failed, generating locally:', err);
+        console.warn('[csv] /api/export failed, generating locally:', err);
       }
     }
 
-    // Fallback: local CSV generation
+    // Fallback: local CSV generation from in-memory entry
     const rows: string[] = [];
     rows.push('Field Key,Field Label,Value,Source Document,Confidence,Flagged,Status');
     entry.fields.forEach(f => {
