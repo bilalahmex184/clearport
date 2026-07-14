@@ -1,0 +1,37 @@
+# Supabase project configuration
+# https://supabase.com/docs/guides/local-development/cloning-projects
+
+project_id = "apfsceomnnhefxkvjhkz"
+
+[functions.upload-document]
+verify_jwt = true
+
+[functions.extract-document]
+verify_jwt = true
+
+[functions.cross-validate]
+verify_jwt = true
+
+[functions.schema-validate]
+verify_jwt = true
+
+[functions.math-validate]
+verify_jwt = true
+
+[functions.flag-exceptions]
+verify_jwt = true
+
+[functions.get-shipments]
+verify_jwt = true
+
+[functions.update-exception]
+verify_jwt = true
+
+[functions.batch-accept]
+verify_jwt = true
+
+[functions.export-csv]
+verify_jwt = true
+
+[functions.get-document-url]
+verify_jwt = true
