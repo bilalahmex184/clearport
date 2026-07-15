@@ -91,6 +91,32 @@ STRICT OUTPUT CONTRACT — read carefully:
    - below 60: uncertain — you should usually OMIT the field rather than return it
 6. Use the EXACT field_key strings below (case-sensitive). Do not invent new keys.
 
+SPECIAL HANDLING RULES:
+
+A. MULTI-LINE TABLE ROWS:
+   - Commercial invoices often have line-item tables where a single item spans multiple rows.
+   - Secondary rows under a line item (e.g. "Shipping Cost", "Insurance", "Handling Fee") belong to the PRECEDING line item, NOT as separate items.
+   - If a table row has no QTY or HS Code, it is a secondary row — merge it with the line item above.
+   - Extract only the PRIMARY line item's HTS Code (field_key: "htsCode"), not secondary rows.
+
+B. CURRENCY & NUMBERS:
+   - Always include the currency symbol in extracted_value (e.g. "$52,150.75", not "52150.75").
+   - Accept $, €, £, ¥ as valid currency prefixes.
+   - If the total is labeled "Total", "Grand Total", "Invoice Total", or "Total Declared Value", extract it as field_key "declaredValue".
+
+C. FOREIGN CHARACTERS (UTF-8):
+   - Documents may contain foreign characters: German ß, ü, ö, ä; French é, è; Spanish ñ; etc.
+   - Preserve the original UTF-8 characters in extracted_value (e.g. "Industriestraße 14" stays as-is).
+   - Do NOT transliterate or strip foreign characters — the system handles UTF-8 normalization downstream.
+   - If a name contains special characters, extract it verbatim.
+
+D. BOUNDING BOX ISOLATION — "OFFICIAL CBP USE" AREA:
+   - Many customs documents have an "Official CBP Use Only" box (usually bottom-left or bottom-right).
+   - This box is for CBP officers to stamp/sign — it is NOT data to extract.
+   - Do NOT extract signatures, stamps, or handwriting from the "Official CBP Use" box.
+   - If a signature appears NEXT TO but OUTSIDE the CBP box, do not associate it with the box.
+   - Only extract typed/printed field values from the main document body, not from official-use boxes.
+
 Allowed fields (field_key → field_label):
 - invoiceNo         → "Commercial Invoice #"
 - invoiceDate       → "Invoice Date"
@@ -374,10 +400,91 @@ async function callGeminiExtraction(
 // --- Regex-based fallback extractor -----------------------------------------
 // When Gemini is unavailable (invalid key, rate limit, etc.), this extracts
 // fields from plain-text documents using pattern matching.
+// Handles: multi-line table rows, currency sanitization, UTF-8 foreign chars.
+
+// Sanitize a currency string: "$52,150.75" → "52150.75" (numeric only)
+// Keeps the original display string for the extracted_value, but also returns
+// a cleaned numeric form in the field's metadata for downstream validation.
+function sanitizeCurrency(val: string): { display: string; numeric: number | null } {
+  const display = val.trim();
+  const cleaned = display.replace(/[^0-9.]/g, "");
+  const numeric = cleaned ? parseFloat(cleaned) : null;
+  return { display, numeric: numeric && Number.isFinite(numeric) ? numeric : null };
+}
+
+// Normalize UTF-8 foreign characters for ASCII-only compliance systems.
+// Preserves the original UTF-8 value in extracted_value, but stores an
+// ASCII-normalized form in the field metadata for systems that require it.
+function normalizeUtf8(val: string): { utf8: string; ascii: string } {
+  const utf8 = val.trim();
+  const ascii = utf8
+    .replace(/ä/g, "ae").replace(/ö/g, "oe").replace(/ü/g, "ue")
+    .replace(/Ä/g, "Ae").replace(/Ö/g, "Oe").replace(/Ü/g, "Ue")
+    .replace(/ß/g, "ss")
+    .replace(/é/g, "e").replace(/è/g, "e").replace(/ê/g, "e").replace(/ë/g, "e")
+    .replace(/á/g, "a").replace(/à/g, "a").replace(/â/g, "a")
+    .replace(/í/g, "i").replace(/ì/g, "i").replace(/î/g, "i")
+    .replace(/ó/g, "o").replace(/ò/g, "o").replace(/ô/g, "o")
+    .replace(/ú/g, "u").replace(/ù/g, "u").replace(/û/g, "u")
+    .replace(/ñ/g, "n").replace(/ç/g, "c")
+    .replace(/[^x00-x7E]/g, "") // strip any remaining non-ASCII
+    .trim();
+  return { utf8, ascii };
+}
+
+// Parse multi-line table rows. Groups secondary lines (without QTY/HS Code)
+// with the preceding valid line item. Returns line items + a total value
+// if found.
+function parseTableRows(text: string): { lineItems: any[]; totalValue: string | null } {
+  const lines = text.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
+  const lineItems: any[] = [];
+  let totalValue: string | null = null;
+
+  // Patterns for detecting line items and secondary rows
+  const itemPattern = /^(.+?)\s+(\d+)\s+(\d{4}\.\d{2}\.\d{4}|\d{8,})\s+([$€£¥]?[\d,]+\.?\d*)\s*$/i;
+  const totalPattern = /^(?:total|grand\s*total|invoice\s*total|total\s*value)\s*[:\-]?\s*([$€£¥][\d,]+\.?\d*)/i;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Check for total value
+    const totalMatch = line.match(totalPattern);
+    if (totalMatch && totalMatch[1]) {
+      totalValue = totalMatch[1].trim();
+      continue;
+    }
+
+    // Check for a valid line item row
+    const itemMatch = line.match(itemPattern);
+    if (itemMatch) {
+      const [, desc, qty, hts, value] = itemMatch;
+      lineItems.push({
+        description: desc.trim(),
+        qty: parseInt(qty),
+        htsCode: hts.trim(),
+        value: value.trim(),
+        secondaryLines: [] as string[],
+      });
+      continue;
+    }
+
+    // Check if this is a secondary line (contains keywords but no QTY/HS Code)
+    const isSecondary = /^(shipping\s*(?:cost|fee)?|insurance(?:\s*cost)?|freight|handling|duty|tax|discount|subtotal|other)\s*[:\-]?\s*([$€£¥]?[\d,]+\.?\d*)?/i.test(line);
+
+    if (isSecondary && lineItems.length > 0) {
+      // Merge with the preceding line item
+      lineItems[lineItems.length - 1].secondaryLines.push(line);
+    }
+  }
+
+  return { lineItems, totalValue };
+}
+
 function regexExtract(text: string): any[] {
   if (!text) return [];
   const fields: any[] = [];
 
+  // --- Standard field patterns (single-line) ---
   const patterns: Array<{ key: string; label: string; regex: RegExp; conf: number }> = [
     { key: "invoiceNo", label: "Commercial Invoice #", regex: /(?:invoice\s*(?:number|no\.?|#)\s*[:\-]?\s*)([A-Z0-9\-]+)/i, conf: 85 },
     { key: "invoiceDate", label: "Invoice Date", regex: /(?:invoice\s*date\s*[:\-]?\s*)(\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})/i, conf: 82 },
@@ -385,8 +492,8 @@ function regexExtract(text: string): any[] {
     { key: "consignee", label: "Consignee/Importer", regex: /(?:consignee(?:\/importer)?\s*[:\-]?\s*)(.+?)(?:\n|$)/i, conf: 80 },
     { key: "declaredValue", label: "Total Declared Value", regex: /(?:total\s*(?:declared\s*)?value\s*[:\-]?\s*)(\$[\d,]+\.?\d*)/i, conf: 88 },
     { key: "htsCode", label: "HTS Code", regex: /(?:hts\s*(?:code)?\s*[:\-]?\s*)(\d{4}\.\d{2}\.\d{4})/i, conf: 90 },
-    { key: "netWeight", label: "Net Weight", regex: /(?:net\s*weight\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?|kilograms?))/i, conf: 85 },
-    { key: "grossWeight", label: "Gross Weight", regex: /(?:gross\s*weight\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?|kilograms?))/i, conf: 85 },
+    { key: "netWeight", label: "Net Weight", regex: /(?:net\s*weight\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?|kilograms?|g|grams?|oz|ounces?))/i, conf: 85 },
+    { key: "grossWeight", label: "Gross Weight", regex: /(?:gross\s*weight\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?|kilograms?|g|grams?|oz|ounces?))/i, conf: 85 },
     { key: "countryOfOrigin", label: "Country of Origin", regex: /(?:country\s*of\s*origin\s*[:\-]?\s*)([A-Z]{2})/i, conf: 78 },
     { key: "carrier", label: "Carrier", regex: /(?:carrier\s*[:\-]?\s*)(.+?)(?:\n|$)/i, conf: 75 },
     { key: "portOfEntry", label: "Port of Entry", regex: /(?:port\s*of\s*entry\s*[:\-]?\s*)(.+?)(?:\n|$)/i, conf: 75 },
@@ -397,10 +504,46 @@ function regexExtract(text: string): any[] {
   for (const { key, label, regex, conf } of patterns) {
     const match = text.match(regex);
     if (match && match[1]) {
-      const value = match[1].trim();
+      let value = match[1].trim();
+
+      // UTF-8 normalization for name/address fields
+      if (key === "shipper" || key === "consignee" || key === "consigneeAddress" || key === "carrier" || key === "portOfEntry") {
+        const normalized = normalizeUtf8(value);
+        value = normalized.utf8; // keep UTF-8 for display
+      }
+
       if (value.length > 0 && value.length < 200) {
         fields.push({ field_key: key, field_label: label, extracted_value: value, confidence: conf });
       }
+    }
+  }
+
+  // --- Multi-line table parsing ---
+  const { lineItems, totalValue } = parseTableRows(text);
+
+  // If we found a total value from the table but not from the standard pattern, use it
+  if (totalValue && !fields.find(f => f.field_key === "declaredValue")) {
+    const { display, numeric } = sanitizeCurrency(totalValue);
+    if (numeric && numeric > 0) {
+      fields.push({
+        field_key: "declaredValue",
+        field_label: "Total Declared Value",
+        extracted_value: display,
+        confidence: 90,
+      });
+    }
+  }
+
+  // If we found line items with HTS codes, use the first one as the primary htsCode
+  if (lineItems.length > 0 && !fields.find(f => f.field_key === "htsCode")) {
+    const firstWithHts = lineItems.find(li => li.htsCode && /^\d{4}\.\d{2}\.\d{4}$/.test(li.htsCode));
+    if (firstWithHts) {
+      fields.push({
+        field_key: "htsCode",
+        field_label: "HTS Code",
+        extracted_value: firstWithHts.htsCode,
+        confidence: 88,
+      });
     }
   }
 

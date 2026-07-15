@@ -39,6 +39,7 @@ export default function ExceptionDesk() {
   const [rotation, setRotation] = React.useState(0);
   const [showHistory, setShowHistory] = React.useState(false);
   const [documentUrl, setDocumentUrl] = React.useState<string | null>(null);
+  const [documentMime, setDocumentMime] = React.useState<string>('');
   const [isLoadingUrl, setIsLoadingUrl] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
 
@@ -46,6 +47,7 @@ export default function ExceptionDesk() {
   React.useEffect(() => {
     if (!selectedEntry || !activeDocTab) {
       setDocumentUrl(null);
+      setDocumentMime('');
       return;
     }
 
@@ -53,12 +55,14 @@ export default function ExceptionDesk() {
     const doc = selectedEntry.documents.find(d => d.docType === activeDocTab);
     if (!doc) {
       setDocumentUrl(null);
+      setDocumentMime('');
       return;
     }
 
     let cancelled = false;
     setIsLoadingUrl(true);
     setDocumentUrl(null);
+    setDocumentMime(doc.mimeType || '');
 
     (async () => {
       try {
@@ -382,7 +386,7 @@ export default function ExceptionDesk() {
         {/* Document Board — shows real uploaded file or extracted data view */}
         <div className="flex-1 overflow-auto bg-[#040406] p-6 flex items-start justify-center relative">
           {documentUrl ? (
-            /* Real file viewer — show the actual uploaded document */
+            /* Real file viewer — show the actual uploaded document based on MIME type */
             <div
               style={{
                 transform: `scale(${zoomLevel / 100}) rotate(${rotation}deg)`,
@@ -391,15 +395,50 @@ export default function ExceptionDesk() {
               }}
               className="rounded border border-gray-700 shadow-2xl overflow-hidden bg-white relative"
             >
-              {documentUrl.endsWith('.txt') || documentUrl.includes('text/plain') ? (
-                /* Text file — show as preformatted text */
-                <iframe src={documentUrl} className="w-[500px] h-[600px] bg-white" title="Document" />
-              ) : documentUrl.includes('.pdf') || documentUrl.includes('application/pdf') ? (
-                /* PDF — show in iframe */
-                <iframe src={documentUrl} className="w-[500px] h-[600px] bg-white" title="Document PDF" />
+              {documentMime.startsWith('text/') ? (
+                /* Text file — show in iframe with monospace styling */
+                <iframe
+                  src={documentUrl}
+                  className="w-[500px] h-[600px] bg-white"
+                  title="Document text"
+                  style={{ fontFamily: 'monospace', fontSize: '12px' }}
+                />
+              ) : documentMime === 'application/pdf' ? (
+                /* PDF — show in iframe (browser's built-in PDF viewer) */
+                <iframe
+                  src={documentUrl}
+                  className="w-[500px] h-[600px] bg-white"
+                  title="Document PDF"
+                />
+              ) : documentMime.startsWith('image/') ? (
+                /* Image (PNG, JPEG, TIFF) — show directly with zoom/rotate */
+                <img
+                  src={documentUrl}
+                  alt={`Document: ${activeDocTab}`}
+                  className="max-w-[500px] max-h-[600px] object-contain"
+                  onError={(e) => {
+                    console.warn('[doc-viewer] image failed to load:', documentUrl);
+                  }}
+                />
               ) : (
-                /* Image — show directly */
-                <img src={documentUrl} alt="Document" className="max-w-[500px] max-h-[600px] object-contain" />
+                /* Unknown type — provide download link */
+                <div className="w-[500px] h-[600px] flex flex-col items-center justify-center bg-gray-50 p-8 text-center">
+                  <FileText className="w-16 h-16 text-gray-400 mb-4" />
+                  <p className="text-sm font-semibold text-gray-700 mb-2">
+                    {activeDocTab || 'Document'}
+                  </p>
+                  <p className="text-xs text-gray-500 mb-4">
+                    Preview not available for this file type ({documentMime || 'unknown'})
+                  </p>
+                  <a
+                    href={documentUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-xs bg-amber-500 hover:bg-amber-600 text-black font-bold px-4 py-2 rounded-lg transition-all"
+                  >
+                    Download File
+                  </a>
+                </div>
               )}
 
               {/* Highlighted bounding box overlay */}
@@ -444,9 +483,30 @@ export default function ExceptionDesk() {
                     {selectedEntry.id} • {selectedEntry.documents.length} file(s) uploaded
                   </p>
                 </div>
-                <span className="text-[9px] font-mono bg-amber-950/40 text-amber-400 border border-amber-900/40 px-2 py-0.5 rounded uppercase">
-                  Structured Extract
-                </span>
+                <div className="flex items-center gap-2">
+                  {selectedEntry.documents.length > 0 && (
+                    <button
+                      onClick={() => {
+                        const doc = selectedEntry.documents.find(d => d.docType === activeDocTab) || selectedEntry.documents[0];
+                        if (doc) {
+                          setActiveDocTab(doc.docType);
+                          // Trigger re-fetch by changing tab
+                          setDocumentUrl(null);
+                          // Re-run the effect by toggling
+                          setTimeout(() => setActiveDocTab(doc.docType), 10);
+                        }
+                      }}
+                      className="flex items-center gap-1 text-[9px] font-mono text-amber-400 border border-amber-900/40 px-2 py-1 rounded hover:bg-amber-950/30 transition-all"
+                      title="Load original file"
+                    >
+                      <Eye className="w-3 h-3" />
+                      VIEW FILE
+                    </button>
+                  )}
+                  <span className="text-[9px] font-mono bg-amber-950/40 text-amber-400 border border-amber-900/40 px-2 py-0.5 rounded uppercase">
+                    Structured Extract
+                  </span>
+                </div>
               </div>
 
               <div className="space-y-2">
