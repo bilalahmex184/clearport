@@ -620,28 +620,25 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         console.warn('[extract] edge function failed:', err);
       }
 
-      // Step 4: Call the validation chain (schema-validate, math-validate, flag-exceptions)
-      // These run server-side and update the DB directly
-      try {
-        await invokeEdgeFunction('schema-validate', { shipmentId }).catch(() => {});
-      } catch (err) {
-        console.warn('[schema-validate] failed:', err);
-      }
-      try {
-        await invokeEdgeFunction('math-validate', { shipmentId }).catch(() => {});
-      } catch (err) {
-        console.warn('[math-validate] failed:', err);
-      }
-      try {
-        await invokeEdgeFunction('cross-validate', { shipmentId }).catch(() => {});
-      } catch (err) {
-        console.warn('[cross-validate] failed:', err);
-      }
-      try {
-        await invokeEdgeFunction('flag-exceptions', { shipmentId }).catch(() => {});
-      } catch (err) {
-        console.warn('[flag-exceptions] failed:', err);
-      }
+      // Step 4: Call the validation chain IN PARALLEL (not sequential)
+      // schema-validate, math-validate, cross-validate are independent → run together
+      // flag-exceptions runs after (it needs the validated fields)
+      // Fire-and-forget — don't block the UI on validation
+      const validationChain = (async () => {
+        try {
+          // Run the 3 independent validators in parallel
+          await Promise.allSettled([
+            invokeEdgeFunction('schema-validate', { shipmentId }),
+            invokeEdgeFunction('math-validate', { shipmentId }),
+            invokeEdgeFunction('cross-validate', { shipmentId }),
+          ]);
+          // Then run flag-exceptions (depends on validated fields)
+          await invokeEdgeFunction('flag-exceptions', { shipmentId }).catch(() => {});
+        } catch (err) {
+          console.warn('[validation-chain] error:', err);
+        }
+      })();
+      // Don't await — let validation run in the background
 
       // Step 5: Reload from API to get the real DB state (with fields, exceptions, documents)
       if (extractedFields.length > 0) {

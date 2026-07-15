@@ -330,7 +330,7 @@ async function callGeminiExtraction(
             config: generationConfig,
           }),
           new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error(`TIMEOUT_30s after 30000ms`)), 30000)
+            setTimeout(() => reject(new Error(`TIMEOUT_15s after 15000ms`)), 15000)
           ),
         ]);
 
@@ -374,8 +374,17 @@ async function callGeminiExtraction(
           /SERVICE_UNAVAILABLE/i.test(errMsg) ||
           /RESOURCE_EXHAUSTED/i.test(errMsg);
 
-        if (isRetryable && attempt < 2) {
-          const delay = Math.pow(2, attempt) * 1000; // 1s, 2s
+        // If quota exhausted (429), skip ALL remaining models — they share the same quota.
+        // Go straight to regex fallback to avoid wasting 15+ seconds on retries.
+        const isQuotaExhausted = /429/.test(errMsg) || /RESOURCE_EXHAUSTED/i.test(errMsg) || /quota/i.test(errMsg);
+        if (isQuotaExhausted) {
+          debug.errors.push(`${model}: quota exhausted — skipping remaining models, using regex fallback`);
+          debug.quotaExhausted = true;
+          return { fields: [], debug, model: null, rawResponse: null };
+        }
+
+        if (isRetryable && attempt < 1) {  // Reduced from 2 to 1 retry
+          const delay = 1000; // Fixed 1s delay (was exponential)
           debug.retries.push({ model, attempt: attempt + 1, delayMs: delay, reason: errMsg });
           await new Promise((r) => setTimeout(r, delay));
           continue;
@@ -383,7 +392,7 @@ async function callGeminiExtraction(
 
         // Non-retryable error (incl. TIMEOUT_30s) — break out of retry loop
         // and fall through to the next model.
-        if (errMsg.startsWith("TIMEOUT_30s")) {
+        if (errMsg.startsWith("TIMEOUT_15s")) {
           debug.errors.push(`${model}: timed out after 30s, falling back to next model`);
         }
         break;
