@@ -2,17 +2,17 @@
 // /api/shipments/[id] — single-shipment CRUD
 // ============================================================================
 //
-// GET    /api/shipments/[id]                → { shipment: ShipmentEntry }
+// GET    /api/shipments/[id]                → { shipment: ShipmentEntry }   (viewer)
 // PATCH  /api/shipments/[id]  { shipper?, consignee?, status?, urgency? }
-//                                            → { shipment: DbShipment }
-// DELETE /api/shipments/[id]                → { success: true }
+//                                            → { shipment: DbShipment }     (operator)
+// DELETE /api/shipments/[id]                → { success: true }             (admin)
 //
 // In Next.js 16, dynamic-route params are a Promise and must be awaited.
+// All queries are filtered by the active org_id from `requireOrgRole()`.
 // ============================================================================
 
 import { NextResponse } from 'next/server';
-import { requireUserClient, getUserRole, getUserEmail } from '@/lib/services/auth.service';
-import { canEdit, isAdmin } from '@/lib/services/rbac.service';
+import { requireOrgRole, getUserEmail } from '@/lib/services/auth.service';
 import {
   getShipmentById,
   updateShipment,
@@ -33,14 +33,15 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { client } = await requireUserClient(req);
+    const { client, orgId, role } = await requireOrgRole(req, 'viewer');
     const { id } = await params;
 
-    const shipment = await getShipmentById(client, id);
+    const shipment = await getShipmentById(client, id, orgId);
     if (!shipment) {
-      throw new AppError(`Shipment not found: ${id}`, 404, 'NOT_FOUND', { id });
+      throw new AppError(`Shipment not found: ${id}`, 404, 'NOT_FOUND', { id, orgId });
     }
 
+    logger.debug('Shipment detail fetched', { shipmentId: id, orgId, role });
     return NextResponse.json({ shipment });
   } catch (err) {
     return errorResponse(err);
@@ -56,17 +57,8 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { user, client } = await requireUserClient(req);
+    const { user, client, orgId, role } = await requireOrgRole(req, 'operator');
     const { id } = await params;
-
-    // RBAC: editing shipment metadata requires the 'edit' permission.
-    const role = getUserRole(user);
-    if (!canEdit(role)) {
-      return NextResponse.json(
-        { error: 'Insufficient permissions', code: 'FORBIDDEN' },
-        { status: 403 },
-      );
-    }
 
     const body = await req.json().catch(() => null);
     if (!body) {
@@ -91,7 +83,17 @@ export async function PATCH(
     if (parsed.data.status !== undefined) patch.status = parsed.data.status;
     if (parsed.data.urgency !== undefined) patch.urgency = parsed.data.urgency;
 
-    const shipment = await updateShipment(client, id, patch);
+    // Scope the update by orgId so a cross-org PATCH returns 404 instead of
+    // silently no-op'ing.
+    const shipment = await updateShipment(client, id, patch, orgId);
+
+    logger.info('Shipment updated via API', {
+      shipmentId: id,
+      orgId,
+      role,
+      user: getUserEmail(user),
+    });
+
     return NextResponse.json({ shipment });
   } catch (err) {
     return errorResponse(err);
@@ -107,20 +109,11 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { user, client } = await requireUserClient(req);
+    const { user, client, orgId, role } = await requireOrgRole(req, 'admin');
     const { id } = await params;
 
-    // RBAC: hard-delete is admin-only. operator/viewer get 403 so they
-    // can't accidentally purge a shipment + its exceptions + audit trail.
-    const role = getUserRole(user);
-    if (!isAdmin(role)) {
-      return NextResponse.json(
-        { error: 'Insufficient permissions: admin role required', code: 'FORBIDDEN' },
-        { status: 403 },
-      );
-    }
-
-    await deleteShipment(client, id);
+    // Scope the delete by orgId so a cross-org DELETE returns 404.
+    await deleteShipment(client, id, orgId);
 
     // Audit the destructive action BEFORE the FK cascade wipes the audit_logs
     // rows for this shipment. (Best-effort — the delete already succeeded.)
@@ -128,6 +121,13 @@ export async function DELETE(
       logger.warn('shipments DELETE: audit log failed', {
         error: err instanceof Error ? err.message : String(err),
       });
+    });
+
+    logger.info('Shipment deleted via API', {
+      shipmentId: id,
+      orgId,
+      role,
+      user: getUserEmail(user),
     });
 
     return NextResponse.json({ success: true });

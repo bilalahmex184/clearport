@@ -60,21 +60,30 @@ function wrapDbError(action: string, message: string): AppError {
 
 export async function getShipments(
   client: SupabaseClient,
-  options: { page?: number; limit?: number } = {},
+  options: { page?: number; limit?: number; orgId?: string } = {},
 ): Promise<PaginatedResult<ShipmentEntry>> {
   const page = Math.max(1, options.page || 1);
   const limit = Math.min(100, Math.max(1, options.limit || 20));
   const offset = (page - 1) * limit;
 
+  let query = client
+    .from('shipments')
+    .select('*', { count: 'exact' })
+    .order('created_at', { ascending: false });
+
+  // Org-scoped filter — restricts results to the currently selected org so
+  // a user who belongs to multiple orgs only sees the active org's data.
+  // RLS already enforces org membership; this filter is for the active-org
+  // view + uses the idx_shipments_org_id index for efficiency.
+  if (options.orgId) {
+    query = query.eq('org_id', options.orgId);
+  }
+
   const {
     data: shipments,
     error,
     count,
-  } = await client
-    .from('shipments')
-    .select('*', { count: 'exact' })
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
+  } = await query.range(offset, offset + limit - 1);
 
   if (error) {
     logger.error('ShipmentService: fetch shipments failed', {
@@ -145,12 +154,16 @@ export async function getShipments(
 export async function getShipmentById(
   client: SupabaseClient,
   shipmentId: string,
+  orgId?: string,
 ): Promise<ShipmentEntry | null> {
-  const { data: shipment, error } = await client
+  let query = client
     .from('shipments')
     .select('*')
-    .eq('id', shipmentId)
-    .maybeSingle();
+    .eq('id', shipmentId);
+  if (orgId) {
+    query = query.eq('org_id', orgId);
+  }
+  const { data: shipment, error } = await query.maybeSingle();
 
   if (error) {
     logger.error('ShipmentService: fetch single shipment failed', {
@@ -207,13 +220,17 @@ export interface CreateShipmentInput {
   consignee: string;
   docsCount?: number;
   urgency?: string;
+  /** Org to scope the new shipment to. The DB trigger auto-fills this from
+   *  the user's first membership if omitted, but callers that already know
+   *  the active org context should pass it explicitly. */
+  orgId?: string;
 }
 
 export async function createShipment(
   client: SupabaseClient,
   data: CreateShipmentInput,
 ): Promise<DbShipment> {
-  const payload = {
+  const payload: Record<string, unknown> = {
     id: data.id,
     shipper: data.shipper,
     consignee: data.consignee,
@@ -225,6 +242,9 @@ export async function createShipment(
     current_confidence: 0,
     status: 'Under Review',
   };
+  if (data.orgId) {
+    payload.org_id = data.orgId;
+  }
 
   const { data: created, error } = await client
     .from('shipments')
@@ -256,6 +276,7 @@ export async function updateShipment(
   client: SupabaseClient,
   shipmentId: string,
   data: Partial<DbShipment>,
+  orgId?: string,
 ): Promise<DbShipment> {
   // Only allow known-safe columns to be updated through this path.
   const allowed: Array<keyof DbShipment> = [
@@ -276,12 +297,17 @@ export async function updateShipment(
   }
   patch.updated_at = new Date().toISOString();
 
-  const { data: updated, error } = await client
+  let query = client
     .from('shipments')
     .update(patch)
-    .eq('id', shipmentId)
-    .select()
-    .maybeSingle();
+    .eq('id', shipmentId);
+  if (orgId) {
+    // Defense-in-depth: even though RLS already blocks cross-org writes,
+    // scoping the UPDATE by org_id means a cross-org attempt returns a
+    // 404 (no row matched) instead of silently no-op'ing.
+    query = query.eq('org_id', orgId);
+  }
+  const { data: updated, error } = await query.select().maybeSingle();
 
   if (error) {
     logger.error('ShipmentService: update shipment failed', {
@@ -309,11 +335,16 @@ export async function updateShipment(
 export async function deleteShipment(
   client: SupabaseClient,
   shipmentId: string,
+  orgId?: string,
 ): Promise<void> {
-  const { error } = await client
+  let query = client
     .from('shipments')
     .delete()
     .eq('id', shipmentId);
+  if (orgId) {
+    query = query.eq('org_id', orgId);
+  }
+  const { error } = await query;
 
   if (error) {
     logger.error('ShipmentService: delete shipment failed', {

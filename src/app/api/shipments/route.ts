@@ -4,17 +4,18 @@
 //
 // GET  /api/shipments?page=1&limit=20
 //   → { data: ShipmentEntry[], pagination: { page, limit, total, totalPages } }
+//   (RBAC: viewer — filtered by the active org from X-Org-Id header)
 //
 // POST /api/shipments  { shipper, consignee, docsCount?, urgency? }
 //   → { shipment: DbShipment }
+//   (RBAC: operator — new shipment is created in the active org)
 //
-// All queries go through a user-scoped Supabase client (RLS enforced) built
-// from the caller's Bearer JWT via requireUserClient().
+// All queries go through a user-scoped Supabase client (RLS enforced) and
+// are additionally filtered by the active org_id from `requireOrgRole()`.
 // ============================================================================
 
 import { NextResponse } from 'next/server';
-import { requireUserClient, getUserEmail, getUserRole } from '@/lib/services/auth.service';
-import { canUpload } from '@/lib/services/rbac.service';
+import { requireOrgRole, getUserEmail } from '@/lib/services/auth.service';
 import {
   getShipments,
   createShipment,
@@ -28,12 +29,12 @@ import { errorResponse } from '@/lib/utils/error-handler';
 import { logger } from '@/lib/utils/logger';
 
 // ---------------------------------------------------------------------------
-// GET — paginated list
+// GET — paginated list (viewer)
 // ---------------------------------------------------------------------------
 
 export async function GET(req: Request) {
   try {
-    const { client } = await requireUserClient(req);
+    const { client, orgId, role } = await requireOrgRole(req, 'viewer');
 
     const url = new URL(req.url);
     const parsed = paginationSchema.safeParse({
@@ -50,6 +51,14 @@ export async function GET(req: Request) {
     const result = await getShipments(client, {
       page: parsed.data.page,
       limit: parsed.data.limit,
+      orgId,
+    });
+
+    logger.debug('Shipments list fetched', {
+      orgId,
+      role,
+      page: parsed.data.page,
+      total: result.pagination.total,
     });
 
     return NextResponse.json(result);
@@ -59,21 +68,12 @@ export async function GET(req: Request) {
 }
 
 // ---------------------------------------------------------------------------
-// POST — create a new shipment row
+// POST — create a new shipment row (operator)
 // ---------------------------------------------------------------------------
 
 export async function POST(req: Request) {
   try {
-    const { user, client } = await requireUserClient(req);
-
-    // RBAC: creating a shipment is considered an upload action.
-    const role = getUserRole(user);
-    if (!canUpload(role)) {
-      return NextResponse.json(
-        { error: 'Insufficient permissions', code: 'FORBIDDEN' },
-        { status: 403 },
-      );
-    }
+    const { user, client, orgId, role } = await requireOrgRole(req, 'operator');
 
     const body = await req.json().catch(() => null);
     if (!body) {
@@ -103,12 +103,17 @@ export async function POST(req: Request) {
       consignee: parsed.data.consignee,
       docsCount: parsed.data.docsCount,
       urgency: parsed.data.urgency,
+      // Scope the new shipment to the active org so it shows up in the
+      // org-filtered GET /api/shipments list.
+      orgId,
     };
 
     const shipment = await createShipment(client, input);
 
     logger.info('Shipment created via API', {
       shipmentId: shipment.id,
+      orgId,
+      role,
       user: getUserEmail(user),
     });
 

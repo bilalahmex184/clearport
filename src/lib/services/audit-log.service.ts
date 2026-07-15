@@ -58,7 +58,7 @@ export async function insertAuditLog(
  */
 export async function getAuditLogs(
   client: SupabaseClient,
-  options: { limit?: number; shipmentId?: string } = {},
+  options: { limit?: number; shipmentId?: string; orgId?: string } = {},
 ): Promise<AuditLog[]> {
   const limit = Math.min(200, Math.max(1, options.limit ?? 50));
 
@@ -70,6 +70,12 @@ export async function getAuditLogs(
 
   if (options.shipmentId) {
     query = query.eq('shipment_id', options.shipmentId);
+  }
+  // Org-scoped filter — restricts audit log to the currently selected org.
+  // RLS already enforces org membership; this filter is for the active-org
+  // view + uses the idx_audit_logs_org_id index.
+  if (options.orgId) {
+    query = query.eq('org_id', options.orgId);
   }
 
   const { data, error } = await query;

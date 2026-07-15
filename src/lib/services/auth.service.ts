@@ -9,7 +9,7 @@
 import { createClient, type SupabaseClient, type User } from '@supabase/supabase-js';
 import { AppError } from '@/lib/utils/error-handler';
 import { logger } from '@/lib/utils/logger';
-import { getDefaultRole, type UserRole } from '@/lib/services/rbac.service';
+import { type UserRole } from '@/lib/services/rbac.service';
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -18,9 +18,6 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
  * Build a Supabase client scoped to the caller's JWT. RLS policies on every
  * table use `auth.uid()` so all queries issued through this client are
  * automatically restricted to the user's own rows.
- *
- * Returns null if no Authorization header is present (caller decides whether
- * that's an error — see requireUser).
  */
 export function createUserClient(authHeader: string | null): SupabaseClient | null {
   if (!authHeader || !supabaseUrl || !supabaseAnonKey) return null;
@@ -31,9 +28,8 @@ export function createUserClient(authHeader: string | null): SupabaseClient | nu
 }
 
 /**
- * Resolve the authenticated user (if any) from the Authorization header on
- * an incoming Request. Returns null for unauthenticated / invalid tokens
- * rather than throwing, so callers can layer on requireUser() when needed.
+ * Resolve the authenticated user (if any) from the Authorization header.
+ * Returns null for unauthenticated / invalid tokens.
  */
 export async function getUser(req: Request): Promise<User | null> {
   const authHeader = req.headers.get('authorization');
@@ -57,8 +53,7 @@ export async function getUser(req: Request): Promise<User | null> {
 }
 
 /**
- * Require an authenticated user. Throws AppError(401) when absent so route
- * handlers can let the error propagate to errorResponse().
+ * Require an authenticated user. Throws AppError(401) when absent.
  */
 export async function requireUser(req: Request): Promise<User> {
   const user = await getUser(req);
@@ -69,9 +64,7 @@ export async function requireUser(req: Request): Promise<User> {
 }
 
 /**
- * Build a Supabase client for a request that must be authenticated. Returns
- * both the user and the user-scoped client so the caller doesn't need to
- * re-parse the Authorization header.
+ * Build a Supabase client for a request that must be authenticated.
  */
 export async function requireUserClient(
   req: Request,
@@ -90,8 +83,7 @@ export async function requireUserClient(
 }
 
 /**
- * Best-effort user email for audit logging. Anonymous users don't have an
- * email attached, so synthesize a stable identifier from their UUID.
+ * Best-effort user email for audit logging.
  */
 export function getUserEmail(user: User): string {
   if (user.email) return user.email;
@@ -99,19 +91,109 @@ export function getUserEmail(user: User): string {
   return `anon-${shortId}@clearport.local`;
 }
 
+// ============================================================================
+// ORG-SCOPED RBAC
+// ============================================================================
+
 /**
- * Resolve the user's RBAC role.
- *
- * In production this would query a `user_roles` table (e.g.
- * `SELECT role FROM user_roles WHERE user_id = auth.uid()`) or read a custom
- * claim from the JWT set by an external IdP (Supabase custom claims, Auth0,
- * Okta). For now, anonymous users get the 'operator' role by default so the
- * no-login UX is preserved while the RBAC framework is in place.
- *
- * The `user` parameter is accepted (not used today) so callers don't have to
- * change their signatures once we wire up real role lookup.
+ * Resolve the org_id for the current request.
+ * Reads from the `X-Org-Id` header. If not provided, uses the user's first org.
+ * Returns null if the user has no org memberships.
  */
-export function getUserRole(_user: User): UserRole {
-  // TODO(production): query user_roles table or read from user.app_metadata.role
-  return getDefaultRole();
+export async function getOrgId(req: Request, client: SupabaseClient, user: User): Promise<string | null> {
+  // Check X-Org-Id header first
+  const headerOrgId = req.headers.get('x-org-id');
+  if (headerOrgId) {
+    // Validate that the user is a member of this org
+    const { data } = await client
+      .from('organization_members')
+      .select('org_id')
+      .eq('org_id', headerOrgId)
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    if (data) return headerOrgId;
+
+    // User tried to access an org they're not a member of
+    throw new AppError('Forbidden: not a member of this organization', 403, 'FORBIDDEN_ORG');
+  }
+
+  // No header — use the user's first org
+  const { data } = await client
+    .from('organization_members')
+    .select('org_id')
+    .eq('user_id', user.id)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  return data?.org_id || null;
+}
+
+/**
+ * Get the user's role in the current org context.
+ * Queries organization_members (not a hardcoded default).
+ */
+export async function getUserRole(client: SupabaseClient, user: User, orgId: string): Promise<UserRole | null> {
+  const { data } = await client
+    .from('organization_members')
+    .select('role')
+    .eq('org_id', orgId)
+    .eq('user_id', user.id)
+    .maybeSingle();
+
+  return (data?.role as UserRole) || null;
+}
+
+/**
+ * Require the user to be a member of an org with at least the specified role.
+ * Returns { user, client, orgId, role } for the route handler.
+ *
+ * Role hierarchy: admin > operator > viewer
+ * - viewer can view + export
+ * - operator can also upload + edit + resolve
+ * - admin can also manage rules + users + delete
+ */
+export async function requireOrgRole(
+  req: Request,
+  minRole: 'viewer' | 'operator' | 'admin',
+): Promise<{ user: User; client: SupabaseClient; orgId: string; role: UserRole }> {
+  const { user, client } = await requireUserClient(req);
+
+  const orgId = await getOrgId(req, client, user);
+  if (!orgId) {
+    throw new AppError('No organization membership found. Please contact your administrator.', 403, 'NO_ORG_MEMBERSHIP');
+  }
+
+  const role = await getUserRole(client, user, orgId);
+  if (!role) {
+    throw new AppError('Forbidden: not a member of this organization', 403, 'FORBIDDEN_ORG');
+  }
+
+  // Check role hierarchy
+  const roleLevel: Record<UserRole, number> = { viewer: 1, operator: 2, admin: 3 };
+  if (roleLevel[role] < roleLevel[minRole]) {
+    throw new AppError(`Forbidden: requires ${minRole} role or higher`, 403, 'INSUFFICIENT_ROLE');
+  }
+
+  return { user, client, orgId, role };
+}
+
+/**
+ * Get all organizations the user belongs to (for org-switcher UI).
+ */
+export async function getUserOrgs(client: SupabaseClient, user: User): Promise<Array<{ org_id: string; org_name: string; role: UserRole }>> {
+  const { data, error } = await client
+    .from('organization_members')
+    .select('org_id, role, organizations(id, name)')
+    .eq('user_id', user.id)
+    .order('created_at', { ascending: true });
+
+  if (error || !data) return [];
+
+  return data.map((row: any) => ({
+    org_id: row.org_id,
+    org_name: row.organizations?.name || 'Unknown',
+    role: row.role as UserRole,
+  }));
 }

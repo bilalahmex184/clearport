@@ -167,6 +167,7 @@ export async function updateException(
   client: SupabaseClient,
   exceptionId: string,
   input: UpdateExceptionInput,
+  orgId?: string,
 ): Promise<UpdateExceptionResult> {
   const { status, correctedValue, resolvedBy } = input;
 
@@ -180,12 +181,12 @@ export async function updateException(
     );
   }
 
-  // 1. Fetch the exception.
-  const { data: existing, error: fetchErr } = await client
-    .from('exceptions')
-    .select('*')
-    .eq('id', exceptionId)
-    .maybeSingle();
+  // 1. Fetch the exception (scoped to the current org when orgId is given).
+  let fetchQuery = client.from('exceptions').select('*').eq('id', exceptionId);
+  if (orgId) {
+    fetchQuery = fetchQuery.eq('org_id', orgId);
+  }
+  const { data: existing, error: fetchErr } = await fetchQuery.maybeSingle();
 
   if (fetchErr) {
     logger.error('ExceptionService: fetch exception failed', {
@@ -327,14 +328,21 @@ export async function batchAcceptExceptions(
   shipmentId: string,
   threshold: number,
   resolvedBy: string,
+  orgId?: string,
 ): Promise<BatchAcceptResult> {
-  // 1. Fetch unresolved exceptions for the shipment.
-  const { data: unresolved, error: fetchErr } = await client
+  // 1. Fetch unresolved exceptions for the shipment (scoped to the org).
+  let fetchQuery = client
     .from('exceptions')
     .select('*')
     .eq('shipment_id', shipmentId)
-    .eq('status', 'Unresolved')
-    .order('created_at', { ascending: true });
+    .eq('status', 'Unresolved');
+  if (orgId) {
+    fetchQuery = fetchQuery.eq('org_id', orgId);
+  }
+  const { data: unresolved, error: fetchErr } = await fetchQuery.order(
+    'created_at',
+    { ascending: true },
+  );
 
   if (fetchErr) {
     logger.error('ExceptionService: batch fetch failed', {

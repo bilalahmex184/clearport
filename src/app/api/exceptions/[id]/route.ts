@@ -5,6 +5,7 @@
 // PATCH /api/exceptions/[id]
 //   body: { status: 'Accepted' | 'Corrected' | 'Rejected', correctedValue?: string }
 //   →    { exception, shipmentStatus, shipmentConfidence }
+//   (RBAC: operator)
 //
 // The service layer handles:
 //   - validating that 'Corrected' requires a correctedValue
@@ -16,8 +17,7 @@
 // ============================================================================
 
 import { NextResponse } from 'next/server';
-import { requireUserClient, getUserEmail, getUserRole } from '@/lib/services/auth.service';
-import { canResolve } from '@/lib/services/rbac.service';
+import { requireOrgRole, getUserEmail } from '@/lib/services/auth.service';
 import {
   updateException,
   type UpdateExceptionInput,
@@ -31,18 +31,8 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { user, client } = await requireUserClient(req);
+    const { user, client, orgId, role } = await requireOrgRole(req, 'operator');
     const { id } = await params;
-
-    // RBAC: resolving an exception (accept / correct / reject) requires the
-    // 'resolve' permission. viewer role gets 403.
-    const role = getUserRole(user);
-    if (!canResolve(role)) {
-      return NextResponse.json(
-        { error: 'Insufficient permissions', code: 'FORBIDDEN' },
-        { status: 403 },
-      );
-    }
 
     const body = await req.json().catch(() => null);
     if (!body) {
@@ -66,12 +56,17 @@ export async function PATCH(
       resolvedBy: getUserEmail(user),
     };
 
-    const result = await updateException(client, id, input);
+    // Scope the lookup by orgId so an exception outside the active org
+    // returns 404 instead of leaking data across orgs.
+    const result = await updateException(client, id, input, orgId);
 
     logger.info('Exception resolved via API', {
       exceptionId: id,
       status: parsed.data.status,
       shipmentStatus: result.shipmentStatus,
+      orgId,
+      role,
+      user: getUserEmail(user),
     });
 
     return NextResponse.json(result);

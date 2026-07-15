@@ -25,7 +25,6 @@ import type {
   ExceptionHistoryEntry,
 } from '@/lib/clearport-types';
 import {
-  getDefaultRole,
   type UserRole,
 } from '@/lib/services/rbac.service';
 
@@ -51,11 +50,19 @@ interface ClearPortContextType {
   edgeFunctionStatus: EdgeFunctionStatus;
   currentUser: string;
   currentTime: string;
-  // RBAC role for the current user — anonymous users default to 'operator'
-  // so the no-login UX continues to work. Components use the can* helpers
-  // (canUpload, canResolve, canManageRules, canExport) from rbac.service
-  // to gate their interactive UI.
+  // RBAC role for the current user — fetched from /api/organizations on
+  // load (reflects the user's role in their active org). Defaults to
+  // 'operator' so the no-login UX continues to work before the role is
+  // resolved. Components use the can* helpers (canUpload, canResolve,
+  // canManageRules, canExport) from rbac.service to gate their UI.
   userRole: UserRole;
+  // Organizations the user belongs to (populated from
+  // GET /api/organizations). Empty until the first successful fetch.
+  userOrgs: Array<{ org_id: string; org_name: string; role: UserRole }>;
+  // The currently active org id. Sent as the X-Org-Id header on every
+  // API call so the backend resolves the same org context via
+  // requireOrgRole(). Null until the first org list load completes.
+  currentOrgId: string | null;
 
   // Actions
   selectEntry: (id: string) => void;
@@ -69,6 +76,9 @@ interface ClearPortContextType {
   exportToCSV: (entryId: string) => Promise<void>;
   toggleTheme: () => void;
   refreshData: () => Promise<void>;
+  // Switch the active org context. Updates currentOrgId + userRole, then
+  // reloads all org-scoped data (shipments, rules, logs) via the API.
+  switchOrg: (orgId: string) => void;
 }
 
 const ClearPortContext = React.createContext<ClearPortContextType | undefined>(undefined);
@@ -92,9 +102,39 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [edgeFunctionStatus, setEdgeFunctionStatus] = React.useState<EdgeFunctionStatus>('unknown');
   const [currentUser, setCurrentUser] = React.useState<string>('Broker');
   const [currentTime, setCurrentTime] = React.useState<string>('');
-  // Anonymous users default to 'operator'. In production this would be
-  // fetched from the server (e.g. GET /api/me → role from user_roles table).
-  const [userRole, setUserRole] = React.useState<UserRole>(getDefaultRole());
+  // Initial value 'operator' preserves the no-login UX. The real role is
+  // fetched from /api/organizations on load (see loadData below).
+  const [userRole, setUserRole] = React.useState<UserRole>('operator');
+  // Orgs the user belongs to + the currently active org id. Populated by
+  // loadData on first run; switchOrg() updates currentOrgId and reloads.
+  const [userOrgs, setUserOrgs] = React.useState<Array<{ org_id: string; org_name: string; role: UserRole }>>([]);
+  const [currentOrgId, setCurrentOrgId] = React.useState<string | null>(null);
+
+  // Refs mirror the org state so loadData / apiFetchOrg / switchOrg can read
+  // the latest values without being recreated on every state change. This
+  // keeps loadData's deps stable ([]) so the initial mount effect only fires
+  // once, and switchOrg can explicitly trigger a reload.
+  const currentOrgIdRef = React.useRef<string | null>(null);
+  currentOrgIdRef.current = currentOrgId;
+  const userOrgsRef = React.useRef<typeof userOrgs>([]);
+  userOrgsRef.current = userOrgs;
+
+  // --- apiFetch wrapper that injects the X-Org-Id header for org-scoped routes ---
+  // Uses the ref so the callback identity is stable (no dependency on state).
+  // Routes that DON'T need an org context (e.g. /api/organizations itself)
+  // should call the base `apiFetch` directly.
+  const apiFetchOrg = React.useCallback(
+    <T = any>(path: string, options: RequestInit & { raw?: boolean } = {}): Promise<T> => {
+      const headers: Record<string, string> = {
+        ...((options.headers as Record<string, string>) || {}),
+      };
+      if (currentOrgIdRef.current) {
+        headers['X-Org-Id'] = currentOrgIdRef.current;
+      }
+      return apiFetch<T>(path, { ...options, headers });
+    },
+    [],
+  );
 
   // --- Real-time clock ---
   React.useEffect(() => {
@@ -145,10 +185,45 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       const email = await getCurrentUserEmail();
       setCurrentUser(email);
 
-      // Try the new /api/shipments route (replaces both the get-shipments
-      // edge function call AND the fetchShipmentsDirect fallback).
+      // --- Bootstrap org context (only on first run, when currentOrgId is null) ---
+      // Subsequent reloads (e.g. after switchOrg) skip this block and reuse
+      // the already-selected org. Uses the base apiFetch (no X-Org-Id header)
+      // because GET /api/organizations is the bootstrap path that doesn't
+      // require an org context.
+      if (!currentOrgIdRef.current) {
+        try {
+          const orgsRes = await apiFetch<{
+            organizations: Array<{ org_id: string; org_name: string; role: UserRole }>;
+          }>('/api/organizations');
+
+          const orgs = orgsRes?.organizations ?? [];
+          if (orgs.length > 0) {
+            setUserOrgs(orgs);
+            const first = orgs[0];
+            setCurrentOrgId(first.org_id);
+            currentOrgIdRef.current = first.org_id;
+            setUserRole(first.role);
+          } else {
+            // No org memberships — fall back to seed data with a warning.
+            // The user can still see the demo data; they just can't mutate it.
+            console.warn('[ctx] No org memberships found — falling back to seed data. Create or join an organization to enable live mode.');
+            setSupabaseStatus('connected');
+            setEdgeFunctionStatus('fallback');
+            return;
+          }
+        } catch (orgErr) {
+          // 403 (no org membership) or network / schema error — fall back to
+          // seed data so the demo UX keeps working.
+          console.warn('[ctx] /api/organizations failed, falling back to seed data:', orgErr);
+          setSupabaseStatus('connected');
+          setEdgeFunctionStatus('fallback');
+          return;
+        }
+      }
+
+      // --- Fetch shipments for the active org (uses X-Org-Id header via apiFetchOrg) ---
       try {
-        const response = await apiFetch<{
+        const response = await apiFetchOrg<{
           data: ShipmentEntry[];
           pagination: { total: number };
         }>('/api/shipments?page=1&limit=100');
@@ -178,10 +253,10 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           setEdgeFunctionStatus('live');
           setSupabaseStatus('connected');
 
-          // Fetch rules + logs in parallel via the new API routes.
+          // Fetch rules + logs in parallel via the org-scoped API routes.
           const [rulesRes, logsRes] = await Promise.all([
-            apiFetch<{ rules: OperationalRules }>('/api/rules').catch(() => null),
-            apiFetch<{ logs: AuditLog[] }>('/api/audit-logs').catch(() => null),
+            apiFetchOrg<{ rules: OperationalRules }>('/api/rules').catch(() => null),
+            apiFetchOrg<{ logs: AuditLog[] }>('/api/audit-logs').catch(() => null),
           ]);
           if (rulesRes?.rules) setRules(rulesRes.rules);
           if (logsRes?.logs && logsRes.logs.length > 0) setAuditLogs(logsRes.logs);
@@ -199,7 +274,23 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       setSupabaseStatus('error_tables');
       setEdgeFunctionStatus('fallback');
     }
-  }, []);
+  }, [apiFetchOrg]);
+
+  // --- switchOrg: change the active org context and reload data ---
+  const switchOrg = React.useCallback((orgId: string) => {
+    const org = userOrgsRef.current.find((o) => o.org_id === orgId);
+    if (!org) {
+      console.warn('[ctx] switchOrg: org not found in userOrgs', { orgId });
+      return;
+    }
+    // Update both state + ref so apiFetchOrg picks up the new org immediately
+    // (the ref is read synchronously; the state triggers a re-render).
+    setCurrentOrgId(orgId);
+    currentOrgIdRef.current = orgId;
+    setUserRole(org.role);
+    // Reload all org-scoped data for the new org.
+    loadData();
+  }, [loadData]);
 
   React.useEffect(() => {
     loadData();
@@ -339,9 +430,10 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
         // Persist via the /api/exceptions/:id route (handles exception update,
         // document_field sync, shipment confidence recompute, and audit log
-        // in one server-side transaction).
+        // in one server-side transaction). Uses the org-scoped wrapper so
+        // the X-Org-Id header is sent.
         if (isSupabaseConfigured()) {
-          apiFetch(`/api/exceptions/${exceptionId}`, {
+          apiFetchOrg(`/api/exceptions/${exceptionId}`, {
             method: 'PATCH',
             body: JSON.stringify({
               status,
@@ -353,7 +445,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }
     },
-    [currentUser, addAuditLog]
+    [currentUser, addAuditLog, apiFetchOrg]
   );
 
   // --- Undo ---
@@ -480,9 +572,10 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
         // Persist via the /api/exceptions/batch-accept route (accepts each
         // qualifying exception, syncs document_fields, recomputes shipment
-        // confidence + status, and writes a batch-level audit log).
+        // confidence + status, and writes a batch-level audit log). Uses the
+        // org-scoped wrapper so the X-Org-Id header is sent.
         if (isSupabaseConfigured()) {
-          apiFetch('/api/exceptions/batch-accept', {
+          apiFetchOrg('/api/exceptions/batch-accept', {
             method: 'POST',
             body: JSON.stringify({
               shipmentId: entryId,
@@ -496,7 +589,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         return updatedEntry;
       });
     });
-  }, [rules.invoiceThreshold, currentUser, addAuditLog]);
+  }, [rules.invoiceThreshold, currentUser, addAuditLog, apiFetchOrg]);
 
   // --- Upload documents ---
   const uploadDocuments = React.useCallback(async (files: File[]): Promise<{ shipmentId: string; success: boolean; error?: string }> => {
@@ -719,9 +812,10 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setRules(prev => {
       const updated = { ...prev, ...newRules };
 
-      // Persist via the /api/rules route (upserts the user's rules row).
+      // Persist via the /api/rules route (upserts the org's rules row).
+      // Uses the org-scoped wrapper so the X-Org-Id header is sent.
       if (isSupabaseConfigured()) {
-        apiFetch('/api/rules', {
+        apiFetchOrg('/api/rules', {
           method: 'PATCH',
           body: JSON.stringify(newRules),
         }).catch((err) => {
@@ -732,7 +826,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return updated;
     });
     addAuditLog('Compliance operational thresholds updated.', 'info');
-  }, [addAuditLog]);
+  }, [addAuditLog, apiFetchOrg]);
 
   // --- Real CSV export ---
   const exportToCSV = React.useCallback(async (entryId: string) => {
@@ -740,10 +834,11 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     if (!entry) return;
 
     // Try the /api/export/:id route first (generates CSV server-side from the
-    // DB-backed shipment data and returns it as text/csv).
+    // DB-backed shipment data and returns it as text/csv). Uses the org-scoped
+    // wrapper so the X-Org-Id header is sent.
     if (isSupabaseConfigured()) {
       try {
-        const res = await apiFetch<Response>(`/api/export/${entryId}`, { raw: true });
+        const res = await apiFetchOrg<Response>(`/api/export/${entryId}`, { raw: true });
         if (res.ok) {
           const csv = await res.text();
           if (csv) {
@@ -799,7 +894,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     URL.revokeObjectURL(url);
 
     addAuditLog(`Audit logs exported to CSV for ${entryId}.`, 'success', entryId);
-  }, [entries, addAuditLog]);
+  }, [entries, addAuditLog, apiFetchOrg]);
 
   const value: ClearPortContextType = {
     entries,
@@ -817,6 +912,8 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     currentUser,
     currentTime,
     userRole,
+    userOrgs,
+    currentOrgId,
     selectEntry,
     selectException,
     setActiveTab,
@@ -828,6 +925,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     exportToCSV,
     toggleTheme,
     refreshData,
+    switchOrg,
   };
 
   return (

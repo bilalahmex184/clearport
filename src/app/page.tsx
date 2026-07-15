@@ -39,9 +39,33 @@ function AppShell() {
     edgeFunctionStatus,
     currentUser,
     currentTime,
+    userOrgs,
+    currentOrgId,
+    switchOrg,
   } = useClearPort();
   const [isSupabaseOpen, setIsSupabaseOpen] = React.useState(false);
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = React.useState(false);
+  const [isOrgMenuOpen, setIsOrgMenuOpen] = React.useState(false);
+  const orgMenuRef = React.useRef<HTMLDivElement | null>(null);
+
+  // Close the org-switcher dropdown on outside click.
+  React.useEffect(() => {
+    if (!isOrgMenuOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (orgMenuRef.current && !orgMenuRef.current.contains(e.target as Node)) {
+        setIsOrgMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [isOrgMenuOpen]);
+
+  // Current org display name (falls back to a placeholder before the first
+  // org list load completes).
+  const currentOrgName = React.useMemo(
+    () => userOrgs.find((o) => o.org_id === currentOrgId)?.org_name ?? 'Personal',
+    [userOrgs, currentOrgId],
+  );
 
   // Dynamic notification badges
   const activeExceptionsCount = React.useMemo(() => {
@@ -312,6 +336,77 @@ function AppShell() {
                   {supabaseStatus === 'connected' ? 'LIVE' : supabaseStatus === 'loading' ? '...' : 'OFF'}
                 </span>
               </button>
+
+              {/* Org switcher — only shown when the user belongs to more than one org.
+                  Calls switchOrg() to update the active org context, which triggers
+                  a full data reload via ClearPortContext.loadData(). */}
+              {userOrgs.length > 1 && (
+                <div className="relative" ref={orgMenuRef}>
+                  <button
+                    onClick={() => setIsOrgMenuOpen((v) => !v)}
+                    className={`border px-2.5 py-1 rounded-md flex items-center gap-1.5 font-mono text-[10px] transition-all cursor-pointer hover:scale-[1.02] active:scale-[0.98] ${
+                      theme === 'light'
+                        ? 'bg-amber-50 border-amber-200 text-amber-700'
+                        : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
+                    }`}
+                    title="Switch organization"
+                  >
+                    <span className="font-extrabold uppercase hidden sm:inline">ORG:</span>
+                    <span className="font-bold uppercase max-w-[140px] truncate">{currentOrgName}</span>
+                    <svg
+                      className={`w-3 h-3 transition-transform ${isOrgMenuOpen ? 'rotate-180' : ''}`}
+                      fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+                  {isOrgMenuOpen && (
+                    <div
+                      className={`absolute right-0 mt-1 min-w-[200px] rounded-md border shadow-lg z-30 overflow-hidden ${
+                        theme === 'light'
+                          ? 'bg-white border-gray-200'
+                          : 'bg-[#0d0e14] border-gray-800'
+                      }`}
+                    >
+                      <div className={`px-3 py-1.5 text-[9px] font-mono uppercase tracking-wider border-b ${
+                        theme === 'light' ? 'text-gray-400 border-gray-200' : 'text-gray-500 border-gray-900'
+                      }`}>
+                        Switch Organization
+                      </div>
+                      {userOrgs.map((org) => {
+                        const isActive = org.org_id === currentOrgId;
+                        return (
+                          <button
+                            key={org.org_id}
+                            onClick={() => {
+                              switchOrg(org.org_id);
+                              setIsOrgMenuOpen(false);
+                            }}
+                            className={`w-full text-left px-3 py-2 flex items-center justify-between gap-2 transition-colors ${
+                              isActive
+                                ? (theme === 'light'
+                                    ? 'bg-amber-50 text-amber-700'
+                                    : 'bg-amber-500/10 text-amber-400')
+                                : (theme === 'light'
+                                    ? 'text-gray-700 hover:bg-gray-100'
+                                    : 'text-gray-300 hover:bg-gray-900/60')
+                            }`}
+                          >
+                            <span className="text-xs font-semibold truncate">{org.org_name}</span>
+                            <span className={`text-[9px] font-mono uppercase shrink-0 ${
+                              isActive
+                                ? (theme === 'light' ? 'text-amber-600' : 'text-amber-500')
+                                : (theme === 'light' ? 'text-gray-400' : 'text-gray-500')
+                            }`}>
+                              {org.role}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Real-time timestamp */}
               <div className="hidden lg:flex items-center gap-1.5 font-mono text-[10px] text-gray-500 uppercase">

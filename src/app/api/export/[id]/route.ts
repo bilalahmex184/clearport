@@ -5,6 +5,7 @@
 // GET /api/export/[id]
 //   → 200 OK, Content-Type: text/csv
 //      Content-Disposition: attachment; filename="ClearPort_Audit_<id>.csv"
+//   (RBAC: viewer)
 //
 // Generates the CSV locally (does NOT call the export-csv edge function) so
 // the route handler is self-contained. The format mirrors the edge function:
@@ -17,7 +18,7 @@
 // with CRLF for Excel compatibility.
 // ============================================================================
 
-import { requireUserClient } from '@/lib/services/auth.service';
+import { requireOrgRole, getUserEmail } from '@/lib/services/auth.service';
 import { getShipmentById } from '@/lib/services/shipment.service';
 import { logExport } from '@/lib/services/audit-log.service';
 import { errorResponse, AppError } from '@/lib/utils/error-handler';
@@ -116,21 +117,28 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { user, client } = await requireUserClient(req);
+    const { user, client, orgId, role } = await requireOrgRole(req, 'viewer');
     const { id } = await params;
 
-    const shipment = await getShipmentById(client, id);
+    // Scope the shipment lookup by orgId so cross-org export attempts
+    // return 404 instead of leaking data.
+    const shipment = await getShipmentById(client, id, orgId);
     if (!shipment) {
-      throw new AppError(`Shipment not found: ${id}`, 404, 'NOT_FOUND', { id });
+      throw new AppError(`Shipment not found: ${id}`, 404, 'NOT_FOUND', { id, orgId });
     }
 
-    const exportedBy = user.email || `anon-${user.id.slice(0, 8)}@clearport.local`;
+    const exportedBy = getUserEmail(user);
     const csv = buildCsv(shipment, exportedBy);
     const filename = `ClearPort_Audit_${id}.csv`;
 
-    // Best-effort structured audit log entry — uses the new logExport helper
-    // so the log line follows the "[export] User X exported CSV for Y" format
-    // that auditors can grep / filter on.
+    logger.info('CSV export via API', {
+      shipmentId: id,
+      orgId,
+      role,
+      user: exportedBy,
+    });
+
+    // Best-effort structured audit log entry.
     await logExport(client, exportedBy, id, 'CSV').catch((err) => {
       logger.warn('export: audit log insert failed', {
         error: err instanceof Error ? err.message : String(err),

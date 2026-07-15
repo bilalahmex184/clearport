@@ -4,19 +4,21 @@
 //
 // GET   /api/rules
 //   → { rules: OperationalRules }  (auto-creates defaults 80/85/75 if missing)
+//   (RBAC: viewer)
 //
 // PATCH /api/rules  { invoiceThreshold?, htsThreshold?, partiesThreshold? }
 //   → { rules: OperationalRules }
+//   (RBAC: admin)
 //
-// There is one rules row per user, keyed by `id = 'default_config'` (RLS
-// enforces user isolation so the same id is safe across users). If the row
-// doesn't exist yet, GET auto-creates it with the spec defaults (80/85/75).
+// There is one rules row per org (keyed by org_id). If the row doesn't exist
+// yet, GET auto-creates it with the spec defaults (80/85/75) for the active
+// org. The active org is resolved from the X-Org-Id header (or the user's
+// first membership) via `requireOrgRole()`.
 // ============================================================================
 
 import { NextResponse } from 'next/server';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { requireUserClient, getUserRole, getUserEmail } from '@/lib/services/auth.service';
-import { canManageRules } from '@/lib/services/rbac.service';
+import { requireOrgRole, getUserEmail } from '@/lib/services/auth.service';
 import { updateRulesSchema } from '@/lib/validators/rules.validator';
 import { logRulesUpdate } from '@/lib/services/audit-log.service';
 import { errorResponse, AppError } from '@/lib/utils/error-handler';
@@ -26,7 +28,6 @@ import type {
   DbOperationalRules,
 } from '@/lib/clearport-types';
 
-const RULES_ROW_ID = 'default_config';
 const DEFAULT_RULES: OperationalRules = {
   invoiceThreshold: 80,
   htsThreshold: 85,
@@ -62,16 +63,18 @@ function mapDbToRules(db: DbOperationalRules): OperationalRules {
 }
 
 /**
- * Fetch the user's rules row. If it doesn't exist, create it with the spec
- * defaults and return those. RLS ensures only the current user's row is visible.
+ * Fetch the active org's rules row. If it doesn't exist, create it with the
+ * spec defaults and return those. RLS ensures only the active org's row is
+ * visible; the explicit `.eq('org_id', orgId)` makes that intent clear.
  */
 async function getOrCreateRules(
   client: SupabaseClient,
+  orgId: string,
 ): Promise<OperationalRules> {
-  // Query without filtering by id — RLS ensures we only see our own row
   const { data, error } = await client
     .from('operational_rules')
     .select('*')
+    .eq('org_id', orgId)
     .maybeSingle();
 
   if (error) {
@@ -82,11 +85,13 @@ async function getOrCreateRules(
     return mapDbToRules(data as DbOperationalRules);
   }
 
-  // Auto-create with defaults. user_id is set by the trigger.
+  // Auto-create with defaults. user_id is set by the trigger; org_id is
+  // explicitly set to the active org.
   const payload = {
     invoice_threshold: DEFAULT_RULES.invoiceThreshold,
     hts_threshold: DEFAULT_RULES.htsThreshold,
     parties_threshold: DEFAULT_RULES.partiesThreshold,
+    org_id: orgId,
     updated_at: new Date().toISOString(),
   };
 
@@ -100,18 +105,20 @@ async function getOrCreateRules(
     throw wrapDbError('create default operational_rules', insertErr.message);
   }
 
-  logger.info('Created default operational_rules row');
+  logger.info('Created default operational_rules row', { orgId });
   return mapDbToRules(created as DbOperationalRules);
 }
 
 // ---------------------------------------------------------------------------
-// GET
+// GET (viewer)
 // ---------------------------------------------------------------------------
 
 export async function GET(req: Request) {
   try {
-    const { client } = await requireUserClient(req);
-    const rules = await getOrCreateRules(client);
+    const { client, orgId, role } = await requireOrgRole(req, 'viewer');
+    const rules = await getOrCreateRules(client, orgId);
+
+    logger.debug('Rules fetched', { orgId, role });
     return NextResponse.json({ rules });
   } catch (err) {
     return errorResponse(err);
@@ -119,22 +126,12 @@ export async function GET(req: Request) {
 }
 
 // ---------------------------------------------------------------------------
-// PATCH — partial update (upsert so it works even if the row was never created)
+// PATCH — partial update (admin only)
 // ---------------------------------------------------------------------------
 
 export async function PATCH(req: Request) {
   try {
-    const { client, user } = await requireUserClient(req);
-
-    // RBAC: tuning operational thresholds is an admin-only action. operator
-    // and viewer can read the rules (GET above) but cannot mutate them.
-    const role = getUserRole(user);
-    if (!canManageRules(role)) {
-      return NextResponse.json(
-        { error: 'Insufficient permissions: manage_rules required', code: 'FORBIDDEN' },
-        { status: 403 },
-      );
-    }
+    const { user, client, orgId, role } = await requireOrgRole(req, 'admin');
 
     const body = await req.json().catch(() => null);
     if (!body) {
@@ -154,14 +151,15 @@ export async function PATCH(req: Request) {
 
     // Load the current rules (auto-creates defaults if missing) so we can
     // merge the patch rather than overwriting un-specified fields with null.
-    const current = await getOrCreateRules(client);
+    const current = await getOrCreateRules(client, orgId);
     const merged: OperationalRules = {
       invoiceThreshold: parsed.data.invoiceThreshold ?? current.invoiceThreshold,
       htsThreshold: parsed.data.htsThreshold ?? current.htsThreshold,
       partiesThreshold: parsed.data.partiesThreshold ?? current.partiesThreshold,
     };
 
-    // Update existing row (getOrCreateRules ensures it exists)
+    // Update the active org's row (scoped by org_id so cross-org PATCHes
+    // are no-ops).
     const { error } = await client
       .from('operational_rules')
       .update({
@@ -170,13 +168,18 @@ export async function PATCH(req: Request) {
         parties_threshold: merged.partiesThreshold,
         updated_at: new Date().toISOString(),
       })
-      .eq('user_id', user.id);
+      .eq('org_id', orgId);
 
     if (error) {
       throw wrapDbError('update operational_rules', error.message);
     }
 
-    logger.info('Operational rules updated via API', { rules: merged });
+    logger.info('Operational rules updated via API', {
+      rules: merged,
+      orgId,
+      role,
+      user: getUserEmail(user),
+    });
 
     // Structured audit log — records which thresholds changed + who changed
     // them. Best-effort: failures are logged but don't break the response.

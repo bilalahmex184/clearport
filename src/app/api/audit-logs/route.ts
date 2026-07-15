@@ -4,16 +4,19 @@
 //
 // GET /api/audit-logs?limit=50&shipmentId=SHIP-XXXX
 //   → { logs: AuditLog[] }
+//   (RBAC: viewer)
 //
 // If `shipmentId` is provided, logs are filtered to that shipment only.
-// Limit is capped at 200 (matches audit-log.service default).
+// Limit is capped at 200 (matches audit-log.service default). All logs are
+// additionally scoped by the active org_id from `requireOrgRole()`.
 // ============================================================================
 
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
-import { requireUserClient } from '@/lib/services/auth.service';
+import { requireOrgRole } from '@/lib/services/auth.service';
 import { getAuditLogs } from '@/lib/services/audit-log.service';
 import { errorResponse } from '@/lib/utils/error-handler';
+import { logger } from '@/lib/utils/logger';
 
 const querySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
@@ -22,7 +25,7 @@ const querySchema = z.object({
 
 export async function GET(req: Request) {
   try {
-    const { client } = await requireUserClient(req);
+    const { client, orgId, role } = await requireOrgRole(req, 'viewer');
 
     const url = new URL(req.url);
     const parsed = querySchema.safeParse({
@@ -39,6 +42,13 @@ export async function GET(req: Request) {
     const logs = await getAuditLogs(client, {
       limit: parsed.data.limit,
       shipmentId: parsed.data.shipmentId,
+      orgId,
+    });
+
+    logger.debug('Audit logs fetched', {
+      orgId,
+      role,
+      count: logs.length,
     });
 
     return NextResponse.json({ logs });

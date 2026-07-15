@@ -465,3 +465,106 @@ Stage Summary:
 - CSV ingestion pipeline implemented
 - Multi-language support (EN/FR/DE)
 - Sparse/minimal document handling
+
+---
+Task ID: S1-API
+Agent: s1-api (org-scoped RBAC migration)
+Task: Update all Next.js API routes + ClearPortContext to use the new org-scoped RBAC system (requireOrgRole / getOrgId / getUserRole / getUserOrgs from auth.service.ts). Add /api/organizations routes for org + member management. Wire the frontend to fetch the user's orgs, send X-Org-Id on every API call, and expose an org-switcher in the header.
+
+Work Log:
+
+PART A — Created 4 new route files under /api/organizations:
+
+1. `/api/organizations/route.ts` (163 lines)
+   - GET → calls `getUserOrgs(client, user)` (from auth.service) → `{ organizations: Array<{ org_id, org_name, role }> }`. Uses `requireUserClient` (NOT `requireOrgRole`) because a brand-new user may not yet belong to any org — this is the bootstrap path.
+   - POST → validates body `{ name: string }` via Zod, INSERTs into `organizations`, then INSERTs the creator as an admin member of the new org. Returns `{ organization, role: 'admin' }` with 201. Surfaces a clear SCHEMA_NOT_DEPLOYED AppError if the table is missing.
+
+2. `/api/organizations/[id]/route.ts` (170 lines)
+   - GET → fetches the org row (RLS `org_member_read` hides orgs the user isn't a member of → 404 if not a member), then calls `getUserRole(client, user, id)` to surface the caller's role in the response.
+   - PATCH → admin-only (via `getUserRole` + role check), validates `{ name }`, updates the org name.
+   - DELETE → admin-only, deletes the org (FK ON DELETE CASCADE removes members + all org-scoped rows).
+   - Org id is read from the path param, NOT the X-Org-Id header, so an admin can manage any org they admin without first switching the global org context.
+
+3. `/api/organizations/[id]/members/route.ts` (147 lines)
+   - GET → membership check (any role), lists members with their role + invited_by.
+   - POST → admin-only, validates `{ userId: UUID, role: 'admin'|'operator'|'viewer' (default 'viewer') }`, INSERTs the membership. Returns 409 ALREADY_MEMBER if the user is already in the org (PostgREST 23505).
+
+4. `/api/organizations/[id]/members/[userId]/route.ts` (196 lines)
+   - PATCH → admin-only, validates `{ role }`, updates the target member's role. Guards against the last-admin self-demotion edge case (returns 409 LAST_ADMIN if `countAdmins(org) <= 1 && target == self && newRole != 'admin'`).
+   - DELETE → admin-only, removes the member. Same last-admin self-removal guard. Uses `delete({ count: 'exact' })` to detect "no rows deleted" → 404.
+
+PART B — Updated all 7 existing API routes to use `requireOrgRole(req, minRole)`:
+
+Replaced the old pattern `requireUserClient(req) + getUserRole(user) + canXxx(role)` with the single call `requireOrgRole(req, minRole)` which returns `{ user, client, orgId, role }`. The role-hierarchy check (viewer < operator < admin) is enforced inside `requireOrgRole`, so the routes just declare their minimum role and use the returned `orgId` to scope every query.
+
+| Route | Before | After |
+|-------|--------|-------|
+| GET /api/shipments | requireUserClient | requireOrgRole(req, 'viewer') + getShipments(client, { ..., orgId }) |
+| POST /api/shipments | requireUserClient + canUpload | requireOrgRole(req, 'operator') + createShipment(client, { ..., orgId }) |
+| GET /api/shipments/[id] | requireUserClient | requireOrgRole(req, 'viewer') + getShipmentById(client, id, orgId) |
+| PATCH /api/shipments/[id] | requireUserClient + canEdit | requireOrgRole(req, 'operator') + updateShipment(client, id, patch, orgId) |
+| DELETE /api/shipments/[id] | requireUserClient + isAdmin | requireOrgRole(req, 'admin') + deleteShipment(client, id, orgId) |
+| PATCH /api/exceptions/[id] | requireUserClient + canResolve | requireOrgRole(req, 'operator') + updateException(client, id, input, orgId) |
+| POST /api/exceptions/batch-accept | requireUserClient + canResolve | requireOrgRole(req, 'operator') + batchAcceptExceptions(client, shipmentId, threshold, resolvedBy, orgId) |
+| GET /api/rules | requireUserClient | requireOrgRole(req, 'viewer') + getOrCreateRules(client, orgId) |
+| PATCH /api/rules | requireUserClient + canManageRules | requireOrgRole(req, 'admin') + update scoped by org_id |
+| GET /api/audit-logs | requireUserClient | requireOrgRole(req, 'viewer') + getAuditLogs(client, { ..., orgId }) |
+| GET /api/export/[id] | requireUserClient | requireOrgRole(req, 'viewer') + getShipmentById(client, id, orgId) |
+
+Removed unused imports of `getUserRole` (the one-arg version that no longer exists), `canUpload`, `canEdit`, `isAdmin`, `canResolve`, `canManageRules` from the route files — `requireOrgRole` replaces them all.
+
+PART B' — Updated 3 service files to accept an optional `orgId` parameter and apply `.eq('org_id', orgId)`:
+
+- `shipment.service.ts`: `getShipments`, `getShipmentById`, `createShipment` (sets `org_id` on the insert payload), `updateShipment`, `deleteShipment` — all accept `orgId?` and scope the query. `CreateShipmentInput` gained an optional `orgId` field.
+- `exception.service.ts`: `updateException` and `batchAcceptExceptions` accept `orgId?` and scope the fetch query, so an exception outside the active org returns 404 (defense-in-depth alongside RLS).
+- `audit-log.service.ts`: `getAuditLogs` options gained `orgId?` and applies `.eq('org_id', orgId)` so the audit log only shows the active org's entries.
+
+All `orgId` parameters are optional to preserve backward compatibility with any future callers that don't have an org context (e.g. a hypothetical admin cross-org dashboard).
+
+PART C — Updated `src/context/ClearPortContext.tsx`:
+
+1. Removed `getDefaultRole` from the `@/lib/services/rbac.service` import (it no longer exists — the new rbac.service has no silent default).
+2. Replaced `useState<UserRole>(getDefaultRole())` with `useState<UserRole>('operator')` — the real role is fetched from `/api/organizations` on load.
+3. Added `userOrgs` state: `Array<{ org_id: string; org_name: string; role: UserRole }>` (defaults to `[]`).
+4. Added `currentOrgId` state: `string | null` (defaults to `null`).
+5. Added two refs (`currentOrgIdRef`, `userOrgsRef`) that mirror the state so `loadData` / `apiFetchOrg` / `switchOrg` can read the latest values without being recreated on every state change. This keeps `loadData`'s deps stable so the initial mount effect only fires once, and `switchOrg` can explicitly trigger a reload.
+6. Added `apiFetchOrg<T>(path, options)` — a stable `useCallback` (deps `[]`) that wraps the existing `apiFetch` from `@/lib/supabase` and injects `X-Org-Id: <currentOrgId>` from the ref. All org-scoped API calls inside the context now go through `apiFetchOrg` instead of `apiFetch`. The base `apiFetch` is still used for `/api/organizations` itself (the bootstrap path that doesn't need an org context).
+7. Modified `loadData`:
+   - On first run (when `currentOrgIdRef.current === null`), fetches `/api/organizations` via base `apiFetch`, sets `userOrgs`, sets `currentOrgId` to the first org, sets `userRole` to the first org's role, and updates the ref immediately so the subsequent `apiFetchOrg` calls in the same `loadData` invocation pick up the new org.
+   - If the orgs list is empty → falls back to seed data with a `console.warn` (preserves the demo UX). If `/api/organizations` throws (403 / network / schema error) → same seed-data fallback.
+   - Subsequent reloads (e.g. after `switchOrg`) skip the orgs-fetch block and reuse the already-selected org.
+   - All `apiFetch('/api/...')` calls inside `loadData` were changed to `apiFetchOrg(...)` so the X-Org-Id header is sent.
+8. Added `switchOrg(orgId: string)` — looks up the org in `userOrgsRef.current`, updates `currentOrgId` state + ref + `userRole`, then calls `loadData()` to reload all org-scoped data with the new context.
+9. Updated `updateException`, `acceptAllHighConfidence`, `updateRules`, `exportToCSV` to use `apiFetchOrg` instead of `apiFetch` (added `apiFetchOrg` to each callback's deps array — it's stable so this doesn't cause re-creation).
+10. Extended `ClearPortContextType` with `userOrgs`, `currentOrgId`, `switchOrg` and added them to the context `value` object.
+
+PART D — Added org-switcher dropdown to `src/app/page.tsx` (AppShell header):
+
+- Pulled `userOrgs`, `currentOrgId`, `switchOrg` from `useClearPort()`.
+- Added `isOrgMenuOpen` state + `orgMenuRef` + an outside-click `useEffect` to close the dropdown.
+- Computed `currentOrgName` via `useMemo` (falls back to `'Personal'` before the first org list load).
+- Rendered an amber-accented "ORG: <name>" button immediately after the Supabase status pill, ONLY when `userOrgs.length > 1`. The button toggles a dropdown that lists every org with its role badge; clicking an org calls `switchOrg(org.org_id)` and closes the dropdown. The dropdown is `absolute right-0 mt-1 z-30` so it overlays the content below the header. The active org is highlighted with the amber accent. Styling adapts to light/dark theme.
+
+PART E — Added a fix migration `supabase/migrations/002_fix_org_create_rls.sql`:
+
+Discovered a chicken-and-egg RLS bug in migration 001: the `org_admin_manage_org` policy was `FOR ALL` with `WITH CHECK (is_org_member(id, auth.uid()) AND role = 'admin')`, which blocks INSERT because a brand-new org has no members yet. Same issue with `admin_manage_members` on `organization_members` (blocks the creator from adding themselves as admin of a new org).
+
+The fix migration:
+- Drops `org_admin_manage_org` and recreates it as separate `org_admin_update` (FOR UPDATE) + `org_admin_delete` (FOR DELETE) policies.
+- Adds `org_authenticated_insert` (FOR INSERT WITH CHECK (true)) so any authenticated user can create an org.
+- Drops `admin_manage_members` and recreates as `admin_update_members` (FOR UPDATE) + `admin_delete_members` (FOR DELETE).
+- Adds `self_insert_members` (FOR INSERT WITH CHECK (user_id = auth.uid())) so a user can add THEMSELVES to an org (the bootstrap path). Adding OTHER users still requires the admin role, enforced by the `/api/organizations/[id]/members` POST route.
+
+Verification:
+- `npx tsc --noEmit` → 0 errors in `src/`. (The only remaining errors are pre-existing + environmental: `audit/` stale folder, `supabase/functions/*.ts` Deno globals, `examples/websocket/` missing socket.io, `skills/` unrelated — all documented by previous agents.)
+- `bun run lint` → exit 0, no errors.
+
+Stage Summary:
+- 4 new route files created under `/api/organizations/` (16 endpoints total: GET+POST on the collection, GET+PATCH+DELETE on `[id]`, GET+POST on `[id]/members`, PATCH+DELETE on `[id]/members/[userId]`).
+- 7 existing API routes migrated from `requireUserClient + getUserRole(user)` to `requireOrgRole(req, minRole)`. Every query is now scoped by the active `org_id`.
+- 3 service files extended with optional `orgId` parameters (backward compatible).
+- ClearPortContext bootstraps the org context on first load, falls back to seed data on 403 / empty org list, and reloads all data when the user switches org.
+- Org-switcher dropdown appears in the header when the user belongs to more than one org.
+- Fix migration `002_fix_org_create_rls.sql` unblocks org + membership creation (was impossible under migration 001's FOR ALL admin-only policies).
+- The existing seed-data fallback, upload pipeline (edge functions + direct supabase inserts via the `set_org_id` trigger), undo stack, and audit-log writes are all untouched and continue to work.
+- Next actions for downstream agents: (a) deploy migration 002 to the live Supabase project (`supabase db push` or paste into SQL Editor); (b) seed an `organization_members` row for any existing users who don't have one yet (migration 001's backfill block should have handled this, but verify); (c) optionally add a "Create Organization" UI button somewhere (the POST /api/organizations route exists but no UI calls it yet — users currently get their first org via migration 001's backfill); (d) consider wiring the upload pipeline through `/api/organizations/[id]/...` or a new `/api/upload` route so uploads are also org-scoped server-side (today the `set_org_id` trigger handles it transparently).
