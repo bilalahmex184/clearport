@@ -12,7 +12,8 @@
 // ============================================================================
 
 import { NextResponse } from 'next/server';
-import { requireUserClient, getUserEmail } from '@/lib/services/auth.service';
+import { requireUserClient, getUserEmail, getUserRole } from '@/lib/services/auth.service';
+import { canResolve } from '@/lib/services/rbac.service';
 import {
   batchAcceptExceptions,
 } from '@/lib/services/exception.service';
@@ -49,6 +50,16 @@ async function resolveThreshold(
 export async function POST(req: Request) {
   try {
     const { user, client } = await requireUserClient(req);
+
+    // RBAC: batch-accept is a bulk resolve action — same 'resolve' gate as
+    // the single-exception PATCH above.
+    const role = getUserRole(user);
+    if (!canResolve(role)) {
+      return NextResponse.json(
+        { error: 'Insufficient permissions', code: 'FORBIDDEN' },
+        { status: 403 },
+      );
+    }
 
     const body = await req.json().catch(() => null);
     if (!body) {

@@ -3,9 +3,16 @@
 import * as React from 'react';
 import { useClearPort } from '@/context/ClearPortContext';
 import { CheckCircle2, FileSpreadsheet, AlertCircle, FileText } from 'lucide-react';
+import { canExport, roleLabel } from '@/lib/services/rbac.service';
 
 export default function EntryDetailView() {
-  const { entries, selectedEntryId, selectedEntry, selectEntry, selectException, setActiveTab, exportToCSV } = useClearPort();
+  const { entries, selectedEntryId, selectedEntry, selectEntry, selectException, setActiveTab, exportToCSV, userRole } = useClearPort();
+
+  // RBAC: every role (admin / operator / viewer) has the 'export' permission,
+  // so this gate is currently a no-op for the default role assignment. It's
+  // wired in so a future "no-export" role (e.g. external auditor with a
+  // redacted view) automatically hides the button without component edits.
+  const canExportCsv = canExport(userRole);
 
   const [isExporting, setIsExporting] = React.useState(false);
 
@@ -38,6 +45,7 @@ export default function EntryDetailView() {
   };
 
   const handleExport = async () => {
+    if (!canExportCsv) return;
     setIsExporting(true);
     try {
       await exportToCSV(selectedEntry.id);
@@ -113,10 +121,11 @@ export default function EntryDetailView() {
             </div>
 
             <button
-              disabled={!isExportEnabled || isExporting}
+              disabled={!isExportEnabled || isExporting || !canExportCsv}
               onClick={handleExport}
+              title={!canExportCsv ? `Export disabled for ${roleLabel(userRole)} role` : undefined}
               className={`flex items-center gap-2 text-xs font-bold px-4 py-2 rounded-lg border transition-all uppercase tracking-wider ${
-                isExportEnabled && !isExporting
+                isExportEnabled && !isExporting && canExportCsv
                   ? 'bg-emerald-600 hover:bg-emerald-500 text-black border-emerald-700 cursor-pointer shadow-lg shadow-emerald-950/35'
                   : 'bg-gray-950 text-gray-600 border-gray-900 cursor-not-allowed'
               }`}

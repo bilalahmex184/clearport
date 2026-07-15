@@ -1,6 +1,7 @@
 'use client';
 
 import * as React from 'react';
+import Link from 'next/link';
 import { ClearPortProvider, useClearPort } from '@/context/ClearPortContext';
 import Dashboard from '@/components/clearport/Dashboard';
 import IngestUpload from '@/components/clearport/IngestUpload';
@@ -355,14 +356,39 @@ function AppShell() {
               ? 'bg-white border-gray-200 text-gray-400'
               : 'bg-[#08090d] border-gray-900 text-gray-600'
           }`}>
-            <span>CLEARPORT v5.0 // CUSTOMS COMPLIANCE PLATFORM</span>
-            <span className="hidden sm:inline">
+            <span className="truncate">CLEARPORT v5.0 // CUSTOMS COMPLIANCE PLATFORM</span>
+            <span className="hidden md:inline flex-1 text-center">
               {edgeFunctionStatus === 'live'
                 ? 'EDGE FUNCTIONS LIVE • GEMINI EXTRACTION ACTIVE'
                 : 'FALLBACK MODE • DEPLOY EDGE FUNCTIONS FOR FULL CAPABILITY'
               }
             </span>
-            <span>{entries.length} SHIPMENTS</span>
+            <div className="flex items-center gap-3 shrink-0">
+              {/* Legal pages — server-rendered, accessible without auth */}
+              <Link
+                href="/terms"
+                className="hover:text-gray-300 transition-colors hidden sm:inline"
+                title="Terms of Use"
+              >
+                Terms
+              </Link>
+              <Link
+                href="/privacy"
+                className="hover:text-gray-300 transition-colors hidden sm:inline"
+                title="Privacy Policy"
+              >
+                Privacy
+              </Link>
+              <Link
+                href="/legal"
+                className="hover:text-gray-300 transition-colors hidden sm:inline"
+                title="AI Disclaimer & Legal Overview"
+              >
+                AI Disclaimer
+              </Link>
+              <span className="text-gray-700 hidden sm:inline">|</span>
+              <span>{entries.length} SHIPMENTS</span>
+            </div>
           </footer>
         </main>
       </div>

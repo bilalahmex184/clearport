@@ -66,17 +66,47 @@ const FIELD_DEFINITIONS: Array<{
   { key: "declaredValue", label: "Total Declared Value" },
   { key: "htsCode", label: "HTS Code" },
   { key: "netWeight", label: "Net Weight" },
+  { key: "grossWeight", label: "Gross Weight" },
   { key: "portOfEntry", label: "Port of Entry" },
   { key: "carrier", label: "Carrier" },
   { key: "billOfLading", label: "Bill of Lading #" },
   { key: "countryOfOrigin", label: "Country of Origin" },
 ];
 
-const GEMINI_PROMPT = `You are a customs document OCR engine. Extract the following fields from this document image.
-Return ONLY a JSON array of objects with keys: field_key, field_label, extracted_value, confidence (0-100).
-Fields to extract: invoiceNo (Commercial Invoice #), invoiceDate (Invoice Date), shipper (Shipper/Exporter), consignee (Consignee/Importer), consigneeAddress (Consignee Address), declaredValue (Total Declared Value), htsCode (HTS Code), netWeight (Net Weight), portOfEntry (Port of Entry), carrier (Carrier), billOfLading (Bill of Lading #), countryOfOrigin (Country of Origin).
-If a field is not present, omit it. Confidence is your certainty 0-100.
-Do not wrap the JSON in markdown fences. Output ONLY the JSON array.`;
+const GEMINI_PROMPT = `You are a strict customs document OCR engine. Extract structured fields from this document.
+
+STRICT OUTPUT CONTRACT — read carefully:
+1. Return ONLY a JSON array. Do NOT wrap it in markdown fences. Do NOT add any prose, explanation, or commentary before or after the array.
+2. Every object in the array MUST have EXACTLY these four keys (no more, no less):
+   - "field_key": string (one of the allowed keys listed below)
+   - "field_label": string (the human-readable label listed below)
+   - "extracted_value": string (the verbatim value read from the document) OR null
+   - "confidence": integer between 0 and 100
+3. If a field is NOT present in the document, OMIT it from the array entirely. Do NOT include it with a null value.
+4. If you cannot clearly read a value, OMIT that field. Do NOT guess, infer, hallucinate, or fabricate values. Only extract fields that are clearly visible in the document.
+5. Confidence must reflect your actual certainty about BOTH the field's presence AND the accuracy of the extracted value:
+   - 95-100: very clear, unambiguous, legible text, no possible doubt
+   - 80-94:  clear, but minor ambiguity (e.g. partial obscuring, slight blur)
+   - 60-79:  somewhat clear, value readable but with some uncertainty
+   - below 60: uncertain — you should usually OMIT the field rather than return it
+6. Use the EXACT field_key strings below (case-sensitive). Do not invent new keys.
+
+Allowed fields (field_key → field_label):
+- invoiceNo         → "Commercial Invoice #"
+- invoiceDate       → "Invoice Date"
+- shipper           → "Shipper/Exporter"
+- consignee         → "Consignee/Importer"
+- consigneeAddress  → "Consignee Address"
+- declaredValue     → "Total Declared Value"  (include currency symbol: $1,234.56)
+- htsCode           → "HTS Code"               (format XXXX.XX.XXXX, e.g. 8108.90.3060)
+- netWeight         → "Net Weight"             (include unit, e.g. "1234 kg" or "1234 lbs")
+- grossWeight       → "Gross Weight"           (include unit)
+- portOfEntry       → "Port of Entry"
+- carrier           → "Carrier"
+- billOfLading      → "Bill of Lading #"
+- countryOfOrigin   → "Country of Origin"      (ISO 3166-1 alpha-2, 2 uppercase letters, e.g. "CN")
+
+Output ONLY the JSON array. No markdown fences. No prose.`;
 
 // --- Gemini client ----------------------------------------------------------
 function getGeminiClient(): GoogleGenAI | null {
@@ -224,63 +254,121 @@ function mockFields(): any[] {
 
 // Call Gemini with the file bytes. Returns an array of field objects.
 // Handles both binary files (via inlineData) and text files (via text prompt).
-// Returns { fields, debug } so the caller can surface diagnostic info.
+// Returns { fields, debug, model, rawResponse } so the caller can surface
+// diagnostic info and persist the raw AI response for audit.
+//
+// MODEL CASCADE (most accurate first):
+//   gemini-2.5-pro  → gemini-2.0-flash → gemini-1.5-flash → regex fallback
+//
+// NOTE: Gemini handles multi-page PDFs natively via inlineData — the entire
+// PDF is sent as a single inlineData part and the model reads every page.
+// No special chunking or per-page calls are required.
 async function callGeminiExtraction(
   ai: GoogleGenAI,
   mimeType: string,
   base64Data: string,
   rawText?: string
-): Promise<{ fields: any[]; debug: any }> {
-  const models = ["gemini-2.0-flash", "gemini-1.5-flash"];
-  const debug: any = { modelsTried: [], errors: [], rawResponses: [] };
+): Promise<{ fields: any[]; debug: any; model: string | null; rawResponse: string | null }> {
+  // Ordered model cascade — Pro first (most accurate), then Flash variants.
+  const models = ["gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"];
+  const debug: any = { modelsTried: [], errors: [], rawResponses: [], retries: [] };
+
+  // Strict, deterministic config — temperature 0 + topP 0 + topK 1 means the
+  // model always picks the single highest-probability token, ensuring that
+  // the same document yields the same extraction on every run.
+  const generationConfig = { temperature: 0, topP: 0, topK: 1 };
 
   for (const model of models) {
     debug.modelsTried.push(model);
-    try {
-      const parts: any[] = [];
+    let lastErr: any = null;
 
-      if (rawText && rawText.length > 0) {
-        parts.push({ text: `Document text content:\n\n${rawText}\n\n---\n${GEMINI_PROMPT}` });
-      } else {
-        parts.push({ inlineData: { mimeType, data: base64Data } });
-        parts.push({ text: GEMINI_PROMPT });
+    // Retry up to 2 times on transient errors (429 rate-limit, 503 server
+    // error). Exponential backoff: 1s, then 2s.
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      try {
+        const parts: any[] = [];
+
+        if (rawText && rawText.length > 0) {
+          parts.push({ text: `Document text content:\n\n${rawText}\n\n---\n${GEMINI_PROMPT}` });
+        } else {
+          parts.push({ inlineData: { mimeType, data: base64Data } });
+          parts.push({ text: GEMINI_PROMPT });
+        }
+
+        // 30-second timeout — if the model is slow or hung, abort and fall
+        // back to the next model in the cascade.
+        const response = await Promise.race([
+          ai.models.generateContent({
+            model,
+            contents: [{ role: "user", parts }],
+            config: generationConfig,
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`TIMEOUT_30s after 30000ms`)), 30000)
+          ),
+        ]);
+
+        // Try multiple ways to get text from the response
+        let text = "";
+        if (typeof response.text === "string") {
+          text = response.text;
+        } else if (typeof response.text === "function") {
+          text = response.text();
+        } else if (response?.candidates?.[0]?.content?.parts?.[0]?.text) {
+          text = response.candidates[0].content.parts[0].text;
+        } else if (response?.response?.text) {
+          text = response.response.text;
+        }
+
+        debug.rawResponses.push({ model, attempt, textLength: text.length, preview: text.substring(0, 300) });
+
+        const parsed = extractJsonArray(text);
+        if (parsed.length > 0) {
+          debug.success = true;
+          debug.successModel = model;
+          return { fields: parsed, debug, model, rawResponse: text };
+        } else {
+          debug.errors.push(`${model}: 0 parseable fields from ${text.length} chars`);
+          lastErr = new Error(`0 parseable fields from ${text.length} chars`);
+          // Non-retryable: model responded but produced nothing useful.
+          // Move on to the next model.
+          break;
+        }
+      } catch (err: any) {
+        const errMsg = err?.message || String(err);
+        lastErr = err;
+        debug.errors.push(`${model} (attempt ${attempt + 1}): ${errMsg}`);
+        debug.rawResponses.push({ model, attempt, error: errMsg });
+
+        const isRetryable =
+          /429/.test(errMsg) ||            // rate limit
+          /503/.test(errMsg) ||            // server error
+          /overloaded/i.test(errMsg) ||
+          /rate.?limit/i.test(errMsg) ||
+          /SERVICE_UNAVAILABLE/i.test(errMsg) ||
+          /RESOURCE_EXHAUSTED/i.test(errMsg);
+
+        if (isRetryable && attempt < 2) {
+          const delay = Math.pow(2, attempt) * 1000; // 1s, 2s
+          debug.retries.push({ model, attempt: attempt + 1, delayMs: delay, reason: errMsg });
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+
+        // Non-retryable error (incl. TIMEOUT_30s) — break out of retry loop
+        // and fall through to the next model.
+        if (errMsg.startsWith("TIMEOUT_30s")) {
+          debug.errors.push(`${model}: timed out after 30s, falling back to next model`);
+        }
+        break;
       }
-
-      const response = await ai.models.generateContent({
-        model,
-        contents: [{ role: "user", parts }],
-      });
-
-      // Try multiple ways to get text from the response
-      let text = "";
-      if (typeof response.text === "string") {
-        text = response.text;
-      } else if (typeof response.text === "function") {
-        text = response.text();
-      } else if (response?.candidates?.[0]?.content?.parts?.[0]?.text) {
-        text = response.candidates[0].content.parts[0].text;
-      } else if (response?.response?.text) {
-        text = response.response.text;
-      }
-
-      debug.rawResponses.push({ model, textLength: text.length, preview: text.substring(0, 300) });
-
-      const parsed = extractJsonArray(text);
-      if (parsed.length > 0) {
-        debug.success = true;
-        debug.successModel = model;
-        return { fields: parsed, debug };
-      } else {
-        debug.errors.push(`${model}: 0 parseable fields from ${text.length} chars`);
-      }
-    } catch (err: any) {
-      const errMsg = err?.message || String(err);
-      debug.errors.push(`${model}: ${errMsg}`);
-      debug.rawResponses.push({ model, error: errMsg });
+    }
+    if (lastErr) {
+      // Already logged — continue to next model.
     }
   }
 
-  return { fields: [], debug };
+  return { fields: [], debug, model: null, rawResponse: null };
 }
 
 // --- Regex-based fallback extractor -----------------------------------------
@@ -297,7 +385,8 @@ function regexExtract(text: string): any[] {
     { key: "consignee", label: "Consignee/Importer", regex: /(?:consignee(?:\/importer)?\s*[:\-]?\s*)(.+?)(?:\n|$)/i, conf: 80 },
     { key: "declaredValue", label: "Total Declared Value", regex: /(?:total\s*(?:declared\s*)?value\s*[:\-]?\s*)(\$[\d,]+\.?\d*)/i, conf: 88 },
     { key: "htsCode", label: "HTS Code", regex: /(?:hts\s*(?:code)?\s*[:\-]?\s*)(\d{4}\.\d{2}\.\d{4})/i, conf: 90 },
-    { key: "netWeight", label: "Net Weight", regex: /(?:net\s*weight\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?))/i, conf: 85 },
+    { key: "netWeight", label: "Net Weight", regex: /(?:net\s*weight\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?|kilograms?))/i, conf: 85 },
+    { key: "grossWeight", label: "Gross Weight", regex: /(?:gross\s*weight\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?|kilograms?))/i, conf: 85 },
     { key: "countryOfOrigin", label: "Country of Origin", regex: /(?:country\s*of\s*origin\s*[:\-]?\s*)([A-Z]{2})/i, conf: 78 },
     { key: "carrier", label: "Carrier", regex: /(?:carrier\s*[:\-]?\s*)(.+?)(?:\n|$)/i, conf: 75 },
     { key: "portOfEntry", label: "Port of Entry", regex: /(?:port\s*of\s*entry\s*[:\-]?\s*)(.+?)(?:\n|$)/i, conf: 75 },
@@ -385,64 +474,127 @@ Deno.serve(async (req) => {
     let latestShipper: string | null = null;
     let latestConsignee: string | null = null;
     let geminiDebug: any = null;
+    // Track whether extraction failed completely for ANY document so we can
+    // return a clear error response at the end (rather than silently succeeding
+    // with zero fields).
+    let totalExtractionFailures = 0;
+    const failureDetails: any[] = [];
 
     // 4. Process each document
     for (const doc of docs) {
       let extracted: any[] = [];
+      let usedModel: string | null = null;
+      let rawAiResponse: string | null = null;
+      let extractionSource: "gemini" | "regex" | "mock" | "none" = "none";
+
+      // 4a. Download the file from Storage (admin client). This happens for
+      //     every document, regardless of whether Gemini is available, so the
+      //     regex fallback can still run on text-based files when no API key
+      //     is configured.
+      const { data: fileData, error: downloadErr } = await admin.storage
+        .from("documents")
+        .download(doc.storage_path);
+
+      if (downloadErr || !fileData) {
+        console.error(
+          "[extract-document] file download failed for",
+          doc.storage_path,
+          downloadErr
+        );
+        perDocResults.push({
+          documentId: doc.id,
+          file_name: doc.file_name,
+          status: "download_failed",
+          fields: [],
+        });
+        continue;
+      }
+
+      const ab = await fileData.arrayBuffer();
+      const base64 = bufToBase64(ab);
+      const mimeType = doc.mime_type || "application/octet-stream";
+
+      // For text-based files, extract the raw text. Used directly as the
+      // prompt when Gemini is enabled (cheaper than re-encoding as inlineData)
+      // AND as the input to the regex fallback when Gemini is unavailable.
+      let rawText: string | undefined;
+      if (mimeType.startsWith("text/")) {
+        try {
+          rawText = new TextDecoder().decode(ab);
+        } catch {
+          // If decode fails, fall back to inlineData
+        }
+      }
 
       if (ai) {
-        // 4a. Download the file from Storage (admin client)
-        const { data: fileData, error: downloadErr } = await admin.storage
-          .from("documents")
-          .download(doc.storage_path);
-
-        if (downloadErr || !fileData) {
-          console.error(
-            "[extract-document] file download failed for",
-            doc.storage_path,
-            downloadErr
-          );
-          perDocResults.push({
-            documentId: doc.id,
-            file_name: doc.file_name,
-            status: "download_failed",
-            fields: [],
-          });
-          continue;
-        }
-
-        const ab = await fileData.arrayBuffer();
-        const base64 = bufToBase64(ab);
-        const mimeType = doc.mime_type || "application/octet-stream";
-
-        // For text-based files, extract the raw text to pass to Gemini directly
-        let rawText: string | undefined;
-        if (mimeType.startsWith("text/")) {
-          try {
-            rawText = new TextDecoder().decode(ab);
-          } catch {
-            // If decode fails, fall back to inlineData
-          }
-        }
-
         const geminiResult = await callGeminiExtraction(ai, mimeType, base64, rawText);
         extracted = geminiResult.fields;
         geminiDebug = geminiResult.debug;
+        usedModel = geminiResult.model;
+        rawAiResponse = geminiResult.rawResponse;
+        if (extracted.length > 0) extractionSource = "gemini";
 
         // If Gemini returned 0 fields, try regex-based extraction on text
         if (extracted.length === 0 && rawText) {
           console.log("[extract-document] Gemini returned 0 fields, trying regex extraction");
           extracted = regexExtract(rawText);
-          if (geminiDebug) geminiDebug.regexFallback = extracted.length > 0;
+          if (extracted.length > 0) {
+            extractionSource = "regex";
+            if (geminiDebug) geminiDebug.regexFallback = true;
+          }
         }
       } else {
         // No Gemini key — use regex extraction if we have text, else mock
         if (rawText) {
           extracted = regexExtract(rawText);
+          if (extracted.length > 0) extractionSource = "regex";
         }
         if (extracted.length === 0) {
           extracted = mockFields();
+          if (extracted.length > 0) extractionSource = "mock";
         }
+      }
+
+      // 4a-bis. Persist raw AI response to audit_logs for compliance/debug.
+      // We truncate to 500 chars to avoid bloating the audit log.
+      if (rawAiResponse) {
+        const truncated = rawAiResponse.length > 500
+          ? rawAiResponse.substring(0, 500) + `…(+${rawAiResponse.length - 500} chars)`
+          : rawAiResponse;
+        await userClient.from("audit_logs").insert({
+          shipment_id: shipmentId,
+          user_id: user.id,
+          text: `Gemini raw response (model: ${usedModel}, fields: ${extracted.length}) — doc ${doc.file_name}: ${truncated}`,
+          type: "info",
+        }).then(({ error: alErr }: any) => {
+          if (alErr) {
+            console.warn("[extract-document] audit_log insert failed for raw response:", alErr.message);
+          }
+        });
+      }
+
+      // 4a-ter. If Gemini AND regex both returned nothing, record the failure.
+      // We still proceed to write whatever fields we DID get (likely none for
+      // this doc), and continue with the next document. We surface the
+      // aggregate failure at the end of the response.
+      if (extracted.length === 0) {
+        totalExtractionFailures++;
+        failureDetails.push({
+          documentId: doc.id,
+          file_name: doc.file_name,
+          reason: "no fields extracted from any model or regex",
+          modelsTried: geminiDebug?.modelsTried || [],
+          errors: geminiDebug?.errors || [],
+        });
+        perDocResults.push({
+          documentId: doc.id,
+          file_name: doc.file_name,
+          doc_type: doc.doc_type,
+          status: "extraction_failed",
+          fieldsCount: 0,
+          fields: [],
+        });
+        continue;
       }
 
       // 4b. Normalize + write to document_fields
@@ -501,6 +653,8 @@ Deno.serve(async (req) => {
         file_name: doc.file_name,
         doc_type: doc.doc_type,
         status: "extracted",
+        extractionSource,
+        model: usedModel,
         fieldsCount: writtenFields.length,
         fields: writtenFields,
       });
@@ -532,7 +686,38 @@ Deno.serve(async (req) => {
       type: "success",
     });
 
-    // 7. Respond — the response mirrors ExtractDocumentResponse shape
+    // 7. Respond — the response mirrors ExtractDocumentResponse shape.
+    // If ALL models failed AND regex returned nothing for every document,
+    // return a clear error instead of silently succeeding with 0 fields.
+    const totalDocsAttempted = docs.length;
+    if (
+      ai &&
+      allFields.length === 0 &&
+      totalExtractionFailures === totalDocsAttempted &&
+      totalDocsAttempted > 0
+    ) {
+      // Every document failed extraction — surface a clear, actionable error.
+      await userClient.from("audit_logs").insert({
+        shipment_id: shipmentId,
+        user_id: user.id,
+        text: `Extraction failed: all models unavailable across ${totalDocsAttempted} document(s).`,
+        type: "error",
+      });
+
+      return jsonRes(
+        {
+          success: false,
+          error: "Extraction failed: all models unavailable",
+          details: {
+            documentsAttempted: totalDocsAttempted,
+            failures: failureDetails,
+            debug: geminiDebug,
+          },
+        },
+        502
+      );
+    }
+
     return jsonRes({
       success: true,
       shipmentId,
@@ -549,6 +734,15 @@ Deno.serve(async (req) => {
       consignee: latestConsignee || undefined,
       geminiUsed: !!ai,
       debug: geminiDebug,
+      ...(totalExtractionFailures > 0
+        ? {
+            partialFailure: {
+              failedDocuments: totalExtractionFailures,
+              totalDocuments: totalDocsAttempted,
+              details: failureDetails,
+            },
+          }
+        : {}),
     });
   } catch (err: any) {
     console.error("[extract-document] unhandled error:", err);

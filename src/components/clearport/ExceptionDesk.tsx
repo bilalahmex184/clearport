@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { supabase, invokeEdgeFunction } from '@/lib/supabase';
+import { canResolve, roleLabel } from '@/lib/services/rbac.service';
 
 export default function ExceptionDesk() {
   const {
@@ -20,7 +21,14 @@ export default function ExceptionDesk() {
     undoLastAction,
     acceptAllHighConfidence,
     rules,
+    userRole,
   } = useClearPort();
+
+  // RBAC: viewer role cannot resolve exceptions. They can still browse the
+  // document viewer + exception list (read-only), but the Accept / Modify /
+  // Reject buttons are hidden and the keyboard shortcuts that mutate state
+  // are disabled below.
+  const canResolveExceptions = canResolve(userRole);
 
   const [severityFilter, setSeverityFilter] = React.useState<'All' | 'High' | 'Medium' | 'Low'>('All');
   const [sortBy, setSortBy] = React.useState<'severity' | 'confidence' | 'fieldName'>('severity');
@@ -107,10 +115,15 @@ export default function ExceptionDesk() {
       if (!selectedException || !selectedEntry) return;
 
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        // Undo is a resolve-adjacent action — gated by the same RBAC check.
+        if (!canResolveExceptions) return;
         e.preventDefault();
         undoLastAction();
         return;
       }
+
+      // Accept / Modify / Reject shortcuts are no-ops for viewer role.
+      if (!canResolveExceptions) return;
 
       if (e.key === ' ') {
         e.preventDefault();
@@ -131,7 +144,7 @@ export default function ExceptionDesk() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedException, selectedEntry, updateException, undoLastAction]);
+  }, [selectedException, selectedEntry, updateException, undoLastAction, canResolveExceptions]);
 
   if (!selectedEntry) {
     return (
@@ -235,7 +248,7 @@ export default function ExceptionDesk() {
             </select>
           </div>
 
-          {highConfidenceCount > 0 && (
+          {highConfidenceCount > 0 && canResolveExceptions && (
             <button
               onClick={() => acceptAllHighConfidence(selectedEntry.id)}
               className="w-full flex items-center justify-center gap-1.5 text-xs bg-emerald-950/30 text-emerald-400 border border-emerald-900/50 hover:bg-emerald-900/20 py-2 rounded-md transition-all cursor-pointer font-medium mt-1"
@@ -243,6 +256,16 @@ export default function ExceptionDesk() {
               <Sparkles className="w-3.5 h-3.5" />
               Accept {highConfidenceCount} Fields ≥ {rules.invoiceThreshold}% Conf
             </button>
+          )}
+
+          {!canResolveExceptions && (
+            <div className="mt-1 flex items-start gap-1.5 text-[10px] text-amber-500/90 bg-amber-950/20 border border-amber-900/40 rounded-md p-2 font-mono leading-relaxed">
+              <AlertCircle className="w-3 h-3 shrink-0 mt-0.5" />
+              <span>
+                READ-ONLY ({roleLabel(userRole)}) — Accept / Modify / Reject are
+                disabled. Switch to an operator / admin session to resolve exceptions.
+              </span>
+            </div>
           )}
         </div>
 
@@ -566,58 +589,82 @@ export default function ExceptionDesk() {
                 ) : (
                   <div className="flex items-center justify-between bg-black border border-gray-900 rounded-lg p-2.5">
                     <span className="font-mono text-sm font-bold text-emerald-400">{editValue}</span>
-                    <button
-                      onClick={() => {
-                        setIsEditing(true);
-                        setTimeout(() => inputRef.current?.focus(), 50);
-                      }}
-                      className="text-xs text-gray-400 hover:text-white bg-gray-900 hover:bg-gray-800 border border-gray-800 px-2 py-1 rounded transition-all cursor-pointer"
-                    >
-                      Edit Field
-                    </button>
+                    {canResolveExceptions ? (
+                      <button
+                        onClick={() => {
+                          setIsEditing(true);
+                          setTimeout(() => inputRef.current?.focus(), 50);
+                        }}
+                        className="text-xs text-gray-400 hover:text-white bg-gray-900 hover:bg-gray-800 border border-gray-800 px-2 py-1 rounded transition-all cursor-pointer"
+                      >
+                        Edit Field
+                      </button>
+                    ) : (
+                      <span className="text-[10px] font-mono uppercase text-gray-600 px-2 py-1">
+                        Read-only
+                      </span>
+                    )}
                   </div>
                 )}
               </div>
 
-              {/* Action buttons */}
-              <div className="pt-3 grid grid-cols-3 gap-2">
-                <button
-                  onClick={() => updateException(selectedEntry.id, selectedException.id, 'Accepted')}
-                  className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
-                    selectedException.status === 'Accepted'
-                      ? 'bg-emerald-950 text-emerald-400 border-emerald-800'
-                      : 'bg-black border-gray-900 text-emerald-500 hover:bg-emerald-950/20'
-                  }`}
-                >
-                  <CheckCircle2 className="w-4 h-4" />
-                  <span>Accept [Space]</span>
-                </button>
-                <button
-                  onClick={() => {
-                    setIsEditing(true);
-                    setTimeout(() => inputRef.current?.focus(), 50);
-                  }}
-                  className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
-                    selectedException.status === 'Corrected'
-                      ? 'bg-blue-950 text-blue-400 border-blue-800'
-                      : 'bg-black border-gray-900 text-blue-500 hover:bg-blue-950/20'
-                  }`}
-                >
-                  <RefreshCw className="w-4 h-4" />
-                  <span>Modify [E]</span>
-                </button>
-                <button
-                  onClick={() => updateException(selectedEntry.id, selectedException.id, 'Rejected')}
-                  className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
-                    selectedException.status === 'Rejected'
-                      ? 'bg-red-950 text-red-400 border-red-800'
-                      : 'bg-black border-gray-900 text-red-500 hover:bg-red-950/20'
-                  }`}
-                >
-                  <XCircle className="w-4 h-4" />
-                  <span>Reject [R]</span>
-                </button>
-              </div>
+              {/* Action buttons — gated by canResolve. Viewer role sees a
+                  locked notice instead of the Accept / Modify / Reject row. */}
+              {canResolveExceptions ? (
+                <div className="pt-3 grid grid-cols-3 gap-2">
+                  <button
+                    onClick={() => updateException(selectedEntry.id, selectedException.id, 'Accepted')}
+                    className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
+                      selectedException.status === 'Accepted'
+                        ? 'bg-emerald-950 text-emerald-400 border-emerald-800'
+                        : 'bg-black border-gray-900 text-emerald-500 hover:bg-emerald-950/20'
+                    }`}
+                  >
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>Accept [Space]</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setIsEditing(true);
+                      setTimeout(() => inputRef.current?.focus(), 50);
+                    }}
+                    className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
+                      selectedException.status === 'Corrected'
+                        ? 'bg-blue-950 text-blue-400 border-blue-800'
+                        : 'bg-black border-gray-900 text-blue-500 hover:bg-blue-950/20'
+                    }`}
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    <span>Modify [E]</span>
+                  </button>
+                  <button
+                    onClick={() => updateException(selectedEntry.id, selectedException.id, 'Rejected')}
+                    className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
+                      selectedException.status === 'Rejected'
+                        ? 'bg-red-950 text-red-400 border-red-800'
+                        : 'bg-black border-gray-900 text-red-500 hover:bg-red-950/20'
+                    }`}
+                  >
+                    <XCircle className="w-4 h-4" />
+                    <span>Reject [R]</span>
+                  </button>
+                </div>
+              ) : (
+                <div className="pt-3 grid grid-cols-3 gap-2">
+                  <div className="py-2 px-1 text-xs rounded-lg font-medium border bg-black/40 border-gray-900 text-gray-600 flex flex-col items-center justify-center gap-1 opacity-60 cursor-not-allowed">
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>Accept</span>
+                  </div>
+                  <div className="py-2 px-1 text-xs rounded-lg font-medium border bg-black/40 border-gray-900 text-gray-600 flex flex-col items-center justify-center gap-1 opacity-60 cursor-not-allowed">
+                    <RefreshCw className="w-4 h-4" />
+                    <span>Modify</span>
+                  </div>
+                  <div className="py-2 px-1 text-xs rounded-lg font-medium border bg-black/40 border-gray-900 text-gray-600 flex flex-col items-center justify-center gap-1 opacity-60 cursor-not-allowed">
+                    <XCircle className="w-4 h-4" />
+                    <span>Reject</span>
+                  </div>
+                </div>
+              )}
 
               {/* Audit trail */}
               <div className="pt-4 border-t border-gray-900">
@@ -656,13 +703,21 @@ export default function ExceptionDesk() {
             {/* Keyboard shortcuts footer */}
             <div className="p-3 bg-black/40 border-t border-gray-900 flex justify-between items-center text-[10px] text-gray-500 font-mono select-none">
               <div className="flex items-center gap-1">
-                <kbd className="bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 text-gray-300 font-bold uppercase">Space</kbd> Accept
-                <kbd className="bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 text-gray-300 font-bold uppercase ml-2">E</kbd> Edit
-                <kbd className="bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 text-gray-300 font-bold uppercase ml-2">R</kbd> Reject
+                <kbd className={`bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 font-bold uppercase ${canResolveExceptions ? 'text-gray-300' : 'text-gray-700'}`}>Space</kbd>
+                <span className={canResolveExceptions ? '' : 'text-gray-700'}>Accept</span>
+                <kbd className={`bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 font-bold uppercase ml-2 ${canResolveExceptions ? 'text-gray-300' : 'text-gray-700'}`}>E</kbd>
+                <span className={canResolveExceptions ? '' : 'text-gray-700'}>Edit</span>
+                <kbd className={`bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 font-bold uppercase ml-2 ${canResolveExceptions ? 'text-gray-300' : 'text-gray-700'}`}>R</kbd>
+                <span className={canResolveExceptions ? '' : 'text-gray-700'}>Reject</span>
               </div>
               <button
-                onClick={undoLastAction}
-                className="flex items-center gap-1 text-[11px] text-gray-400 hover:text-white hover:bg-gray-900 border border-gray-800 px-2 py-1 rounded transition-all cursor-pointer font-bold uppercase"
+                onClick={canResolveExceptions ? undoLastAction : undefined}
+                disabled={!canResolveExceptions}
+                className={`flex items-center gap-1 text-[11px] border px-2 py-1 rounded font-bold uppercase transition-all ${
+                  canResolveExceptions
+                    ? 'text-gray-400 hover:text-white hover:bg-gray-900 border-gray-800 cursor-pointer'
+                    : 'text-gray-700 border-gray-900 bg-gray-950/50 cursor-not-allowed'
+                }`}
               >
                 <Undo2 className="w-3.5 h-3.5 text-gray-500" />
                 Undo [Ctrl+Z]

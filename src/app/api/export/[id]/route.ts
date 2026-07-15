@@ -19,7 +19,7 @@
 
 import { requireUserClient } from '@/lib/services/auth.service';
 import { getShipmentById } from '@/lib/services/shipment.service';
-import { insertAuditLog } from '@/lib/services/audit-log.service';
+import { logExport } from '@/lib/services/audit-log.service';
 import { errorResponse, AppError } from '@/lib/utils/error-handler';
 import { logger } from '@/lib/utils/logger';
 import type { ShipmentEntry } from '@/lib/clearport-types';
@@ -128,12 +128,10 @@ export async function GET(
     const csv = buildCsv(shipment, exportedBy);
     const filename = `ClearPort_Audit_${id}.csv`;
 
-    // Best-effort audit log entry.
-    await insertAuditLog(client, {
-      text: `Audit logs exported to CSV for ${id}`,
-      type: 'success',
-      shipmentId: id,
-    }).catch((err) => {
+    // Best-effort structured audit log entry — uses the new logExport helper
+    // so the log line follows the "[export] User X exported CSV for Y" format
+    // that auditors can grep / filter on.
+    await logExport(client, exportedBy, id, 'CSV').catch((err) => {
       logger.warn('export: audit log insert failed', {
         error: err instanceof Error ? err.message : String(err),
       });

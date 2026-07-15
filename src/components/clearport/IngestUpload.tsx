@@ -2,14 +2,20 @@
 
 import * as React from 'react';
 import { useClearPort } from '@/context/ClearPortContext';
-import { UploadCloud, CheckCircle2, FileText, Loader2, Sparkles, AlertCircle, HelpCircle, XCircle } from 'lucide-react';
+import { UploadCloud, CheckCircle2, FileText, Loader2, Sparkles, AlertCircle, HelpCircle, XCircle, Lock } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { supabase } from '@/lib/supabase';
+import { canUpload, roleLabel } from '@/lib/services/rbac.service';
 
 type StepType = 'idle' | 'uploading' | 'detecting' | 'extracting' | 'done';
 
 export default function IngestUpload() {
-  const { uploadDocuments, entries, setActiveTab } = useClearPort();
+  const { uploadDocuments, entries, setActiveTab, userRole } = useClearPort();
+
+  // RBAC: viewer role cannot upload. Show a locked panel instead of the
+  // drag/drop zone so the viewer can still see recent shipment clusters
+  // on the right side (read-only access to existing data).
+  const canUploadFiles = canUpload(userRole);
   const [uploadStep, setUploadStep] = React.useState<StepType>('idle');
   const [uploadProgress, setUploadProgress] = React.useState(0);
   const [detectedType, setDetectedType] = React.useState('Commercial Invoice');
@@ -69,6 +75,13 @@ export default function IngestUpload() {
   };
 
   const handleFileUpload = async (files: File[]) => {
+    // Defense in depth — the upload button is hidden for viewer role, but
+    // if a keyboard shortcut / devtools bypass reaches here, bail out.
+    if (!canUploadFiles) {
+      setErrorMsg('Your role does not have permission to upload documents.');
+      return;
+    }
+
     // Validate first file
     const file = files[0];
     const allowedMimeTypes = ['application/pdf', 'image/png', 'image/jpeg', 'image/jpg', 'image/tiff', 'text/plain', 'text/csv'];
@@ -176,6 +189,31 @@ export default function IngestUpload() {
           </div>
         )}
 
+        {/* RBAC: viewer role sees a locked panel instead of the drag/drop
+            zone. They can still browse existing shipments on the right. */}
+        {!canUploadFiles && (
+          <div className="text-center space-y-5 max-w-md mx-auto px-4">
+            <div className="w-16 h-16 bg-gray-950 rounded-2xl flex items-center justify-center border border-gray-900 shadow-xl mb-5 mx-auto">
+              <Lock className="w-8 h-8 text-amber-500" />
+            </div>
+            <h3 className="text-lg font-bold text-gray-200 tracking-tight">Upload Restricted</h3>
+            <p className="text-xs text-gray-500 max-w-sm mx-auto leading-relaxed">
+              Your role is <span className="font-bold text-gray-300">{roleLabel(userRole)}</span>.
+              Ingesting new shipment documents requires an <span className="font-mono">operator</span> or
+              <span className="font-mono"> admin</span> role. Contact your ClearPort administrator to
+              request a role upgrade, or browse existing shipments below.
+            </p>
+            <button
+              onClick={() => setActiveTab('entry-detail')}
+              className="inline-flex items-center gap-2 bg-gray-950 border border-gray-900 hover:border-gray-700 px-4 py-2 rounded-lg text-xs font-semibold text-gray-300 transition-all cursor-pointer"
+            >
+              <FileText className="w-4 h-4" />
+              <span>Browse Existing Shipments</span>
+            </button>
+          </div>
+        )}
+
+        {canUploadFiles && (
         <AnimatePresence mode="wait">
           {uploadStep === 'idle' && (
             <motion.div
@@ -377,6 +415,7 @@ export default function IngestUpload() {
             </motion.div>
           )}
         </AnimatePresence>
+        )}
       </div>
 
       {/* RIGHT: Cluster feed */}

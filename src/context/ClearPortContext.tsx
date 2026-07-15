@@ -24,6 +24,10 @@ import type {
   ReviewerAction,
   ExceptionHistoryEntry,
 } from '@/lib/clearport-types';
+import {
+  getDefaultRole,
+  type UserRole,
+} from '@/lib/services/rbac.service';
 
 // ============================================================================
 // Context Type
@@ -47,6 +51,11 @@ interface ClearPortContextType {
   edgeFunctionStatus: EdgeFunctionStatus;
   currentUser: string;
   currentTime: string;
+  // RBAC role for the current user — anonymous users default to 'operator'
+  // so the no-login UX continues to work. Components use the can* helpers
+  // (canUpload, canResolve, canManageRules, canExport) from rbac.service
+  // to gate their interactive UI.
+  userRole: UserRole;
 
   // Actions
   selectEntry: (id: string) => void;
@@ -83,6 +92,9 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [edgeFunctionStatus, setEdgeFunctionStatus] = React.useState<EdgeFunctionStatus>('unknown');
   const [currentUser, setCurrentUser] = React.useState<string>('Broker');
   const [currentTime, setCurrentTime] = React.useState<string>('');
+  // Anonymous users default to 'operator'. In production this would be
+  // fetched from the server (e.g. GET /api/me → role from user_roles table).
+  const [userRole, setUserRole] = React.useState<UserRole>(getDefaultRole());
 
   // --- Real-time clock ---
   React.useEffect(() => {
@@ -807,6 +819,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     edgeFunctionStatus,
     currentUser,
     currentTime,
+    userRole,
     selectEntry,
     selectException,
     setActiveTab,

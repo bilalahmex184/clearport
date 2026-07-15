@@ -9,6 +9,7 @@
 import { createClient, type SupabaseClient, type User } from '@supabase/supabase-js';
 import { AppError } from '@/lib/utils/error-handler';
 import { logger } from '@/lib/utils/logger';
+import { getDefaultRole, type UserRole } from '@/lib/services/rbac.service';
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -96,4 +97,21 @@ export function getUserEmail(user: User): string {
   if (user.email) return user.email;
   const shortId = user.id.slice(0, 8);
   return `anon-${shortId}@clearport.local`;
+}
+
+/**
+ * Resolve the user's RBAC role.
+ *
+ * In production this would query a `user_roles` table (e.g.
+ * `SELECT role FROM user_roles WHERE user_id = auth.uid()`) or read a custom
+ * claim from the JWT set by an external IdP (Supabase custom claims, Auth0,
+ * Okta). For now, anonymous users get the 'operator' role by default so the
+ * no-login UX is preserved while the RBAC framework is in place.
+ *
+ * The `user` parameter is accepted (not used today) so callers don't have to
+ * change their signatures once we wire up real role lookup.
+ */
+export function getUserRole(_user: User): UserRole {
+  // TODO(production): query user_roles table or read from user.app_metadata.role
+  return getDefaultRole();
 }

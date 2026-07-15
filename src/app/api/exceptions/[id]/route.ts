@@ -16,7 +16,8 @@
 // ============================================================================
 
 import { NextResponse } from 'next/server';
-import { requireUserClient, getUserEmail } from '@/lib/services/auth.service';
+import { requireUserClient, getUserEmail, getUserRole } from '@/lib/services/auth.service';
+import { canResolve } from '@/lib/services/rbac.service';
 import {
   updateException,
   type UpdateExceptionInput,
@@ -32,6 +33,16 @@ export async function PATCH(
   try {
     const { user, client } = await requireUserClient(req);
     const { id } = await params;
+
+    // RBAC: resolving an exception (accept / correct / reject) requires the
+    // 'resolve' permission. viewer role gets 403.
+    const role = getUserRole(user);
+    if (!canResolve(role)) {
+      return NextResponse.json(
+        { error: 'Insufficient permissions', code: 'FORBIDDEN' },
+        { status: 403 },
+      );
+    }
 
     const body = await req.json().catch(() => null);
     if (!body) {

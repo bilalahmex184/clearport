@@ -13,7 +13,8 @@
 // ============================================================================
 
 import { NextResponse } from 'next/server';
-import { requireUserClient, getUserEmail } from '@/lib/services/auth.service';
+import { requireUserClient, getUserEmail, getUserRole } from '@/lib/services/auth.service';
+import { canUpload } from '@/lib/services/rbac.service';
 import {
   getShipments,
   createShipment,
@@ -64,6 +65,15 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   try {
     const { user, client } = await requireUserClient(req);
+
+    // RBAC: creating a shipment is considered an upload action.
+    const role = getUserRole(user);
+    if (!canUpload(role)) {
+      return NextResponse.json(
+        { error: 'Insufficient permissions', code: 'FORBIDDEN' },
+        { status: 403 },
+      );
+    }
 
     const body = await req.json().catch(() => null);
     if (!body) {

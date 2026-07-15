@@ -15,8 +15,10 @@
 
 import { NextResponse } from 'next/server';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { requireUserClient } from '@/lib/services/auth.service';
+import { requireUserClient, getUserRole, getUserEmail } from '@/lib/services/auth.service';
+import { canManageRules } from '@/lib/services/rbac.service';
 import { updateRulesSchema } from '@/lib/validators/rules.validator';
+import { logRulesUpdate } from '@/lib/services/audit-log.service';
 import { errorResponse, AppError } from '@/lib/utils/error-handler';
 import { logger } from '@/lib/utils/logger';
 import type {
@@ -124,6 +126,16 @@ export async function PATCH(req: Request) {
   try {
     const { client, user } = await requireUserClient(req);
 
+    // RBAC: tuning operational thresholds is an admin-only action. operator
+    // and viewer can read the rules (GET above) but cannot mutate them.
+    const role = getUserRole(user);
+    if (!canManageRules(role)) {
+      return NextResponse.json(
+        { error: 'Insufficient permissions: manage_rules required', code: 'FORBIDDEN' },
+        { status: 403 },
+      );
+    }
+
     const body = await req.json().catch(() => null);
     if (!body) {
       return NextResponse.json(
@@ -165,6 +177,18 @@ export async function PATCH(req: Request) {
     }
 
     logger.info('Operational rules updated via API', { rules: merged });
+
+    // Structured audit log — records which thresholds changed + who changed
+    // them. Best-effort: failures are logged but don't break the response.
+    await logRulesUpdate(client, getUserEmail(user), {
+      invoiceThreshold: merged.invoiceThreshold,
+      htsThreshold: merged.htsThreshold,
+      partiesThreshold: merged.partiesThreshold,
+    }).catch((err) => {
+      logger.warn('rules: audit log failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
 
     return NextResponse.json({ rules: merged });
   } catch (err) {

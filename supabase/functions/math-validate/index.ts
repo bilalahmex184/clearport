@@ -60,25 +60,58 @@ function parseNumber(v: string | null | undefined): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-// Pull weight number + unit from "1234 kg" / "1,234.5 lb" / "500g"
+// Normalize unit strings to canonical short forms BEFORE any comparison.
+//   "lbs", "lb", "pounds", "pound"  → "lbs"
+//   "kg", "kgs", "kilograms", "kilogram" → "kg"
+//   "g", "gram", "grams"            → "g"
+//   "oz", "ounce", "ounces"         → "oz"
+//   "ton", "tons", "tonne", "tonnes" → "tons"
+// Anything else is returned lowercased as-is so unknown units don't silently
+// collapse together (which would cause false-positive mismatches).
+function normalizeUnit(raw: string | null | undefined): string {
+  if (!raw) return "";
+  const u = String(raw).trim().toLowerCase();
+  if (u === "lb" || u === "lbs" || u === "pound" || u === "pounds") return "lbs";
+  if (u === "kg" || u === "kgs" || u === "kilogram" || u === "kilograms") return "kg";
+  if (u === "g" || u === "gram" || u === "grams") return "g";
+  if (u === "oz" || u === "ounce" || u === "ounces") return "oz";
+  if (u === "ton" || u === "tons" || u === "tonne" || u === "tonnes") return "tons";
+  return u;
+}
+
+// Pull weight number + unit from "1234 kg" / "1,234.5 lb" / "500g" / "500 pounds"
+// The unit is normalized to its canonical short form via normalizeUnit().
 function parseWeight(v: string | null | undefined): { value: number; unit: string } | null {
   if (!v) return null;
-  const m = String(v).match(/^([\d,]+(?:\.\d+)?)\s*(kg|kgs|lbs?|g|oz|tons?)?$/i);
+  // Accept spelled-out unit forms (pounds, kilograms, etc.) in addition to
+  // the short forms handled previously.
+  const m = String(v).match(
+    /^([\d,]+(?:\.\d+)?)\s*(kg|kgs|kilograms?|lbs?|pounds?|g|grams?|oz|ounces?|tons?|tonnes?)?$/i
+  );
   if (!m) return null;
   const value = Number(m[1].replace(/,/g, ""));
-  const unit = (m[2] || "").toLowerCase();
+  const unit = normalizeUnit(m[2]);
   if (!Number.isFinite(value)) return null;
   return { value, unit };
 }
 
-// Convert weight to kg for comparison
+// Convert a parsed weight to kg for comparison. Uses the canonical unit
+// produced by normalizeUnit() so we don't need to handle every spelling here.
 function toKg(w: { value: number; unit: string }): number {
-  const u = (w.unit || "").toLowerCase();
-  if (u.startsWith("lb")) return w.value * 0.45359237;
-  if (u === "g") return w.value / 1000;
-  if (u === "oz") return w.value * 0.0283495231;
-  if (u.startsWith("ton")) return w.value * 907.18474; // assume short ton
-  return w.value; // kg or unspecified
+  switch (w.unit) {
+    case "lbs":
+      return w.value * 0.45359237;
+    case "g":
+      return w.value / 1000;
+    case "oz":
+      return w.value * 0.0283495231;
+    case "tons":
+      return w.value * 907.18474; // assume short ton
+    case "kg":
+    case "": // unspecified — assume kg
+    default:
+      return w.value;
+  }
 }
 
 // --- Main handler -----------------------------------------------------------
@@ -236,39 +269,80 @@ Deno.serve(async (req) => {
       }
     }
 
-    // 2c. grossWeight >= netWeight (when both present in same shipment)
+    // 2c. grossWeight >= netWeight
+    //    First check per-document pairs (gross + net on the SAME document —
+    //    that's the most meaningful comparison). Then fall back to a shipment-
+    //    level comparison (first gross vs first net) for the case where the
+    //    two fields live on different documents.
     if (grouped.grossWeight && grouped.netWeight) {
       const gross = grouped.grossWeight
         .map((f) => ({ f, w: parseWeight(f.extracted_value) }))
-        .filter((x) => x.w != null);
+        .filter((x) => x.w != null) as Array<{ f: any; w: { value: number; unit: string } }>;
       const net = grouped.netWeight
         .map((f) => ({ f, w: parseWeight(f.extracted_value) }))
-        .filter((x) => x.w != null);
+        .filter((x) => x.w != null) as Array<{ f: any; w: { value: number; unit: string } }>;
 
       if (gross.length > 0 && net.length > 0) {
-        const grossKg = toKg(gross[0].w);
-        const netKg = toKg(net[0].w);
-        if (grossKg < netKg) {
-          const errMsg = `Gross weight (${gross[0].f.extracted_value}) is less than net weight (${net[0].f.extracted_value}) — gross must be >= net`;
-          errors.push({
-            type: "gross_less_than_net",
-            field_key: "grossWeight",
-            message: errMsg,
-            values: [grossKg, netKg],
-          });
-          exceptionsToInsert.push({
-            shipment_id: shipmentId,
-            field_id: gross[0].f.id,
-            user_id: user.id,
-            field_key: "grossWeight",
-            field_name: "Gross Weight",
-            extracted_value: gross[0].f.extracted_value,
-            confidence: gross[0].f.confidence,
-            reason: errMsg,
-            exception_type: "math_error",
-            doc_type: gross[0].f.documents?.doc_type || null,
-            status: "Unresolved",
-          });
+        // Try to find a per-document pair first (most accurate check).
+        let checkedPair = false;
+        for (const g of gross) {
+          const matchingNet = net.find((n) => n.f.document_id === g.f.document_id);
+          if (!matchingNet) continue;
+          const grossKg = toKg(g.w);
+          const netKg = toKg(matchingNet.w);
+          if (grossKg < netKg) {
+            const errMsg = `Gross weight (${g.f.extracted_value}) is less than net weight (${matchingNet.f.extracted_value}) on document ${g.f.documents?.file_name || g.f.document_id} — gross must be >= net`;
+            errors.push({
+              type: "gross_less_than_net",
+              field_key: "grossWeight",
+              message: errMsg,
+              values: [grossKg, netKg],
+              document_id: g.f.document_id,
+            });
+            exceptionsToInsert.push({
+              shipment_id: shipmentId,
+              field_id: g.f.id,
+              user_id: user.id,
+              field_key: "grossWeight",
+              field_name: "Gross Weight",
+              extracted_value: g.f.extracted_value,
+              confidence: g.f.confidence,
+              reason: errMsg,
+              exception_type: "math_error",
+              doc_type: g.f.documents?.doc_type || null,
+              status: "Unresolved",
+            });
+          }
+          checkedPair = true;
+        }
+
+        // Fallback: no per-document pair, but the shipment has both fields —
+        // compare the first gross vs the first net as a sanity check.
+        if (!checkedPair) {
+          const grossKg = toKg(gross[0].w);
+          const netKg = toKg(net[0].w);
+          if (grossKg < netKg) {
+            const errMsg = `Gross weight (${gross[0].f.extracted_value}) is less than net weight (${net[0].f.extracted_value}) — gross must be >= net`;
+            errors.push({
+              type: "gross_less_than_net",
+              field_key: "grossWeight",
+              message: errMsg,
+              values: [grossKg, netKg],
+            });
+            exceptionsToInsert.push({
+              shipment_id: shipmentId,
+              field_id: gross[0].f.id,
+              user_id: user.id,
+              field_key: "grossWeight",
+              field_name: "Gross Weight",
+              extracted_value: gross[0].f.extracted_value,
+              confidence: gross[0].f.confidence,
+              reason: errMsg,
+              exception_type: "math_error",
+              doc_type: gross[0].f.documents?.doc_type || null,
+              status: "Unresolved",
+            });
+          }
         }
       }
     }
@@ -337,7 +411,7 @@ Deno.serve(async (req) => {
     await userClient.from("audit_logs").insert({
       shipment_id: shipmentId,
       user_id: user.id,
-      text: `Math validation: ${errors.length} error(s) detected; ${exceptionsToInsert.length} exception(s) created.`,
+      text: `Math validation: ${errors.length} error(s) detected; ${exceptionsToInsert.length} exception(s) created. Unit normalization applied (lbs/lb/pounds→lbs, kg/kgs/kilograms→kg, etc.) before comparison.`,
       type: errors.length > 0 ? "warning" : "success",
     });
 

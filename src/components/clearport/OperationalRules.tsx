@@ -2,12 +2,19 @@
 
 import * as React from 'react';
 import { useClearPort } from '@/context/ClearPortContext';
-import { Sliders, ShieldCheck, Users, Link2, AlertCircle } from 'lucide-react';
+import { Sliders, ShieldCheck, Users, Link2, AlertCircle, Lock } from 'lucide-react';
+import { canManageRules, roleLabel } from '@/lib/services/rbac.service';
 
 export default function OperationalRules() {
-  const { rules, updateRules, currentUser } = useClearPort();
+  const { rules, updateRules, currentUser, userRole } = useClearPort();
+
+  // RBAC: tuning thresholds is an admin-only action. operator + viewer see
+  // the current values but the sliders are disabled and the PATCH route
+  // returns 403 if they try anyway (defense in depth).
+  const canEditRules = canManageRules(userRole);
 
   const handleSliderChange = (category: 'invoiceThreshold' | 'htsThreshold' | 'partiesThreshold', value: number) => {
+    if (!canEditRules) return;
     updateRules({ [category]: value });
   };
 
@@ -32,6 +39,17 @@ export default function OperationalRules() {
             <p className="text-xs text-gray-500 mt-0.5">Control the margin of acceptable OCR confidence before triggering human exceptions. These values are applied during the flag-exceptions pipeline step.</p>
           </div>
 
+          {!canEditRules && (
+            <div className="flex items-start gap-2 text-[11px] text-amber-400 bg-amber-950/20 border border-amber-900/40 rounded-lg p-3 font-mono leading-relaxed">
+              <Lock className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+              <span>
+                THRESHOLDS LOCKED — your role is <span className="font-bold">{roleLabel(userRole)}</span>.
+                Only an Administrator can modify operational thresholds. The
+                values below are read-only.
+              </span>
+            </div>
+          )}
+
           <div className="space-y-6">
             {/* Slider 1: Invoice totals */}
             <div className="space-y-2">
@@ -48,7 +66,12 @@ export default function OperationalRules() {
                 step="5"
                 value={rules.invoiceThreshold}
                 onChange={e => handleSliderChange('invoiceThreshold', parseInt(e.target.value))}
-                className="w-full accent-amber-500 cursor-pointer h-1.5 bg-gray-900 rounded-lg appearance-none"
+                disabled={!canEditRules}
+                className={`w-full h-1.5 bg-gray-900 rounded-lg appearance-none ${
+                  canEditRules
+                    ? 'accent-amber-500 cursor-pointer'
+                    : 'accent-gray-700 cursor-not-allowed opacity-60'
+                }`}
               />
               <p className="text-[11px] text-gray-500 leading-normal">
                 {rules.invoiceThreshold >= 80
@@ -72,7 +95,12 @@ export default function OperationalRules() {
                 step="5"
                 value={rules.htsThreshold}
                 onChange={e => handleSliderChange('htsThreshold', parseInt(e.target.value))}
-                className="w-full accent-amber-500 cursor-pointer h-1.5 bg-gray-900 rounded-lg appearance-none"
+                disabled={!canEditRules}
+                className={`w-full h-1.5 bg-gray-900 rounded-lg appearance-none ${
+                  canEditRules
+                    ? 'accent-amber-500 cursor-pointer'
+                    : 'accent-gray-700 cursor-not-allowed opacity-60'
+                }`}
               />
               <p className="text-[11px] text-gray-500 leading-normal">
                 {rules.htsThreshold >= 85
@@ -96,7 +124,12 @@ export default function OperationalRules() {
                 step="5"
                 value={rules.partiesThreshold}
                 onChange={e => handleSliderChange('partiesThreshold', parseInt(e.target.value))}
-                className="w-full accent-amber-500 cursor-pointer h-1.5 bg-gray-900 rounded-lg appearance-none"
+                disabled={!canEditRules}
+                className={`w-full h-1.5 bg-gray-900 rounded-lg appearance-none ${
+                  canEditRules
+                    ? 'accent-amber-500 cursor-pointer'
+                    : 'accent-gray-700 cursor-not-allowed opacity-60'
+                }`}
               />
               <p className="text-[11px] text-gray-500 leading-normal">
                 {rules.partiesThreshold >= 75
@@ -130,9 +163,11 @@ export default function OperationalRules() {
               <div className="flex justify-between items-center p-2.5 bg-black/60 rounded-lg border border-gray-950">
                 <div>
                   <span className="text-xs font-semibold text-gray-300 block truncate max-w-[180px]">{userDisplay}</span>
-                  <span className="text-[10px] text-emerald-400 font-mono block mt-0.5 font-bold uppercase">System Admin</span>
+                  <span className={`text-[10px] font-mono block mt-0.5 font-bold uppercase ${
+                    canEditRules ? 'text-emerald-400' : 'text-amber-400'
+                  }`}>{roleLabel(userRole)}</span>
                 </div>
-                <span className="text-[9px] font-mono text-gray-500 bg-gray-950 border border-gray-900 px-1.5 py-0.5 rounded">OWNER</span>
+                <span className="text-[9px] font-mono text-gray-500 bg-gray-950 border border-gray-900 px-1.5 py-0.5 rounded uppercase">{userRole}</span>
               </div>
 
               <div className="flex justify-between items-center p-2.5 bg-black/40 rounded-lg border border-gray-950/60">

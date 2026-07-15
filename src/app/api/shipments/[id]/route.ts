@@ -11,15 +11,18 @@
 // ============================================================================
 
 import { NextResponse } from 'next/server';
-import { requireUserClient } from '@/lib/services/auth.service';
+import { requireUserClient, getUserRole, getUserEmail } from '@/lib/services/auth.service';
+import { canEdit, isAdmin } from '@/lib/services/rbac.service';
 import {
   getShipmentById,
   updateShipment,
   deleteShipment,
 } from '@/lib/services/shipment.service';
+import { logDelete } from '@/lib/services/audit-log.service';
 import { updateShipmentSchema } from '@/lib/validators/shipment.validator';
 import { errorResponse } from '@/lib/utils/error-handler';
 import { AppError } from '@/lib/utils/error-handler';
+import { logger } from '@/lib/utils/logger';
 
 // ---------------------------------------------------------------------------
 // GET — full shipment detail (fields + exceptions + documents)
@@ -53,8 +56,17 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { client } = await requireUserClient(req);
+    const { user, client } = await requireUserClient(req);
     const { id } = await params;
+
+    // RBAC: editing shipment metadata requires the 'edit' permission.
+    const role = getUserRole(user);
+    if (!canEdit(role)) {
+      return NextResponse.json(
+        { error: 'Insufficient permissions', code: 'FORBIDDEN' },
+        { status: 403 },
+      );
+    }
 
     const body = await req.json().catch(() => null);
     if (!body) {
@@ -95,10 +107,29 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { client } = await requireUserClient(req);
+    const { user, client } = await requireUserClient(req);
     const { id } = await params;
 
+    // RBAC: hard-delete is admin-only. operator/viewer get 403 so they
+    // can't accidentally purge a shipment + its exceptions + audit trail.
+    const role = getUserRole(user);
+    if (!isAdmin(role)) {
+      return NextResponse.json(
+        { error: 'Insufficient permissions: admin role required', code: 'FORBIDDEN' },
+        { status: 403 },
+      );
+    }
+
     await deleteShipment(client, id);
+
+    // Audit the destructive action BEFORE the FK cascade wipes the audit_logs
+    // rows for this shipment. (Best-effort — the delete already succeeded.)
+    await logDelete(client, getUserEmail(user), id).catch((err) => {
+      logger.warn('shipments DELETE: audit log failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+
     return NextResponse.json({ success: true });
   } catch (err) {
     return errorResponse(err);

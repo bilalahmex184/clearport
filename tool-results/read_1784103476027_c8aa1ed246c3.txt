@@ -1,0 +1,839 @@
+     1→'use client';
+     2→
+     3→import * as React from 'react';
+     4→import {
+     5→  supabase,
+     6→  isSupabaseConfigured,
+     7→  ensureAuthenticated,
+     8→  getCurrentUserEmail,
+     9→  invokeEdgeFunction,
+    10→  apiFetch,
+    11→  seedEntries,
+    12→  seedRules,
+    13→  seedLogs,
+    14→  calculateConfidence,
+    15→} from '@/lib/supabase';
+    16→import type {
+    17→  ShipmentEntry,
+    18→  Exception,
+    19→  ExtractedField,
+    20→  OperationalRules,
+    21→  AuditLog,
+    22→  ShipmentStatus,
+    23→  ExceptionStatus,
+    24→  ReviewerAction,
+    25→  ExceptionHistoryEntry,
+    26→} from '@/lib/clearport-types';
+    27→
+    28→// ============================================================================
+    29→// Context Type
+    30→// ============================================================================
+    31→
+    32→export type SupabaseStatus = 'connected' | 'unconfigured' | 'error_tables' | 'loading';
+    33→export type EdgeFunctionStatus = 'live' | 'fallback' | 'unknown';
+    34→
+    35→interface ClearPortContextType {
+    36→  entries: ShipmentEntry[];
+    37→  selectedEntryId: string;
+    38→  selectedEntry: ShipmentEntry | undefined;
+    39→  selectedExceptionId: string;
+    40→  selectedException: Exception | undefined;
+    41→  activeTab: string;
+    42→  rules: OperationalRules;
+    43→  undoStack: { entryId: string; exceptionId: string; previousState: Exception }[];
+    44→  auditLogs: AuditLog[];
+    45→  theme: 'dark' | 'light';
+    46→  supabaseStatus: SupabaseStatus;
+    47→  edgeFunctionStatus: EdgeFunctionStatus;
+    48→  currentUser: string;
+    49→  currentTime: string;
+    50→
+    51→  // Actions
+    52→  selectEntry: (id: string) => void;
+    53→  selectException: (id: string) => void;
+    54→  setActiveTab: (tab: string) => void;
+    55→  updateException: (entryId: string, exceptionId: string, status: ReviewerAction, newValue?: string) => void;
+    56→  undoLastAction: () => void;
+    57→  acceptAllHighConfidence: (entryId: string) => void;
+    58→  uploadDocuments: (files: File[]) => Promise<{ shipmentId: string; success: boolean; error?: string }>;
+    59→  updateRules: (newRules: Partial<OperationalRules>) => void;
+    60→  exportToCSV: (entryId: string) => Promise<void>;
+    61→  toggleTheme: () => void;
+    62→  refreshData: () => Promise<void>;
+    63→}
+    64→
+    65→const ClearPortContext = React.createContext<ClearPortContextType | undefined>(undefined);
+    66→
+    67→// ============================================================================
+    68→// Provider
+    69→// ============================================================================
+    70→
+    71→export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+    72→  const [entries, setEntries] = React.useState<ShipmentEntry[]>(seedEntries);
+    73→  const [selectedEntryId, setSelectedEntryId] = React.useState<string>('SHIP-2026-8802');
+    74→  const [selectedExceptionId, setSelectedExceptionId] = React.useState<string>('8802-hts');
+    75→  const [activeTab, setActiveTab] = React.useState<string>('exception-desk');
+    76→  const [theme, setTheme] = React.useState<'dark' | 'light'>('dark');
+    77→  const [rules, setRules] = React.useState<OperationalRules>(seedRules);
+    78→  const [undoStack, setUndoStack] = React.useState<{ entryId: string; exceptionId: string; previousState: Exception }[]>([]);
+    79→  const [auditLogs, setAuditLogs] = React.useState<AuditLog[]>(seedLogs);
+    80→  const [supabaseStatus, setSupabaseStatus] = React.useState<SupabaseStatus>(
+    81→    isSupabaseConfigured() ? 'loading' : 'unconfigured'
+    82→  );
+    83→  const [edgeFunctionStatus, setEdgeFunctionStatus] = React.useState<EdgeFunctionStatus>('unknown');
+    84→  const [currentUser, setCurrentUser] = React.useState<string>('Broker');
+    85→  const [currentTime, setCurrentTime] = React.useState<string>('');
+    86→
+    87→  // --- Real-time clock ---
+    88→  React.useEffect(() => {
+    89→    const update = () => {
+    90→      const now = new Date();
+    91→      const utc = now.toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+    92→      setCurrentTime(utc);
+    93→    };
+    94→    update();
+    95→    const interval = setInterval(update, 1000);
+    96→    return () => clearInterval(interval);
+    97→  }, []);
+    98→
+    99→  // --- Load user email ---
+   100→  React.useEffect(() => {
+   101→    getCurrentUserEmail().then(email => setCurrentUser(email));
+   102→  }, []);
+   103→
+   104→  // --- Persist theme ---
+   105→  React.useEffect(() => {
+   106→    const saved = typeof window !== 'undefined' ? localStorage.getItem('clearport-theme') : null;
+   107→    if (saved === 'light' || saved === 'dark') setTheme(saved);
+   108→  }, []);
+   109→
+   110→  const toggleTheme = React.useCallback(() => {
+   111→    setTheme(prev => {
+   112→      const next = prev === 'dark' ? 'light' : 'dark';
+   113→      if (typeof window !== 'undefined') localStorage.setItem('clearport-theme', next);
+   114→      return next;
+   115→    });
+   116→  }, []);
+   117→
+   118→  // --- Load data ---
+   119→  const selectedEntryIdRef = React.useRef(selectedEntryId);
+   120→  selectedEntryIdRef.current = selectedEntryId;
+   121→
+   122→  const loadData = React.useCallback(async () => {
+   123→    if (!isSupabaseConfigured()) {
+   124→      setSupabaseStatus('unconfigured');
+   125→      setEdgeFunctionStatus('fallback');
+   126→      return;
+   127→    }
+   128→
+   129→    setSupabaseStatus('loading');
+   130→
+   131→    try {
+   132→      await ensureAuthenticated();
+   133→      const email = await getCurrentUserEmail();
+   134→      setCurrentUser(email);
+   135→
+   136→      // Try the new /api/shipments route (replaces both the get-shipments
+   137→      // edge function call AND the fetchShipmentsDirect fallback).
+   138→      try {
+   139→        const response = await apiFetch<{
+   140→          data: ShipmentEntry[];
+   141→          pagination: { total: number };
+   142→        }>('/api/shipments?page=1&limit=100');
+   143→
+   144→        if (response?.data && Array.isArray(response.data)) {
+   145→          // Only use DB shipments if they have fields/exceptions data (new
+   146→          // schema). Old-schema shipments have empty arrays — fall back to
+   147→          // seed data so the demo UX is preserved.
+   148→          const hasRealData = response.data.some(
+   149→            (s) => s.fields.length > 0 || s.exceptions.length > 0,
+   150→          );
+   151→
+   152→          if (hasRealData) {
+   153→            setEntries(response.data);
+   154→            // Select first shipment if current selection doesn't exist
+   155→            if (!response.data.find((s) => s.id === selectedEntryIdRef.current)) {
+   156→              const first = response.data[0];
+   157→              setSelectedEntryId(first.id);
+   158→              if (first.exceptions?.length > 0) {
+   159→                const unresolved = first.exceptions.find((e) => e.status === 'Unresolved');
+   160→                setSelectedExceptionId(unresolved ? unresolved.id : first.exceptions[0].id);
+   161→              }
+   162→            }
+   163→          }
+   164→          // else: keep seed entries (demo mode)
+   165→
+   166→          setEdgeFunctionStatus('live');
+   167→          setSupabaseStatus('connected');
+   168→
+   169→          // Fetch rules + logs in parallel via the new API routes.
+   170→          const [rulesRes, logsRes] = await Promise.all([
+   171→            apiFetch<{ rules: OperationalRules }>('/api/rules').catch(() => null),
+   172→            apiFetch<{ logs: AuditLog[] }>('/api/audit-logs').catch(() => null),
+   173→          ]);
+   174→          if (rulesRes?.rules) setRules(rulesRes.rules);
+   175→          if (logsRes?.logs && logsRes.logs.length > 0) setAuditLogs(logsRes.logs);
+   176→          return;
+   177→        }
+   178→      } catch (apiErr) {
+   179→        console.warn('[ctx] /api/shipments failed, falling back to seed data:', apiErr);
+   180→      }
+   181→
+   182→      // Fallback: seed data (demo mode)
+   183→      setSupabaseStatus('connected');
+   184→      setEdgeFunctionStatus('fallback');
+   185→    } catch (err) {
+   186→      console.error('[ctx] loadData error:', err);
+   187→      setSupabaseStatus('error_tables');
+   188→      setEdgeFunctionStatus('fallback');
+   189→    }
+   190→  }, []);
+   191→
+   192→  React.useEffect(() => {
+   193→    loadData();
+   194→  }, [loadData]);
+   195→
+   196→  const refreshData = React.useCallback(async () => {
+   197→    await loadData();
+   198→  }, [loadData]);
+   199→
+   200→  // --- Computed ---
+   201→  const selectedEntry = React.useMemo(
+   202→    () => entries.find(e => e.id === selectedEntryId),
+   203→    [entries, selectedEntryId]
+   204→  );
+   205→
+   206→  const selectedException = React.useMemo(() => {
+   207→    if (!selectedEntry) return undefined;
+   208→    return selectedEntry.exceptions.find(ex => ex.id === selectedExceptionId);
+   209→  }, [selectedEntry, selectedExceptionId]);
+   210→
+   211→  // --- Selection (fixes stale closure — uses functional update) ---
+   212→  const selectEntry = React.useCallback((id: string) => {
+   213→    setSelectedEntryId(id);
+   214→    setEntries(prev => {
+   215→      const entry = prev.find(e => e.id === id);
+   216→      if (entry && entry.exceptions.length > 0) {
+   217→        const unresolved = entry.exceptions.find(e => e.status === 'Unresolved');
+   218→        setSelectedExceptionId(unresolved ? unresolved.id : entry.exceptions[0].id);
+   219→      } else {
+   220→        setSelectedExceptionId('');
+   221→      }
+   222→      return prev;
+   223→    });
+   224→  }, []);
+   225→
+   226→  const selectException = React.useCallback((id: string) => {
+   227→    setSelectedExceptionId(id);
+   228→  }, []);
+   229→
+   230→  // --- Audit log helper ---
+   231→  const addAuditLog = React.useCallback((text: string, type: AuditLog['type'] = 'info', shipmentId?: string) => {
+   232→    const newLog: AuditLog = {
+   233→      id: typeof crypto !== 'undefined' ? crypto.randomUUID() : `log-${Date.now()}`,
+   234→      text,
+   235→      timestamp: new Date().toISOString(),
+   236→      type,
+   237→      shipmentId,
+   238→    };
+   239→    setAuditLogs(prev => [newLog, ...prev]);
+   240→
+   241→    if (isSupabaseConfigured() && supabase) {
+   242→      supabase.from('audit_logs').insert({
+   243→        id: newLog.id,
+   244→        text: newLog.text,
+   245→        timestamp: newLog.timestamp,
+   246→        type: newLog.type,
+   247→        shipment_id: shipmentId || null,
+   248→      }).then(({ error }) => {
+   249→        if (error) console.warn('[ctx] audit log insert failed:', error.message);
+   250→      });
+   251→    }
+   252→  }, []);
+   253→
+   254→  // --- Update exception (fixes setState-in-setState) ---
+   255→  const updateException = React.useCallback(
+   256→    (entryId: string, exceptionId: string, status: ReviewerAction, newValue?: string) => {
+   257→      let previousException: Exception | undefined;
+   258→      let updatedEntry: ShipmentEntry | undefined;
+   259→
+   260→      setEntries(prevEntries => {
+   261→        return prevEntries.map(entry => {
+   262→          if (entry.id !== entryId) return entry;
+   263→
+   264→          const prev = entry.exceptions.find(ex => ex.id === exceptionId);
+   265→          if (!prev) return entry;
+   266→          previousException = { ...prev };
+   267→
+   268→          const updatedExceptions = entry.exceptions.map(ex => {
+   269→            if (ex.id !== exceptionId) return ex;
+   270→
+   271→            const oldVal = ex.correctedValue || ex.extractedValue;
+   272→            const updatedVal = newValue !== undefined ? newValue : ex.extractedValue;
+   273→
+   274→            const historyItem: ExceptionHistoryEntry = {
+   275→              user: currentUser,
+   276→              oldValue: oldVal,
+   277→              newValue: updatedVal,
+   278→              timestamp: new Date().toISOString(),
+   279→              action: status,
+   280→            };
+   281→
+   282→            return {
+   283→              ...ex,
+   284→              status: status as ExceptionStatus,
+   285→              correctedValue: status === 'Corrected' ? newValue : undefined,
+   286→              history: [historyItem, ...ex.history],
+   287→              resolvedAt: new Date().toISOString(),
+   288→              resolvedBy: currentUser,
+   289→            };
+   290→          });
+   291→
+   292→          const allResolved = updatedExceptions.every(ex => ex.status !== 'Unresolved');
+   293→          const newStatus: ShipmentStatus = allResolved ? 'Approved' : 'Under Review';
+   294→          const newConfidence = calculateConfidence(entry.initialConfidence, updatedExceptions);
+   295→
+   296→          const updatedFields = entry.fields.map(f => {
+   297→            if (f.exceptionId === exceptionId) {
+   298→              const val = status === 'Corrected' ? (newValue || f.value) : f.value;
+   299→              return { ...f, value: val, isFlagged: false };
+   300→            }
+   301→            return f;
+   302→          });
+   303→
+   304→          updatedEntry = {
+   305→            ...entry,
+   306→            status: newStatus,
+   307→            exceptions: updatedExceptions,
+   308→            fields: updatedFields,
+   309→            currentConfidence: newConfidence,
+   310→          };
+   311→
+   312→          return updatedEntry;
+   313→        });
+   314→      });
+   315→
+   316→      // Side effects AFTER setState
+   317→      if (previousException && updatedEntry) {
+   318→        setUndoStack(prevStack => [
+   319→          { entryId, exceptionId, previousState: { ...previousException! } },
+   320→          ...prevStack,
+   321→        ]);
+   322→
+   323→        const logText = `Exception "${previousException.fieldName}" for ${entryId} was ${status.toLowerCase()}${
+   324→          status === 'Corrected' ? ` to "${newValue}"` : ''
+   325→        } by ${currentUser}.`;
+   326→        addAuditLog(logText, status === 'Rejected' ? 'warning' : 'success', entryId);
+   327→
+   328→        // Persist via the /api/exceptions/:id route (handles exception update,
+   329→        // document_field sync, shipment confidence recompute, and audit log
+   330→        // in one server-side transaction).
+   331→        if (isSupabaseConfigured()) {
+   332→          apiFetch(`/api/exceptions/${exceptionId}`, {
+   333→            method: 'PATCH',
+   334→            body: JSON.stringify({
+   335→              status,
+   336→              correctedValue: status === 'Corrected' ? newValue : undefined,
+   337→            }),
+   338→          }).catch((err) => {
+   339→            console.warn('[ctx] exception update failed:', err instanceof Error ? err.message : err);
+   340→          });
+   341→        }
+   342→      }
+   343→    },
+   344→    [currentUser, addAuditLog]
+   345→  );
+   346→
+   347→  // --- Undo ---
+   348→  const undoLastAction = React.useCallback(() => {
+   349→    if (undoStack.length === 0) return;
+   350→
+   351→    const [lastAction, ...remainingStack] = undoStack;
+   352→    setUndoStack(remainingStack);
+   353→
+   354→    setEntries(prevEntries => {
+   355→      return prevEntries.map(entry => {
+   356→        if (entry.id !== lastAction.entryId) return entry;
+   357→
+   358→        const restored = lastAction.previousState;
+   359→        const updatedExceptions = entry.exceptions.map(ex =>
+   360→          ex.id === lastAction.exceptionId ? restored : ex
+   361→        );
+   362→
+   363→        const allResolved = updatedExceptions.every(ex => ex.status !== 'Unresolved');
+   364→        const newStatus: ShipmentStatus = allResolved ? 'Approved' : 'Under Review';
+   365→        const newConfidence = calculateConfidence(entry.initialConfidence, updatedExceptions);
+   366→
+   367→        const updatedFields = entry.fields.map(f => {
+   368→          if (f.exceptionId === lastAction.exceptionId) {
+   369→            return {
+   370→              ...f,
+   371→              value: restored.status === 'Corrected' ? (restored.correctedValue || f.value) : restored.extractedValue,
+   372→              isFlagged: restored.status === 'Unresolved',
+   373→            };
+   374→          }
+   375→          return f;
+   376→        });
+   377→
+   378→        const updatedEntry = {
+   379→          ...entry,
+   380→          status: newStatus,
+   381→          exceptions: updatedExceptions,
+   382→          fields: updatedFields,
+   383→          currentConfidence: newConfidence,
+   384→        };
+   385→
+   386→        if (isSupabaseConfigured() && supabase) {
+   387→          supabase.from('exceptions').update({
+   388→            status: restored.status,
+   389→            corrected_value: restored.correctedValue || null,
+   390→            resolved_at: restored.resolvedAt || null,
+   391→            resolved_by: restored.resolvedBy || null,
+   392→            history: restored.history,
+   393→          }).eq('id', lastAction.exceptionId).then(({ error }) => {
+   394→            if (error) console.warn('[ctx] undo exception failed:', error.message);
+   395→          });
+   396→
+   397→          supabase.from('shipments').update({
+   398→            status: newStatus,
+   399→            current_confidence: newConfidence,
+   400→            updated_at: new Date().toISOString(),
+   401→          }).eq('id', entry.id).then(({ error }) => {
+   402→            if (error) console.warn('[ctx] undo shipment failed:', error.message);
+   403→          });
+   404→        }
+   405→
+   406→        return updatedEntry;
+   407→      });
+   408→    });
+   409→
+   410→    addAuditLog(`Undo applied for last review action on shipment ${lastAction.entryId}`, 'info', lastAction.entryId);
+   411→  }, [undoStack, addAuditLog]);
+   412→
+   413→  // --- Batch accept (uses configured threshold) ---
+   414→  const acceptAllHighConfidence = React.useCallback((entryId: string) => {
+   415→    setEntries(prevEntries => {
+   416→      return prevEntries.map(entry => {
+   417→        if (entry.id !== entryId) return entry;
+   418→
+   419→        const cutoff = rules.invoiceThreshold;
+   420→        let acceptedCount = 0;
+   421→
+   422→        const updatedExceptions = entry.exceptions.map(ex => {
+   423→          if (ex.status === 'Unresolved' && ex.confidence >= cutoff) {
+   424→            acceptedCount++;
+   425→            const historyItem: ExceptionHistoryEntry = {
+   426→              user: currentUser,
+   427→              oldValue: ex.extractedValue,
+   428→              newValue: ex.extractedValue,
+   429→              timestamp: new Date().toISOString(),
+   430→              action: 'Accepted' as ReviewerAction,
+   431→            };
+   432→            return {
+   433→              ...ex,
+   434→              status: 'Accepted' as ExceptionStatus,
+   435→              history: [historyItem, ...ex.history],
+   436→              resolvedAt: new Date().toISOString(),
+   437→              resolvedBy: currentUser,
+   438→            };
+   439→          }
+   440→          return ex;
+   441→        });
+   442→
+   443→        if (acceptedCount === 0) return entry;
+   444→
+   445→        const allResolved = updatedExceptions.every(ex => ex.status !== 'Unresolved');
+   446→        const newStatus: ShipmentStatus = allResolved ? 'Approved' : 'Under Review';
+   447→        const newConfidence = calculateConfidence(entry.initialConfidence, updatedExceptions);
+   448→
+   449→        const updatedFields = entry.fields.map(f => {
+   450→          const exc = updatedExceptions.find(e => e.id === f.exceptionId);
+   451→          if (exc) return { ...f, isFlagged: exc.status === 'Unresolved' };
+   452→          return f;
+   453→        });
+   454→
+   455→        const updatedEntry = {
+   456→          ...entry,
+   457→          status: newStatus,
+   458→          exceptions: updatedExceptions,
+   459→          fields: updatedFields,
+   460→          currentConfidence: newConfidence,
+   461→        };
+   462→
+   463→        addAuditLog(
+   464→          `Batch action: Approved ${acceptedCount} high-confidence exceptions (≥${cutoff}%) in ${entryId}.`,
+   465→          'success',
+   466→          entryId
+   467→        );
+   468→
+   469→        // Persist via the /api/exceptions/batch-accept route (accepts each
+   470→        // qualifying exception, syncs document_fields, recomputes shipment
+   471→        // confidence + status, and writes a batch-level audit log).
+   472→        if (isSupabaseConfigured()) {
+   473→          apiFetch('/api/exceptions/batch-accept', {
+   474→            method: 'POST',
+   475→            body: JSON.stringify({
+   476→              shipmentId: entryId,
+   477→              threshold: cutoff,
+   478→            }),
+   479→          }).catch((err) => {
+   480→            console.warn('[ctx] batch accept failed:', err instanceof Error ? err.message : err);
+   481→          });
+   482→        }
+   483→
+   484→        return updatedEntry;
+   485→      });
+   486→    });
+   487→  }, [rules.invoiceThreshold, currentUser, addAuditLog]);
+   488→
+   489→  // --- Upload documents ---
+   490→  const uploadDocuments = React.useCallback(async (files: File[]): Promise<{ shipmentId: string; success: boolean; error?: string }> => {
+   491→    const shipmentId = `SHIP-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
+   492→
+   493→    try {
+   494→      if (!isSupabaseConfigured()) {
+   495→        // Fallback
+   496→        const newEntry: ShipmentEntry = {
+   497→          id: shipmentId,
+   498→          shipper: 'Titanium Castings KK',
+   499→          consignee: 'Ironclad Logistics Inc.',
+   500→          status: 'Under Review',
+   501→          docsCount: files.length,
+   502→          urgency: '08:30:00',
+   503→          initialConfidence: 70,
+   504→          currentConfidence: 70,
+   505→          createdAt: new Date().toISOString(),
+   506→          documents: [],
+   507→          exceptions: [],
+   508→          fields: [],
+   509→        };
+   510→
+   511→        const excId = typeof crypto !== 'undefined' ? crypto.randomUUID() : `${shipmentId}-address`;
+   512→        newEntry.exceptions = [{
+   513→          id: excId,
+   514→          fieldName: 'Consignee Corporate Address',
+   515→          fieldKey: 'consigneeAddress',
+   516→          originalValue: 'Suite 200, Seattle, WA',
+   517→          extractedValue: 'Suite 200, Seattle, WA',
+   518→          crossDocValue: 'Suite 201, Seattle, WA',
+   519→          confidence: 62,
+   520→          reason: 'Address abbreviation mismatch: Commercial Invoice lists "Suite 200, Seattle, WA" while Bill of Lading shows "Suite 201, Seattle, WA".',
+   521→          exceptionType: 'cross_doc_mismatch',
+   522→          docType: 'Bill of Lading',
+   523→          boundingBox: { x: 10, y: 35, w: 32, h: 5 },
+   524→          status: 'Unresolved',
+   525→          history: [],
+   526→          createdAt: new Date().toISOString(),
+   527→        }];
+   528→
+   529→        newEntry.fields = [
+   530→          { id: 'n1', key: 'invoiceNo', label: 'Commercial Invoice #', value: 'TC-9921-KK', sourceDoc: 'Commercial Invoice', isFlagged: false, confidence: 90 },
+   531→          { id: 'n2', key: 'invoiceDate', label: 'Invoice Date', value: new Date().toISOString().split('T')[0], sourceDoc: 'Commercial Invoice', isFlagged: false, confidence: 88 },
+   532→          { id: 'n3', key: 'shipper', label: 'Shipper / Exporter', value: 'Titanium Castings KK', sourceDoc: 'Commercial Invoice', isFlagged: false, confidence: 95 },
+   533→          { id: 'n4', key: 'consignee', label: 'Consignee / Importer', value: 'Ironclad Logistics Inc.', sourceDoc: 'Commercial Invoice', isFlagged: false, confidence: 94 },
+   534→          { id: 'n5', key: 'consigneeAddress', label: 'Consignee Address', value: 'Suite 200, Seattle, WA', sourceDoc: 'Commercial Invoice', isFlagged: true, confidence: 62, exceptionId: excId, crossDocValue: 'Suite 201, Seattle, WA' },
+   535→          { id: 'n6', key: 'declaredValue', label: 'Total Declared Value', value: '$45,210.00', sourceDoc: 'Commercial Invoice', isFlagged: false, confidence: 87 },
+   536→          { id: 'n7', key: 'htsCode', label: 'HTS Code (Primary Line)', value: '7308.90.0000', sourceDoc: 'Commercial Invoice', isFlagged: false, confidence: 91 },
+   537→          { id: 'n8', key: 'netWeight', label: 'Total Net Weight', value: '8,410 lbs', sourceDoc: 'Bill of Lading', isFlagged: false, confidence: 89 },
+   538→        ];
+   539→
+   540→        setEntries(prev => [newEntry, ...prev]);
+   541→        setSelectedEntryId(shipmentId);
+   542→        setSelectedExceptionId(excId);
+   543→        addAuditLog(`New entry ${shipmentId} ingestion and auto-analysis completed with 1 exception.`, 'info', shipmentId);
+   544→
+   545→        return { shipmentId, success: true };
+   546→      }
+   547→
+   548→      // Real pipeline
+   549→      await ensureAuthenticated();
+   550→
+   551→      // Step 1: Upload each file to Storage via edge function
+   552→      for (const file of files) {
+   553→        const formData = new FormData();
+   554→        formData.append('file', file);
+   555→        formData.append('shipment_id', shipmentId);
+   556→
+   557→        try {
+   558→          if (supabase) {
+   559→            const { error } = await supabase.functions.invoke('upload-document', {
+   560→              body: formData,
+   561→            });
+   562→            if (error) throw error;
+   563→          }
+   564→        } catch (err) {
+   565→          console.warn('[upload] edge function failed for file:', err);
+   566→          // Continue — extraction will still try to work on whatever was uploaded
+   567→        }
+   568→      }
+   569→
+   570→      // Step 2: Create the shipment row in DB (if not already created by upload-document)
+   571→      if (supabase) {
+   572→        await supabase.from('shipments').upsert({
+   573→          id: shipmentId,
+   574→          shipper: 'Pending Extraction',
+   575→          consignee: 'Pending Extraction',
+   576→          status: 'Under Review',
+   577→          docs_count: files.length,
+   578→          urgency: '08:30:00',
+   579→          initial_confidence: 0,
+   580→          current_confidence: 0,
+   581→        }).then(({ error }) => {
+   582→          if (error) console.warn('[upload] shipment upsert:', error.message);
+   583→        });
+   584→      }
+   585→
+   586→      // Step 3: Extract fields via Gemini edge function
+   587→      let extractedFields: ExtractedField[] = [];
+   588→      let shipper = 'Unknown Shipper';
+   589→      let consignee = 'Unknown Consignee';
+   590→
+   591→      try {
+   592→        const extractResponse = await invokeEdgeFunction<any>('extract-document', { shipmentId });
+   593→        if (extractResponse?.success && extractResponse.fields && extractResponse.fields.length > 0) {
+   594→          extractedFields = extractResponse.fields.map((f: any) => ({
+   595→            id: typeof crypto !== 'undefined' ? crypto.randomUUID() : `f-${Date.now()}`,
+   596→            key: f.field_key,
+   597→            label: f.field_label,
+   598→            value: f.extracted_value,
+   599→            sourceDoc: 'Commercial Invoice',
+   600→            isFlagged: false,
+   601→            confidence: f.confidence,
+   602→            boundingBox: f.bounding_box,
+   603→          }));
+   604→          if (extractResponse.shipper) shipper = extractResponse.shipper;
+   605→          if (extractResponse.consignee) consignee = extractResponse.consignee;
+   606→        }
+   607→      } catch (err) {
+   608→        console.warn('[extract] edge function failed:', err);
+   609→      }
+   610→
+   611→      // Step 4: Call the validation chain (schema-validate, math-validate, flag-exceptions)
+   612→      // These run server-side and update the DB directly
+   613→      try {
+   614→        await invokeEdgeFunction('schema-validate', { shipmentId }).catch(() => {});
+   615→      } catch (err) {
+   616→        console.warn('[schema-validate] failed:', err);
+   617→      }
+   618→      try {
+   619→        await invokeEdgeFunction('math-validate', { shipmentId }).catch(() => {});
+   620→      } catch (err) {
+   621→        console.warn('[math-validate] failed:', err);
+   622→      }
+   623→      try {
+   624→        await invokeEdgeFunction('cross-validate', { shipmentId }).catch(() => {});
+   625→      } catch (err) {
+   626→        console.warn('[cross-validate] failed:', err);
+   627→      }
+   628→      try {
+   629→        await invokeEdgeFunction('flag-exceptions', { shipmentId }).catch(() => {});
+   630→      } catch (err) {
+   631→        console.warn('[flag-exceptions] failed:', err);
+   632→      }
+   633→
+   634→      // Step 5: Reload from API to get the real DB state (with fields, exceptions, documents)
+   635→      if (extractedFields.length > 0) {
+   636→        // If we have extracted fields, build the entry from extraction response
+   637→        const newExceptions: Exception[] = [];
+   638→        const updatedFields = extractedFields.map(f => {
+   639→          let threshold = rules.invoiceThreshold;
+   640→          if (f.key === 'htsCode') threshold = rules.htsThreshold;
+   641→          else if (f.key === 'shipper' || f.key === 'consignee' || f.key === 'consigneeAddress') threshold = rules.partiesThreshold;
+   642→
+   643→          if (f.confidence < threshold) {
+   644→            const excId = crypto.randomUUID();
+   645→            const exc: Exception = {
+   646→              id: excId,
+   647→              fieldName: f.label,
+   648→              fieldKey: f.key,
+   649→              originalValue: f.value,
+   650→              extractedValue: f.value,
+   651→              confidence: f.confidence,
+   652→              reason: `Extracted confidence (${f.confidence}%) is below threshold (${threshold}%).`,
+   653→              exceptionType: 'low_confidence',
+   654→              docType: f.sourceDoc,
+   655→              boundingBox: f.boundingBox || { x: 10, y: 35, w: 32, h: 5 },
+   656→              status: 'Unresolved',
+   657→              history: [],
+   658→              createdAt: new Date().toISOString(),
+   659→            };
+   660→            newExceptions.push(exc);
+   661→            return { ...f, isFlagged: true, exceptionId: excId };
+   662→          }
+   663→          return f;
+   664→        });
+   665→
+   666→        const initialConfidence = Math.round(
+   667→          updatedFields.reduce((acc, f) => acc + f.confidence, 0) / Math.max(updatedFields.length, 1)
+   668→        );
+   669→
+   670→        const newEntry: ShipmentEntry = {
+   671→          id: shipmentId,
+   672→          shipper,
+   673→          consignee,
+   674→          status: 'Under Review',
+   675→          docsCount: files.length,
+   676→          urgency: '08:30:00',
+   677→          initialConfidence,
+   678→          currentConfidence: initialConfidence,
+   679→          createdAt: new Date().toISOString(),
+   680→          documents: [],
+   681→          exceptions: newExceptions,
+   682→          fields: updatedFields,
+   683→        };
+   684→
+   685→        setEntries(prev => [newEntry, ...prev]);
+   686→        setSelectedEntryId(shipmentId);
+   687→        setSelectedExceptionId(newExceptions[0]?.id || '');
+   688→      } else {
+   689→        // No fields extracted — reload from API to get whatever the DB has
+   690→        await loadData();
+   691→        setSelectedEntryId(shipmentId);
+   692→      }
+   693→
+   694→      addAuditLog(
+   695→        `New entry ${shipmentId} ingestion completed: ${files.length} files, ${extractedFields.length} fields extracted.`,
+   696→        extractedFields.length > 0 ? 'success' : 'warning',
+   697→        shipmentId
+   698→      );
+   699→
+   700→      return { shipmentId, success: true };
+   701→    } catch (err) {
+   702→      const errMsg = err instanceof Error ? err.message : 'Upload pipeline failed';
+   703→      addAuditLog(`Upload failed for ${shipmentId}: ${errMsg}`, 'error', shipmentId);
+   704→      return { shipmentId, success: false, error: errMsg };
+   705→    }
+   706→  }, [rules, addAuditLog]);
+   707→
+   708→  // --- Update rules ---
+   709→  const updateRules = React.useCallback((newRules: Partial<OperationalRules>) => {
+   710→    setRules(prev => {
+   711→      const updated = { ...prev, ...newRules };
+   712→
+   713→      // Persist via the /api/rules route (upserts the user's rules row).
+   714→      if (isSupabaseConfigured()) {
+   715→        apiFetch('/api/rules', {
+   716→          method: 'PATCH',
+   717→          body: JSON.stringify(newRules),
+   718→        }).catch((err) => {
+   719→          console.warn('[ctx] rules update failed:', err instanceof Error ? err.message : err);
+   720→        });
+   721→      }
+   722→
+   723→      return updated;
+   724→    });
+   725→    addAuditLog('Compliance operational thresholds updated.', 'info');
+   726→  }, [addAuditLog]);
+   727→
+   728→  // --- Real CSV export ---
+   729→  const exportToCSV = React.useCallback(async (entryId: string) => {
+   730→    const entry = entries.find(e => e.id === entryId);
+   731→    if (!entry) return;
+   732→
+   733→    // Try the /api/export/:id route first (generates CSV server-side from the
+   734→    // DB-backed shipment data and returns it as text/csv).
+   735→    if (isSupabaseConfigured()) {
+   736→      try {
+   737→        const res = await apiFetch<Response>(`/api/export/${entryId}`, { raw: true });
+   738→        if (res.ok) {
+   739→          const csv = await res.text();
+   740→          if (csv) {
+   741→            const blob = new Blob([csv], { type: 'text/csv' });
+   742→            const url = URL.createObjectURL(blob);
+   743→            const a = document.createElement('a');
+   744→            a.href = url;
+   745→            a.download = `ClearPort_Audit_${entryId}.csv`;
+   746→            document.body.appendChild(a);
+   747→            a.click();
+   748→            document.body.removeChild(a);
+   749→            URL.revokeObjectURL(url);
+   750→
+   751→            addAuditLog(`Audit logs exported to CSV for ${entryId}.`, 'success', entryId);
+   752→            return;
+   753→          }
+   754→        }
+   755→      } catch (err) {
+   756→        console.warn('[csv] /api/export failed, generating locally:', err);
+   757→      }
+   758→    }
+   759→
+   760→    // Fallback: local CSV generation from in-memory entry
+   761→    const rows: string[] = [];
+   762→    rows.push('Field Key,Field Label,Value,Source Document,Confidence,Flagged,Status');
+   763→    entry.fields.forEach(f => {
+   764→      const exc = entry.exceptions.find(e => e.id === f.exceptionId);
+   765→      const status = exc ? exc.status : 'SECURE';
+   766→      const escaped = [f.key, f.label, f.value, f.sourceDoc, f.confidence, f.isFlagged, status]
+   767→        .map(v => `"${String(v).replace(/"/g, '""')}"`)
+   768→        .join(',');
+   769→      rows.push(escaped);
+   770→    });
+   771→
+   772→    rows.push('');
+   773→    rows.push('Exception ID,Field Name,Reason,Confidence,Status,Resolved By');
+   774→    entry.exceptions.forEach(e => {
+   775→      const escaped = [e.id, e.fieldName, e.reason, e.confidence, e.status, e.resolvedBy || '']
+   776→        .map(v => `"${String(v).replace(/"/g, '""')}"`)
+   777→        .join(',');
+   778→      rows.push(escaped);
+   779→    });
+   780→
+   781→    const csv = rows.join('\n');
+   782→    const blob = new Blob([csv], { type: 'text/csv' });
+   783→    const url = URL.createObjectURL(blob);
+   784→    const a = document.createElement('a');
+   785→    a.href = url;
+   786→    a.download = `ClearPort_Audit_${entryId}.csv`;
+   787→    document.body.appendChild(a);
+   788→    a.click();
+   789→    document.body.removeChild(a);
+   790→    URL.revokeObjectURL(url);
+   791→
+   792→    addAuditLog(`Audit logs exported to CSV for ${entryId}.`, 'success', entryId);
+   793→  }, [entries, addAuditLog]);
+   794→
+   795→  const value: ClearPortContextType = {
+   796→    entries,
+   797→    selectedEntryId,
+   798→    selectedEntry,
+   799→    selectedExceptionId,
+   800→    selectedException,
+   801→    activeTab,
+   802→    rules,
+   803→    undoStack,
+   804→    auditLogs,
+   805→    theme,
+   806→    supabaseStatus,
+   807→    edgeFunctionStatus,
+   808→    currentUser,
+   809→    currentTime,
+   810→    selectEntry,
+   811→    selectException,
+   812→    setActiveTab,
+   813→    updateException,
+   814→    undoLastAction,
+   815→    acceptAllHighConfidence,
+   816→    uploadDocuments,
+   817→    updateRules,
+   818→    exportToCSV,
+   819→    toggleTheme,
+   820→    refreshData,
+   821→  };
+   822→
+   823→  return (
+   824→    <ClearPortContext.Provider value={value}>
+   825→      {children}
+   826→    </ClearPortContext.Provider>
+   827→  );
+   828→};
+   829→
+   830→export function useClearPort() {
+   831→  const context = React.useContext(ClearPortContext);
+   832→  if (context === undefined) {
+   833→    throw new Error('useClearPort must be used within a ClearPortProvider');
+   834→  }
+   835→  return context;
+   836→}
+   837→
+   838→export type { ShipmentEntry, Exception, ExtractedField, OperationalRules, AuditLog };
+   839→
