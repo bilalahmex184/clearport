@@ -71,7 +71,7 @@ export default function IngestUpload() {
   const handleFileUpload = async (files: File[]) => {
     // Validate first file
     const file = files[0];
-    const allowedMimeTypes = ['application/pdf', 'image/png', 'image/jpeg', 'image/jpg', 'image/tiff'];
+    const allowedMimeTypes = ['application/pdf', 'image/png', 'image/jpeg', 'image/jpg', 'image/tiff', 'text/plain', 'text/csv'];
     if (!allowedMimeTypes.includes(file.type)) {
       setErrorMsg(`Unsupported file format (${file.type || 'unknown'}). Please upload PDF, PNG, JPEG, or TIFF.`);
       return;
@@ -198,7 +198,7 @@ export default function IngestUpload() {
                 ref={fileInputRef}
                 onChange={handleFileChange}
                 className="hidden"
-                accept=".pdf,.png,.jpg,.jpeg,.tiff"
+                accept=".pdf,.png,.jpg,.jpeg,.tiff,.txt,.csv"
                 multiple
               />
 

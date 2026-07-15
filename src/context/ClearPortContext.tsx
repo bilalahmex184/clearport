@@ -548,7 +548,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       // Real pipeline
       await ensureAuthenticated();
 
-      // Upload each file
+      // Step 1: Upload each file to Storage via edge function
       for (const file of files) {
         const formData = new FormData();
         formData.append('file', file);
@@ -562,24 +562,41 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             if (error) throw error;
           }
         } catch (err) {
-          console.warn('[upload] edge function failed, continuing:', err);
+          console.warn('[upload] edge function failed for file:', err);
+          // Continue — extraction will still try to work on whatever was uploaded
         }
       }
 
-      // Extract
+      // Step 2: Create the shipment row in DB (if not already created by upload-document)
+      if (supabase) {
+        await supabase.from('shipments').upsert({
+          id: shipmentId,
+          shipper: 'Pending Extraction',
+          consignee: 'Pending Extraction',
+          status: 'Under Review',
+          docs_count: files.length,
+          urgency: '08:30:00',
+          initial_confidence: 0,
+          current_confidence: 0,
+        }).then(({ error }) => {
+          if (error) console.warn('[upload] shipment upsert:', error.message);
+        });
+      }
+
+      // Step 3: Extract fields via Gemini edge function
       let extractedFields: ExtractedField[] = [];
-      let shipper = 'Titanium Castings KK';
-      let consignee = 'Ironclad Logistics Inc.';
+      let shipper = 'Unknown Shipper';
+      let consignee = 'Unknown Consignee';
 
       try {
         const extractResponse = await invokeEdgeFunction<any>('extract-document', { shipmentId });
-        if (extractResponse?.success && extractResponse.fields) {
+        if (extractResponse?.success && extractResponse.fields && extractResponse.fields.length > 0) {
           extractedFields = extractResponse.fields.map((f: any) => ({
             id: typeof crypto !== 'undefined' ? crypto.randomUUID() : `f-${Date.now()}`,
             key: f.field_key,
             label: f.field_label,
             value: f.extracted_value,
-            sourceDoc: extractResponse.docType || 'Commercial Invoice',
+            sourceDoc: 'Commercial Invoice',
             isFlagged: false,
             confidence: f.confidence,
             boundingBox: f.bounding_box,
@@ -588,80 +605,95 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           if (extractResponse.consignee) consignee = extractResponse.consignee;
         }
       } catch (err) {
-        console.warn('[extract] edge function failed, using fallback:', err);
+        console.warn('[extract] edge function failed:', err);
       }
 
-      if (extractedFields.length === 0) {
-        extractedFields = [
-          { id: crypto.randomUUID(), key: 'invoiceNo', label: 'Commercial Invoice #', value: 'TC-9921-KK', sourceDoc: 'Commercial Invoice', isFlagged: false, confidence: 90 },
-          { id: crypto.randomUUID(), key: 'shipper', label: 'Shipper / Exporter', value: shipper, sourceDoc: 'Commercial Invoice', isFlagged: false, confidence: 95 },
-          { id: crypto.randomUUID(), key: 'consignee', label: 'Consignee / Importer', value: consignee, sourceDoc: 'Commercial Invoice', isFlagged: false, confidence: 94 },
-          { id: crypto.randomUUID(), key: 'consigneeAddress', label: 'Consignee Address', value: 'Suite 200, Seattle, WA', sourceDoc: 'Commercial Invoice', isFlagged: true, confidence: 62, crossDocValue: 'Suite 201, Seattle, WA' },
-          { id: crypto.randomUUID(), key: 'declaredValue', label: 'Total Declared Value', value: '$45,210.00', sourceDoc: 'Commercial Invoice', isFlagged: false, confidence: 87 },
-          { id: crypto.randomUUID(), key: 'htsCode', label: 'HTS Code (Primary Line)', value: '7308.90.0000', sourceDoc: 'Commercial Invoice', isFlagged: false, confidence: 91 },
-          { id: crypto.randomUUID(), key: 'netWeight', label: 'Total Net Weight', value: '8,410 lbs', sourceDoc: 'Bill of Lading', isFlagged: false, confidence: 89 },
-        ];
+      // Step 4: Call the validation chain (schema-validate, math-validate, flag-exceptions)
+      // These run server-side and update the DB directly
+      try {
+        await invokeEdgeFunction('schema-validate', { shipmentId }).catch(() => {});
+      } catch (err) {
+        console.warn('[schema-validate] failed:', err);
+      }
+      try {
+        await invokeEdgeFunction('math-validate', { shipmentId }).catch(() => {});
+      } catch (err) {
+        console.warn('[math-validate] failed:', err);
+      }
+      try {
+        await invokeEdgeFunction('cross-validate', { shipmentId }).catch(() => {});
+      } catch (err) {
+        console.warn('[cross-validate] failed:', err);
+      }
+      try {
+        await invokeEdgeFunction('flag-exceptions', { shipmentId }).catch(() => {});
+      } catch (err) {
+        console.warn('[flag-exceptions] failed:', err);
       }
 
-      // Flag exceptions based on thresholds
-      const newExceptions: Exception[] = [];
-      const updatedFields = extractedFields.map(f => {
-        let threshold = rules.invoiceThreshold;
-        if (f.key === 'htsCode') threshold = rules.htsThreshold;
-        else if (f.key === 'shipper' || f.key === 'consignee' || f.key === 'consigneeAddress') threshold = rules.partiesThreshold;
+      // Step 5: Reload from API to get the real DB state (with fields, exceptions, documents)
+      if (extractedFields.length > 0) {
+        // If we have extracted fields, build the entry from extraction response
+        const newExceptions: Exception[] = [];
+        const updatedFields = extractedFields.map(f => {
+          let threshold = rules.invoiceThreshold;
+          if (f.key === 'htsCode') threshold = rules.htsThreshold;
+          else if (f.key === 'shipper' || f.key === 'consignee' || f.key === 'consigneeAddress') threshold = rules.partiesThreshold;
 
-        if (f.confidence < threshold || f.crossDocValue) {
-          const excId = crypto.randomUUID();
-          const exc: Exception = {
-            id: excId,
-            fieldName: f.label,
-            fieldKey: f.key,
-            originalValue: f.value,
-            extractedValue: f.value,
-            crossDocValue: f.crossDocValue,
-            confidence: f.confidence,
-            reason: f.crossDocValue
-              ? `Cross-document mismatch detected: extracted "${f.value}" but cross-reference shows "${f.crossDocValue}".`
-              : `Extracted confidence (${f.confidence}%) is below threshold (${threshold}%).`,
-            exceptionType: f.crossDocValue ? 'cross_doc_mismatch' : 'low_confidence',
-            docType: f.sourceDoc,
-            boundingBox: f.boundingBox || { x: 10, y: 35, w: 32, h: 5 },
-            status: 'Unresolved',
-            history: [],
-            createdAt: new Date().toISOString(),
-          };
-          newExceptions.push(exc);
-          return { ...f, isFlagged: true, exceptionId: excId };
-        }
-        return f;
-      });
+          if (f.confidence < threshold) {
+            const excId = crypto.randomUUID();
+            const exc: Exception = {
+              id: excId,
+              fieldName: f.label,
+              fieldKey: f.key,
+              originalValue: f.value,
+              extractedValue: f.value,
+              confidence: f.confidence,
+              reason: `Extracted confidence (${f.confidence}%) is below threshold (${threshold}%).`,
+              exceptionType: 'low_confidence',
+              docType: f.sourceDoc,
+              boundingBox: f.boundingBox || { x: 10, y: 35, w: 32, h: 5 },
+              status: 'Unresolved',
+              history: [],
+              createdAt: new Date().toISOString(),
+            };
+            newExceptions.push(exc);
+            return { ...f, isFlagged: true, exceptionId: excId };
+          }
+          return f;
+        });
 
-      const initialConfidence = Math.round(
-        updatedFields.reduce((acc, f) => acc + f.confidence, 0) / Math.max(updatedFields.length, 1)
-      );
+        const initialConfidence = Math.round(
+          updatedFields.reduce((acc, f) => acc + f.confidence, 0) / Math.max(updatedFields.length, 1)
+        );
 
-      const newEntry: ShipmentEntry = {
-        id: shipmentId,
-        shipper,
-        consignee,
-        status: 'Under Review',
-        docsCount: files.length,
-        urgency: '08:30:00',
-        initialConfidence,
-        currentConfidence: initialConfidence,
-        createdAt: new Date().toISOString(),
-        documents: [],
-        exceptions: newExceptions,
-        fields: updatedFields,
-      };
+        const newEntry: ShipmentEntry = {
+          id: shipmentId,
+          shipper,
+          consignee,
+          status: 'Under Review',
+          docsCount: files.length,
+          urgency: '08:30:00',
+          initialConfidence,
+          currentConfidence: initialConfidence,
+          createdAt: new Date().toISOString(),
+          documents: [],
+          exceptions: newExceptions,
+          fields: updatedFields,
+        };
 
-      setEntries(prev => [newEntry, ...prev]);
-      setSelectedEntryId(shipmentId);
-      setSelectedExceptionId(newExceptions[0]?.id || '');
+        setEntries(prev => [newEntry, ...prev]);
+        setSelectedEntryId(shipmentId);
+        setSelectedExceptionId(newExceptions[0]?.id || '');
+      } else {
+        // No fields extracted — reload from API to get whatever the DB has
+        await loadData();
+        setSelectedEntryId(shipmentId);
+      }
 
       addAuditLog(
-        `New entry ${shipmentId} ingestion completed: ${files.length} files, ${newExceptions.length} exceptions flagged.`,
-        newExceptions.length > 0 ? 'warning' : 'success',
+        `New entry ${shipmentId} ingestion completed: ${files.length} files, ${extractedFields.length} fields extracted.`,
+        extractedFields.length > 0 ? 'success' : 'warning',
         shipmentId
       );
 

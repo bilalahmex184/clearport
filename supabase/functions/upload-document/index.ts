@@ -60,6 +60,8 @@ const ALLOWED_MIME: Record<string, string> = {
   "image/tiff": "tiff",
   "application/tiff": "tiff",
   "image/x-tiff": "tiff",
+  "text/plain": "txt",
+  "text/csv": "txt",
 };
 
 // --- doc_type detection -----------------------------------------------------
@@ -125,6 +127,8 @@ Deno.serve(async (req) => {
         jpeg: "image/jpeg",
         tif: "image/tiff",
         tiff: "image/tiff",
+        txt: "text/plain",
+        csv: "text/csv",
       };
       mimeType = extMap[ext] || "";
     }

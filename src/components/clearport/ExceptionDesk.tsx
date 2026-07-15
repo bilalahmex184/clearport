@@ -4,9 +4,10 @@ import * as React from 'react';
 import { useClearPort } from '@/context/ClearPortContext';
 import {
   AlertCircle, CheckCircle2, ChevronRight, Eye, RefreshCw, XCircle, FileText,
-  ZoomIn, ZoomOut, RotateCw, Sparkles, Undo2,
+  ZoomIn, ZoomOut, RotateCw, Sparkles, Undo2, Loader2,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { supabase, invokeEdgeFunction } from '@/lib/supabase';
 
 export default function ExceptionDesk() {
   const {
@@ -29,7 +30,58 @@ export default function ExceptionDesk() {
   const [zoomLevel, setZoomLevel] = React.useState(100);
   const [rotation, setRotation] = React.useState(0);
   const [showHistory, setShowHistory] = React.useState(false);
+  const [documentUrl, setDocumentUrl] = React.useState<string | null>(null);
+  const [isLoadingUrl, setIsLoadingUrl] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
+
+  // Fetch signed URL for the active document when tab changes
+  React.useEffect(() => {
+    if (!selectedEntry || !activeDocTab) {
+      setDocumentUrl(null);
+      return;
+    }
+
+    // Find the document matching the active tab
+    const doc = selectedEntry.documents.find(d => d.docType === activeDocTab);
+    if (!doc) {
+      setDocumentUrl(null);
+      return;
+    }
+
+    let cancelled = false;
+    setIsLoadingUrl(true);
+    setDocumentUrl(null);
+
+    (async () => {
+      try {
+        // Try the get-document-url edge function first
+        const response = await invokeEdgeFunction<any>('get-document-url', {
+          storagePath: doc.storagePath,
+        });
+        if (!cancelled && response?.success && response.signedUrl) {
+          setDocumentUrl(response.signedUrl);
+        }
+      } catch (err) {
+        // Fallback: try direct Supabase storage signed URL
+        if (supabase && !cancelled) {
+          try {
+            const { data } = await supabase.storage
+              .from('documents')
+              .createSignedUrl(doc.storagePath, 3600);
+            if (data?.signedUrl) {
+              setDocumentUrl(data.signedUrl);
+            }
+          } catch (e) {
+            console.warn('[doc-url] failed to get signed URL:', e);
+          }
+        }
+      } finally {
+        if (!cancelled) setIsLoadingUrl(false);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [selectedEntry?.id, activeDocTab]);
 
   // Fix: use useEffect instead of setState-during-render
   React.useEffect(() => {
@@ -304,127 +356,121 @@ export default function ExceptionDesk() {
           </div>
         </div>
 
-        {/* Document Board */}
+        {/* Document Board — shows real uploaded file or extracted data view */}
         <div className="flex-1 overflow-auto bg-[#040406] p-6 flex items-start justify-center relative">
-          <div
-            style={{
-              transform: `scale(${zoomLevel / 100}) rotate(${rotation}deg)`,
-              transformOrigin: 'top center',
-              transition: 'transform 0.15s ease-out',
-            }}
-            className="w-[450px] aspect-[1/1.4] bg-[#fafbfc] rounded border border-gray-200 text-[#0f1115] shadow-2xl p-6 relative select-none font-serif flex flex-col justify-between"
-          >
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 font-sans font-bold border-4 border-red-500/10 text-red-500/10 rounded-xl px-6 py-3 text-4xl rotate-12 tracking-widest pointer-events-none uppercase">
-              {activeDocTab || 'Document'} WORK COPY
-            </div>
+          {documentUrl ? (
+            /* Real file viewer — show the actual uploaded document */
+            <div
+              style={{
+                transform: `scale(${zoomLevel / 100}) rotate(${rotation}deg)`,
+                transformOrigin: 'top center',
+                transition: 'transform 0.15s ease-out',
+              }}
+              className="rounded border border-gray-700 shadow-2xl overflow-hidden bg-white relative"
+            >
+              {documentUrl.endsWith('.txt') || documentUrl.includes('text/plain') ? (
+                /* Text file — show as preformatted text */
+                <iframe src={documentUrl} className="w-[500px] h-[600px] bg-white" title="Document" />
+              ) : documentUrl.includes('.pdf') || documentUrl.includes('application/pdf') ? (
+                /* PDF — show in iframe */
+                <iframe src={documentUrl} className="w-[500px] h-[600px] bg-white" title="Document PDF" />
+              ) : (
+                /* Image — show directly */
+                <img src={documentUrl} alt="Document" className="max-w-[500px] max-h-[600px] object-contain" />
+              )}
 
-            <div>
-              <div className="flex justify-between items-start border-b-2 border-gray-900 pb-3 mb-4">
+              {/* Highlighted bounding box overlay */}
+              {selectedException && activeDocTab === selectedException.docType && (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="absolute border-[2px] border-amber-500 bg-amber-500/10 rounded pointer-events-none shadow-[0_0_12px_rgba(245,158,11,0.4)]"
+                  style={{
+                    left: `${selectedException.boundingBox.x}%`,
+                    top: `${selectedException.boundingBox.y}%`,
+                    width: `${selectedException.boundingBox.w}%`,
+                    height: `${selectedException.boundingBox.h}%`,
+                  }}
+                >
+                  <div className="absolute -top-3.5 left-0 text-[7px] font-mono text-white bg-amber-600 px-1 py-0.5 rounded shadow whitespace-nowrap uppercase tracking-wider font-bold">
+                    FLAGGED: {selectedException.fieldName.toUpperCase()}
+                  </div>
+                </motion.div>
+              )}
+            </div>
+          ) : isLoadingUrl ? (
+            <div className="flex items-center justify-center h-full">
+              <Loader2 className="w-8 h-8 text-amber-500 animate-spin" />
+            </div>
+          ) : (
+            /* Fallback: show extracted data as a structured view (not a fake document) */
+            <div
+              style={{
+                transform: `scale(${zoomLevel / 100}) rotate(${rotation}deg)`,
+                transformOrigin: 'top center',
+                transition: 'transform 0.15s ease-out',
+              }}
+              className="w-[500px] bg-[#0c0d12] border border-gray-800 rounded-xl shadow-2xl p-6 relative"
+            >
+              <div className="flex items-center justify-between mb-4 pb-3 border-b border-gray-800">
                 <div>
-                  <h1 className="text-[13px] font-extrabold uppercase tracking-widest font-sans text-gray-900">
-                    {activeDocTab || 'Document'}
-                  </h1>
-                  <p className="text-[8px] text-gray-500 font-sans mt-0.5 uppercase tracking-wider">
-                    {selectedEntry.id} • SECURE CARGO ENTRY
+                  <h3 className="text-sm font-bold text-gray-100 uppercase tracking-wider">
+                    {activeDocTab || 'Extracted Data'}
+                  </h3>
+                  <p className="text-[10px] text-gray-500 font-mono mt-0.5">
+                    {selectedEntry.id} • {selectedEntry.documents.length} file(s) uploaded
                   </p>
                 </div>
-                <div className="text-right">
-                  <span className="font-sans font-semibold text-[8px] bg-gray-900 text-white px-1.5 py-0.5 rounded uppercase tracking-wider">
-                    ORIGINAL EXTRACT
-                  </span>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4 text-[8px] font-sans border-b border-gray-200 pb-2 mb-3">
-                <div>
-                  <span className="text-gray-500 block uppercase font-bold tracking-wider text-[7px]">Shipper / Exporter:</span>
-                  <span className="font-semibold text-gray-900 block mt-0.5">{selectedEntry.shipper}</span>
-                </div>
-                <div>
-                  <span className="text-gray-500 block uppercase font-bold tracking-wider text-[7px]">Consignee / Importer:</span>
-                  <span className="font-semibold text-gray-900 block mt-0.5">{selectedEntry.consignee}</span>
-                </div>
-              </div>
-
-              <div className="text-[8px] font-sans space-y-2">
-                <div className="grid grid-cols-4 border-b border-gray-200 pb-1 font-bold text-gray-500 uppercase tracking-widest text-[6px]">
-                  <div>REF NUMBER</div>
-                  <div>PORT CODE</div>
-                  <div>CARRIER</div>
-                  <div className="text-right">ORIGIN</div>
-                </div>
-                <div className="grid grid-cols-4 border-b border-gray-100 pb-1.5 font-medium text-gray-900 font-mono">
-                  <div>{selectedEntry.fields.find(f => f.key === 'invoiceNo')?.value || '—'}</div>
-                  <div>{selectedEntry.fields.find(f => f.key === 'portOfEntry')?.value?.slice(0, 8) || '—'}</div>
-                  <div>{selectedEntry.fields.find(f => f.key === 'carrier')?.value?.slice(0, 10) || '—'}</div>
-                  <div className="text-right">
-                    {selectedEntry.fields.find(f => f.key === 'countryOfOrigin')?.value || '—'}
-                  </div>
-                </div>
-              </div>
-
-              <div className="mt-4 space-y-2.5 text-[8.5px] text-gray-800 leading-relaxed font-serif">
-                <p>
-                  We hereby certify that the goods described below are of international export origin and conform to bilateral trade rules of the respective Customs departments.
-                </p>
-
-                <div className="border border-gray-200 p-2.5 rounded bg-gray-50/50 mt-3 font-sans space-y-2">
-                  <div className="flex justify-between font-bold border-b border-gray-200 pb-1 text-[7px] text-gray-500">
-                    <span>ITEM DESCRIPTION & SPECS</span>
-                    <span>HTS CLASSIFICATION</span>
-                  </div>
-                  <div className="flex justify-between items-center text-gray-900 font-medium">
-                    <span>Cargo Item (Aerospace-Spec)</span>
-                    <span className="font-mono text-gray-900">
-                      {selectedEntry.fields.find(f => f.key === 'htsCode')?.value || '—'}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-center border-t border-gray-100 pt-1 text-gray-900">
-                    <span className="text-gray-500 text-[7px]">Gross/Net Declared Weights:</span>
-                    <span className="font-mono font-medium text-gray-900">
-                      {selectedEntry.fields.find(f => f.key === 'netWeight')?.value || '—'}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="pt-2 text-[7.5px] text-gray-500 leading-normal italic">
-                  * Discrepancy values are highlighted dynamically on OCR workspace overlays. This copy has been parsed securely through the Gemini extraction engine.
-                </div>
-              </div>
-            </div>
-
-            <div className="border-t-2 border-gray-900 pt-3 flex justify-between items-end font-sans">
-              <div>
-                <span className="text-[6.5px] text-gray-400 uppercase tracking-widest block font-bold">VERIFIED BY AGENT</span>
-                <span className="text-[7px] text-gray-900 block font-semibold mt-0.5">CBP REGISTERED FILING AGENCY</span>
-              </div>
-              <div className="text-right">
-                <span className="text-[6.5px] text-gray-500 uppercase tracking-widest block font-bold">TOTAL VALUE DECLARED:</span>
-                <span className="text-xs font-mono font-extrabold text-gray-950 tracking-tight block">
-                  {selectedEntry.fields.find(f => f.key === 'declaredValue')?.value || '—'}
+                <span className="text-[9px] font-mono bg-amber-950/40 text-amber-400 border border-amber-900/40 px-2 py-0.5 rounded uppercase">
+                  Structured Extract
                 </span>
               </div>
-            </div>
 
-            {/* Highlighted bounding box */}
-            {selectedException && activeDocTab === selectedException.docType && (
-              <motion.div
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                className="absolute border-[2px] border-amber-500 bg-amber-500/10 rounded pointer-events-none shadow-[0_0_12px_rgba(245,158,11,0.4)] flex flex-col justify-end p-0.5"
-                style={{
-                  left: `${selectedException.boundingBox.x}%`,
-                  top: `${selectedException.boundingBox.y}%`,
-                  width: `${selectedException.boundingBox.w}%`,
-                  height: `${selectedException.boundingBox.h}%`,
-                }}
-              >
-                <div className="absolute -top-3.5 left-0 text-[7px] font-mono text-white bg-amber-600 px-1 py-0.5 rounded shadow whitespace-nowrap uppercase tracking-wider font-bold">
-                  FLAGGED: {selectedException.fieldName.toUpperCase()}
+              <div className="space-y-2">
+                {selectedEntry.fields.map((f, idx) => (
+                  <div key={f.id || idx} className={`flex justify-between items-start p-2 rounded border ${
+                    f.isFlagged ? 'bg-red-950/20 border-red-900/40' : 'bg-black/30 border-gray-900'
+                  }`}>
+                    <div className="flex-1">
+                      <span className="text-[10px] font-mono text-gray-500 uppercase tracking-wider block">{f.label}</span>
+                      <span className={`text-xs font-mono ${f.isFlagged ? 'text-amber-400' : 'text-gray-200'}`}>
+                        {f.value}
+                      </span>
+                      {f.crossDocValue && (
+                        <span className="text-[9px] text-red-400 block mt-0.5">↔ {f.crossDocValue}</span>
+                      )}
+                    </div>
+                    <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${
+                      f.confidence < 60 ? 'bg-red-950 text-red-400' :
+                      f.confidence < 85 ? 'bg-amber-950 text-amber-400' :
+                      'bg-emerald-950 text-emerald-400'
+                    }`}>
+                      {f.confidence}%
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              {selectedEntry.fields.length === 0 && (
+                <div className="text-center py-8 text-gray-600 text-xs">
+                  No fields extracted for this shipment.
                 </div>
-              </motion.div>
-            )}
-          </div>
+              )}
+
+              {selectedException && activeDocTab === selectedException.docType && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  className="mt-4 p-3 bg-amber-950/20 border border-amber-900/40 rounded-lg"
+                >
+                  <div className="text-[10px] font-mono text-amber-400 uppercase tracking-wider mb-1">
+                    ⚠ FLAGGED: {selectedException.fieldName}
+                  </div>
+                  <p className="text-[11px] text-gray-300">{selectedException.reason}</p>
+                </motion.div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 

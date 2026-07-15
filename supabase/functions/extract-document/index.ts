@@ -98,26 +98,64 @@ function bufToBase64(buf: ArrayBuffer): string {
   return btoa(binary);
 }
 
-// Strip ```json fences and trailing prose from Gemini's reply
+// Strip ```json fences and trailing prose from Gemini's reply.
+// Handles arrays, single objects, and objects with a wrapper like { fields: [...] }.
 function extractJsonArray(text: string): any[] {
   if (!text) return [];
-  // Remove ```json ... ``` fences if present
   let cleaned = text.trim();
+
+  // Remove ```json ... ``` fences if present
   const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenceMatch) {
     cleaned = fenceMatch[1].trim();
   }
+
+  // Try direct parse first (fast path)
+  try {
+    const direct = JSON.parse(cleaned);
+    if (Array.isArray(direct)) return direct;
+    if (direct && typeof direct === "object") {
+      // Could be a wrapper object
+      if (Array.isArray(direct.fields)) return direct.fields;
+      if (Array.isArray(direct.data)) return direct.data;
+      // Single field object?
+      if (direct.field_key) return [direct];
+    }
+  } catch {
+    // Fall through to manual extraction
+  }
+
   // Find the first '[' and matching last ']'
   const start = cleaned.indexOf("[");
   const end = cleaned.lastIndexOf("]");
-  if (start === -1 || end === -1 || end < start) return [];
-  const slice = cleaned.slice(start, end + 1);
-  try {
-    const parsed = JSON.parse(slice);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+  if (start !== -1 && end !== -1 && end > start) {
+    const slice = cleaned.slice(start, end + 1);
+    try {
+      const parsed = JSON.parse(slice);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      // Fall through
+    }
   }
+
+  // Try finding a JSON object instead
+  const objStart = cleaned.indexOf("{");
+  const objEnd = cleaned.lastIndexOf("}");
+  if (objStart !== -1 && objEnd !== -1 && objEnd > objStart) {
+    const slice = cleaned.slice(objStart, objEnd + 1);
+    try {
+      const parsed = JSON.parse(slice);
+      if (Array.isArray(parsed)) return parsed;
+      if (parsed && typeof parsed === "object") {
+        if (Array.isArray(parsed.fields)) return parsed.fields;
+        if (parsed.field_key) return [parsed];
+      }
+    } catch {
+      // Give up
+    }
+  }
+
+  return [];
 }
 
 // Fallback mock fields (used when GEMINI_API_KEY is not set so the pipeline
@@ -185,52 +223,99 @@ function mockFields(): any[] {
 }
 
 // Call Gemini with the file bytes. Returns an array of field objects.
+// Handles both binary files (via inlineData) and text files (via text prompt).
+// Returns { fields, debug } so the caller can surface diagnostic info.
 async function callGeminiExtraction(
   ai: GoogleGenAI,
   mimeType: string,
-  base64Data: string
-): Promise<any[]> {
-  const model = "gemini-2.0-flash";
-  try {
-    const response = await ai.models.generateContent({
-      model,
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { inlineData: { mimeType, data: base64Data } },
-            { text: GEMINI_PROMPT },
-          ],
-        },
-      ],
-    });
-    const text = response.text || "";
-    const parsed = extractJsonArray(text);
-    if (parsed.length > 0) return parsed;
-  } catch (err) {
-    console.warn("[extract-document] gemini-2.0-flash failed, trying 1.5-flash:", err);
+  base64Data: string,
+  rawText?: string
+): Promise<{ fields: any[]; debug: any }> {
+  const models = ["gemini-2.0-flash", "gemini-1.5-flash"];
+  const debug: any = { modelsTried: [], errors: [], rawResponses: [] };
+
+  for (const model of models) {
+    debug.modelsTried.push(model);
+    try {
+      const parts: any[] = [];
+
+      if (rawText && rawText.length > 0) {
+        parts.push({ text: `Document text content:\n\n${rawText}\n\n---\n${GEMINI_PROMPT}` });
+      } else {
+        parts.push({ inlineData: { mimeType, data: base64Data } });
+        parts.push({ text: GEMINI_PROMPT });
+      }
+
+      const response = await ai.models.generateContent({
+        model,
+        contents: [{ role: "user", parts }],
+      });
+
+      // Try multiple ways to get text from the response
+      let text = "";
+      if (typeof response.text === "string") {
+        text = response.text;
+      } else if (typeof response.text === "function") {
+        text = response.text();
+      } else if (response?.candidates?.[0]?.content?.parts?.[0]?.text) {
+        text = response.candidates[0].content.parts[0].text;
+      } else if (response?.response?.text) {
+        text = response.response.text;
+      }
+
+      debug.rawResponses.push({ model, textLength: text.length, preview: text.substring(0, 300) });
+
+      const parsed = extractJsonArray(text);
+      if (parsed.length > 0) {
+        debug.success = true;
+        debug.successModel = model;
+        return { fields: parsed, debug };
+      } else {
+        debug.errors.push(`${model}: 0 parseable fields from ${text.length} chars`);
+      }
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      debug.errors.push(`${model}: ${errMsg}`);
+      debug.rawResponses.push({ model, error: errMsg });
+    }
   }
 
-  // Fallback to gemini-1.5-flash
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { inlineData: { mimeType, data: base64Data } },
-            { text: GEMINI_PROMPT },
-          ],
-        },
-      ],
-    });
-    const text = response.text || "";
-    return extractJsonArray(text);
-  } catch (err2) {
-    console.error("[extract-document] gemini-1.5-flash also failed:", err2);
-    return [];
+  return { fields: [], debug };
+}
+
+// --- Regex-based fallback extractor -----------------------------------------
+// When Gemini is unavailable (invalid key, rate limit, etc.), this extracts
+// fields from plain-text documents using pattern matching.
+function regexExtract(text: string): any[] {
+  if (!text) return [];
+  const fields: any[] = [];
+
+  const patterns: Array<{ key: string; label: string; regex: RegExp; conf: number }> = [
+    { key: "invoiceNo", label: "Commercial Invoice #", regex: /(?:invoice\s*(?:number|no\.?|#)\s*[:\-]?\s*)([A-Z0-9\-]+)/i, conf: 85 },
+    { key: "invoiceDate", label: "Invoice Date", regex: /(?:invoice\s*date\s*[:\-]?\s*)(\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})/i, conf: 82 },
+    { key: "shipper", label: "Shipper/Exporter", regex: /(?:shipper(?:\/exporter)?\s*[:\-]?\s*)(.+?)(?:\n|$)/i, conf: 80 },
+    { key: "consignee", label: "Consignee/Importer", regex: /(?:consignee(?:\/importer)?\s*[:\-]?\s*)(.+?)(?:\n|$)/i, conf: 80 },
+    { key: "declaredValue", label: "Total Declared Value", regex: /(?:total\s*(?:declared\s*)?value\s*[:\-]?\s*)(\$[\d,]+\.?\d*)/i, conf: 88 },
+    { key: "htsCode", label: "HTS Code", regex: /(?:hts\s*(?:code)?\s*[:\-]?\s*)(\d{4}\.\d{2}\.\d{4})/i, conf: 90 },
+    { key: "netWeight", label: "Net Weight", regex: /(?:net\s*weight\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?))/i, conf: 85 },
+    { key: "countryOfOrigin", label: "Country of Origin", regex: /(?:country\s*of\s*origin\s*[:\-]?\s*)([A-Z]{2})/i, conf: 78 },
+    { key: "carrier", label: "Carrier", regex: /(?:carrier\s*[:\-]?\s*)(.+?)(?:\n|$)/i, conf: 75 },
+    { key: "portOfEntry", label: "Port of Entry", regex: /(?:port\s*of\s*entry\s*[:\-]?\s*)(.+?)(?:\n|$)/i, conf: 75 },
+    { key: "billOfLading", label: "Bill of Lading #", regex: /(?:bill\s*of\s*lading\s*(?:#|no\.?)?\s*[:\-]?\s*)([A-Z0-9\-]+)/i, conf: 82 },
+    { key: "consigneeAddress", label: "Consignee Address", regex: /(?:consignee\s*address\s*[:\-]?\s*)(.+?)(?:\n|$)/i, conf: 72 },
+  ];
+
+  for (const { key, label, regex, conf } of patterns) {
+    const match = text.match(regex);
+    if (match && match[1]) {
+      const value = match[1].trim();
+      if (value.length > 0 && value.length < 200) {
+        fields.push({ field_key: key, field_label: label, extracted_value: value, confidence: conf });
+      }
+    }
   }
+
+  return fields;
 }
 
 // --- Main handler -----------------------------------------------------------
@@ -299,6 +384,7 @@ Deno.serve(async (req) => {
     const perDocResults: any[] = [];
     let latestShipper: string | null = null;
     let latestConsignee: string | null = null;
+    let geminiDebug: any = null;
 
     // 4. Process each document
     for (const doc of docs) {
@@ -329,10 +415,34 @@ Deno.serve(async (req) => {
         const base64 = bufToBase64(ab);
         const mimeType = doc.mime_type || "application/octet-stream";
 
-        extracted = await callGeminiExtraction(ai, mimeType, base64);
+        // For text-based files, extract the raw text to pass to Gemini directly
+        let rawText: string | undefined;
+        if (mimeType.startsWith("text/")) {
+          try {
+            rawText = new TextDecoder().decode(ab);
+          } catch {
+            // If decode fails, fall back to inlineData
+          }
+        }
+
+        const geminiResult = await callGeminiExtraction(ai, mimeType, base64, rawText);
+        extracted = geminiResult.fields;
+        geminiDebug = geminiResult.debug;
+
+        // If Gemini returned 0 fields, try regex-based extraction on text
+        if (extracted.length === 0 && rawText) {
+          console.log("[extract-document] Gemini returned 0 fields, trying regex extraction");
+          extracted = regexExtract(rawText);
+          if (geminiDebug) geminiDebug.regexFallback = extracted.length > 0;
+        }
       } else {
-        // Fallback mock extraction
-        extracted = mockFields();
+        // No Gemini key — use regex extraction if we have text, else mock
+        if (rawText) {
+          extracted = regexExtract(rawText);
+        }
+        if (extracted.length === 0) {
+          extracted = mockFields();
+        }
       }
 
       // 4b. Normalize + write to document_fields
@@ -438,6 +548,7 @@ Deno.serve(async (req) => {
       shipper: latestShipper || undefined,
       consignee: latestConsignee || undefined,
       geminiUsed: !!ai,
+      debug: geminiDebug,
     });
   } catch (err: any) {
     console.error("[extract-document] unhandled error:", err);
