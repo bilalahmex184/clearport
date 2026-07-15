@@ -568,3 +568,35 @@ Stage Summary:
 - Fix migration `002_fix_org_create_rls.sql` unblocks org + membership creation (was impossible under migration 001's FOR ALL admin-only policies).
 - The existing seed-data fallback, upload pipeline (edge functions + direct supabase inserts via the `set_org_id` trigger), undo stack, and audit-log writes are all untouched and continue to work.
 - Next actions for downstream agents: (a) deploy migration 002 to the live Supabase project (`supabase db push` or paste into SQL Editor); (b) seed an `organization_members` row for any existing users who don't have one yet (migration 001's backfill block should have handled this, but verify); (c) optionally add a "Create Organization" UI button somewhere (the POST /api/organizations route exists but no UI calls it yet — users currently get their first org via migration 001's backfill); (d) consider wiring the upload pipeline through `/api/organizations/[id]/...` or a new `/api/upload` route so uploads are also org-scoped server-side (today the `set_org_id` trigger handles it transparently).
+
+---
+Task ID: MASTER-IMPL-ALL
+Agent: main
+Task: Implement all 6 sections of the master implementation prompt
+
+Work Log:
+- Section 1 (Multi-tenant + RBAC): Created organizations + organization_members tables, org_id columns on all 6 existing tables, is_org_member/get_user_org_role SECURITY DEFINER functions, org-scoped RLS policies replacing owner_all_*, create_organization RPC function, requireOrgRole helper, X-Org-Id header support, org-switcher UI, /api/organizations CRUD routes. Migrations 001-006.
+- Section 2 (Configurable rule engine): Created validation_rules table (migration 007), seeded 13 default rules per org, wrote src/lib/rules/engine.ts (rule interpreter with loadRules/runRules/evaluateRule), created /api/rules/validation CRUD routes, auto-seed on new org creation (migration 010). Disabling a rule via API takes effect immediately without redeploy.
+- Section 3 (Structured explanation layer): Added explanation column to exceptions table (migration 008), updated Exception type, updated mapDbToException, updated ExceptionDesk UI to show explanation next to reason badge with value-specific messages.
+- Section 4 (Field-mapping system): Created broker_templates + broker_field_mappings tables (migration 009), wrote src/lib/mapping/transform.ts (date_format, round, concat, lookup_table, currency_convert, uppercase, lowercase, trim), created /api/broker-templates CRUD routes, created /api/broker-templates/[id]/mappings CRUD routes, created /api/export/[id]/broker route with required-field validation. Auto-seed default import/export templates on new org.
+- Section 5 (Mapping UI): Created BrokerTemplates.tsx component with template list, create form, mapping table editor (internal field dropdown, external column input, transform dropdown, required checkbox), save/delete actions, RBAC gating. Added to sidebar navigation as "Broker Templates".
+- Section 6 (Audit log extensions): Updated /api/audit-logs route with type and date range filters (startDate, endDate, type params). All mutating actions (rule create/update/delete, template create, mapping changes, org membership changes) produce audit log entries.
+
+Verification Results:
+- S1 Create org: ✓
+- S1 Cross-org blocked: ✓ (403)
+- S1 No-org blocked: ✓ (403)
+- S2 List rules: ✓ (13 rules auto-seeded)
+- S2 Create rule: ✓
+- S2 Disable rule via API: ✓
+- S2 Delete rule via API: ✓
+- S4 List templates: ✓ (2 auto-seeded)
+- S4 Create template: ✓
+- S4 Add mapping: ✓
+- S6 List logs: ✓
+- S6 Filter by type: ✓
+- Lint: 0 errors
+
+Migrations created: 001-010 (10 migration files under supabase/migrations/)
+New files: 15+ (engine.ts, transform.ts, 4 org routes, 3 validation routes, 4 broker template routes, 1 broker export route, BrokerTemplates.tsx)
+Modified files: 20+ (auth.service.ts, rbac.service.ts, all API routes, ClearPortContext, page.tsx, ExceptionDesk.tsx, clearport-types.ts, supabase.ts)

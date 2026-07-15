@@ -151,6 +151,7 @@ export interface Exception {
   crossDocValue?: string;
   confidence: number;
   reason: string;
+  explanation?: string;
   exceptionType: ExceptionType;
   docType: string;
   boundingBox: BoundingBox;

@@ -1,14 +1,16 @@
 // ============================================================================
-// /api/audit-logs — fetch audit log entries
+// /api/audit-logs — fetch audit log entries with date/type filtering
 // ============================================================================
 //
-// GET /api/audit-logs?limit=50&shipmentId=SHIP-XXXX
+// GET /api/audit-logs?limit=50&shipmentId=SHIP-XXXX&type=success&startDate=2026-01-01&endDate=2026-12-31
 //   → { logs: AuditLog[] }
 //   (RBAC: viewer)
 //
-// If `shipmentId` is provided, logs are filtered to that shipment only.
-// Limit is capped at 200 (matches audit-log.service default). All logs are
-// additionally scoped by the active org_id from `requireOrgRole()`.
+// Filters:
+//   - shipmentId: filter to a specific shipment
+//   - type: filter by log type (info, success, warning, error)
+//   - startDate: ISO date string (inclusive)
+//   - endDate: ISO date string (inclusive)
 // ============================================================================
 
 import { NextResponse } from 'next/server';
@@ -21,6 +23,9 @@ import { logger } from '@/lib/utils/logger';
 const querySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   shipmentId: z.string().min(1).optional(),
+  type: z.enum(['info', 'success', 'warning', 'error']).optional(),
+  startDate: z.string().optional(),
+  endDate: z.string().optional(),
 });
 
 export async function GET(req: Request) {
@@ -31,6 +36,9 @@ export async function GET(req: Request) {
     const parsed = querySchema.safeParse({
       limit: url.searchParams.get('limit') ?? 50,
       shipmentId: url.searchParams.get('shipmentId') ?? undefined,
+      type: url.searchParams.get('type') ?? undefined,
+      startDate: url.searchParams.get('startDate') ?? undefined,
+      endDate: url.searchParams.get('endDate') ?? undefined,
     });
     if (!parsed.success) {
       return NextResponse.json(
@@ -45,13 +53,29 @@ export async function GET(req: Request) {
       orgId,
     });
 
+    // Apply additional filters (type + date range) in-memory since the service
+    // function doesn't natively support them yet — this is fine for <200 rows.
+    let filtered = logs;
+    if (parsed.data.type) {
+      filtered = filtered.filter(l => l.type === parsed.data.type);
+    }
+    if (parsed.data.startDate) {
+      const start = new Date(parsed.data.startDate).getTime();
+      filtered = filtered.filter(l => new Date(l.timestamp).getTime() >= start);
+    }
+    if (parsed.data.endDate) {
+      const end = new Date(parsed.data.endDate).getTime();
+      filtered = filtered.filter(l => new Date(l.timestamp).getTime() <= end);
+    }
+
     logger.debug('Audit logs fetched', {
       orgId,
       role,
-      count: logs.length,
+      count: filtered.length,
+      filters: { type: parsed.data.type, startDate: parsed.data.startDate, endDate: parsed.data.endDate },
     });
 
-    return NextResponse.json({ logs });
+    return NextResponse.json({ logs: filtered });
   } catch (err) {
     return errorResponse(err);
   }

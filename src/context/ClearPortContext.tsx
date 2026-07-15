@@ -64,6 +64,9 @@ interface ClearPortContextType {
   // requireOrgRole(). Null until the first org list load completes.
   currentOrgId: string | null;
 
+  // API helper — same as apiFetch but injects X-Org-Id header
+  apiFetchOrg: <T = any>(path: string, options?: RequestInit & { raw?: boolean }) => Promise<T>;
+
   // Actions
   selectEntry: (id: string) => void;
   selectException: (id: string) => void;
@@ -914,6 +917,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     userRole,
     userOrgs,
     currentOrgId,
+    apiFetchOrg,
     selectEntry,
     selectException,
     setActiveTab,

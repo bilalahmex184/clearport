@@ -584,13 +584,19 @@ export default function ExceptionDesk() {
                 </span>
               </div>
 
-              {/* Discrepancy reason */}
+              {/* Discrepancy reason + explanation */}
               <div className="bg-[#120f12] border border-red-950/40 p-3.5 rounded-lg">
                 <h4 className="text-[11px] font-mono text-red-400 tracking-wider uppercase mb-1 flex items-center gap-1.5">
                   <AlertCircle className="w-3.5 h-3.5" />
                   DISCREPANCY WHY:
                 </h4>
                 <p className="text-xs text-gray-300 leading-normal">{selectedException.reason}</p>
+                {selectedException.explanation && selectedException.explanation !== selectedException.reason && (
+                  <div className="mt-2 pt-2 border-t border-red-950/30">
+                    <span className="text-[9px] font-mono text-amber-400 uppercase tracking-wider block mb-0.5">EXPLANATION:</span>
+                    <p className="text-[11px] text-amber-300/90 leading-relaxed">{selectedException.explanation}</p>
+                  </div>
+                )}
               </div>
 
               {/* Data comparison */}

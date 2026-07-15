@@ -257,6 +257,7 @@ export function mapDbToException(db: DbException): Exception {
     crossDocValue: db.cross_doc_value || undefined,
     confidence: db.confidence,
     reason: db.reason,
+    explanation: (db as any).explanation || undefined,
     exceptionType: db.exception_type,
     docType: db.doc_type || 'Document',
     boundingBox: db.bounding_box || { x: 10, y: 10, w: 20, h: 4 },

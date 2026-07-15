@@ -10,6 +10,7 @@ import CrossDocAuditor from '@/components/clearport/CrossDocAuditor';
 import BrokerAnalytics from '@/components/clearport/BrokerAnalytics';
 import OperationalRules from '@/components/clearport/OperationalRules';
 import EntryDetailView from '@/components/clearport/EntryDetailView';
+import BrokerTemplates from '@/components/clearport/BrokerTemplates';
 import SupabaseSyncPanel from '@/components/clearport/SupabaseSyncPanel';
 import {
   Shield,
@@ -22,6 +23,7 @@ import {
   TrendingUp,
   History,
   Settings2,
+  FileSpreadsheet,
   Menu,
   X,
   Wifi,
@@ -98,6 +100,7 @@ function AppShell() {
     { id: 'analytics', label: 'Broker Analytics', icon: TrendingUp },
     { id: 'entry-detail', label: 'Entry Detail View', icon: History },
     { id: 'rules', label: 'Operational Rules', icon: Settings2 },
+    { id: 'broker-templates', label: 'Broker Templates', icon: FileSpreadsheet },
   ];
 
   const renderActiveView = () => {
@@ -109,6 +112,7 @@ function AppShell() {
       case 'analytics': return <BrokerAnalytics />;
       case 'rules': return <OperationalRules />;
       case 'entry-detail': return <EntryDetailView />;
+      case 'broker-templates': return <BrokerTemplates />;
       default: return <ExceptionDesk />;
     }
   };
