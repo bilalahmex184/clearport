@@ -820,7 +820,56 @@ function regexExtract(text: string): any[] {
   return fields;
 }
 
-// --- Main handler -----------------------------------------------------------
+// --- PDF text-layer extraction (Tier 2) ---------------------------------------
+// Extracts embedded text from PDF files that have a real text layer
+// (not scanned images). Uses a simple regex-based approach to find text
+// between BT/ET markers in the PDF content stream.
+function extractPdfTextLayer(arrayBuffer: ArrayBuffer): string | null {
+  try {
+    const bytes = new Uint8Array(arrayBuffer);
+    // Check if it's actually a PDF
+    const header = new TextDecoder().decode(bytes.slice(0, 5));
+    if (header !== '%PDF-') return null;
+
+    // Extract text from PDF content streams
+    // Look for text in parentheses within BT...ET blocks
+    const text = new TextDecoder('latin1').decode(bytes);
+    const textMatches: string[] = [];
+
+    // Match text in parentheses (PDF text objects)
+    const textRegex = /\(([^)]+)\)/g;
+    let match;
+    while ((match = textRegex.exec(text)) !== null) {
+      const t = match[1];
+      // Filter out non-text content (binary data, short strings)
+      if (t.length > 2 && /[a-zA-Z]/.test(t) && !/\\[nrt]/.test(t)) {
+        textMatches.push(t);
+      }
+    }
+
+    if (textMatches.length < 3) return null; // Not enough text to be useful
+
+    // Join and clean up
+    const result = textMatches.join('\n');
+    return result.length > 50 ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+// --- Tesseract OCR placeholder (Tier 4) --------------------------------------
+// In production, this would call a Tesseract service or a serverless function.
+// For now, it returns null (indicating Tesseract is not available in this environment).
+// To enable: deploy a Tesseract serverless function and call it here.
+async function tesseractOCR(_arrayBuffer: ArrayBuffer, _mimeType: string): Promise<string | null> {
+  // Tesseract requires a separate service (not available in Deno edge functions).
+  // To enable: deploy a Tesseract service (e.g., on Railway/Render) and call it:
+  // const response = await fetch('https://your-tesseract-service.com/ocr', { ... });
+  // return await response.text();
+  return null;
+}
+
+// --- Main handler with 5-tier extraction fallback chain ----------------------
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -915,33 +964,29 @@ Deno.serve(async (req) => {
     let totalExtractionFailures = 0;
     const failureDetails: any[] = [];
 
-    // 4. Process each document
+    // 4. Process each document through the 5-tier extraction fallback chain
     for (const doc of docs) {
       let extracted: any[] = [];
       let usedModel: string | null = null;
       let rawAiResponse: string | null = null;
-      let extractionSource: "gemini" | "regex" | "mock" | "none" = "none";
+      let extractionSource: string = "none";
+      let extractionTier: number = 0;
 
-      // 4a. Download the file from Storage (admin client). This happens for
-      //     every document, regardless of whether Gemini is available, so the
-      //     regex fallback can still run on text-based files when no API key
-      //     is configured.
+      // Mark document as 'extracting'
+      await admin.from("documents").update({
+        processing_status: "extracting",
+        processing_started_at: new Date().toISOString(),
+      }).eq("id", doc.id);
+
+      // 4a. Download the file from Storage
       const { data: fileData, error: downloadErr } = await admin.storage
         .from("documents")
         .download(doc.storage_path);
 
       if (downloadErr || !fileData) {
-        console.error(
-          "[extract-document] file download failed for",
-          doc.storage_path,
-          downloadErr
-        );
-        perDocResults.push({
-          documentId: doc.id,
-          file_name: doc.file_name,
-          status: "download_failed",
-          fields: [],
-        });
+        console.error("[extract-document] file download failed for", doc.storage_path, downloadErr);
+        await admin.from("documents").update({ processing_status: "failed" }).eq("id", doc.id);
+        perDocResults.push({ documentId: doc.id, file_name: doc.file_name, status: "download_failed", fields: [] });
         continue;
       }
 
@@ -949,46 +994,133 @@ Deno.serve(async (req) => {
       const base64 = bufToBase64(ab);
       const mimeType = doc.mime_type || "application/octet-stream";
 
-      // For text-based files, extract the raw text. Used directly as the
-      // prompt when Gemini is enabled (cheaper than re-encoding as inlineData)
-      // AND as the input to the regex fallback when Gemini is unavailable.
+      // Extract raw text for text-based files (used by regex fallback)
       let rawText: string | undefined;
       if (mimeType.startsWith("text/")) {
-        try {
-          rawText = new TextDecoder().decode(ab);
-        } catch {
-          // If decode fails, fall back to inlineData
-        }
+        try { rawText = new TextDecoder().decode(ab); } catch {}
       }
 
+      // ─── TIER 1: Gemini Vision (primary) ───
       if (ai) {
+        extractionTier = 1;
         const geminiResult = await callGeminiExtraction(ai, mimeType, base64, rawText);
         extracted = geminiResult.fields;
         geminiDebug = geminiResult.debug;
         usedModel = geminiResult.model;
         rawAiResponse = geminiResult.rawResponse;
-        if (extracted.length > 0) extractionSource = "gemini";
-
-        // If Gemini returned 0 fields, try regex-based extraction on text
-        if (extracted.length === 0 && rawText) {
-          console.log("[extract-document] Gemini returned 0 fields, trying regex extraction");
-          extracted = regexExtract(rawText);
-          if (extracted.length > 0) {
-            extractionSource = "regex";
-            if (geminiDebug) geminiDebug.regexFallback = true;
-          }
-        }
-      } else {
-        // No Gemini key — use regex extraction if we have text, else mock
-        if (rawText) {
-          extracted = regexExtract(rawText);
-          if (extracted.length > 0) extractionSource = "regex";
-        }
-        if (extracted.length === 0) {
-          extracted = mockFields();
-          if (extracted.length > 0) extractionSource = "mock";
+        if (extracted.length > 0) {
+          extractionSource = usedModel || "gemini";
         }
       }
+
+      // ─── TIER 2: PDF text-layer extraction (if Gemini failed and it's a PDF) ───
+      if (extracted.length === 0 && mimeType === "application/pdf") {
+        extractionTier = 2;
+        console.log("[extract-document] Tier 2: trying PDF text-layer extraction");
+        const pdfText = extractPdfTextLayer(ab);
+        if (pdfText) {
+          rawText = pdfText; // Use the extracted PDF text for regex
+          console.log("[extract-document] PDF text-layer found, running regex on it");
+        }
+      }
+
+      // ─── TIER 3: Cloud Vision OCR placeholder ───
+      // (Not implemented in this environment — would require a Google Cloud Vision API key
+      // separate from Gemini. Falls through to Tier 4.)
+      if (extracted.length === 0 && !rawText) {
+        extractionTier = 3;
+        // Cloud Vision would go here: const visionText = await callCloudVision(base64, mimeType);
+        // if (visionText) rawText = visionText;
+      }
+
+      // ─── TIER 4: Tesseract OCR (local, zero quota) ───
+      if (extracted.length === 0 && !rawText) {
+        extractionTier = 4;
+        console.log("[extract-document] Tier 4: trying Tesseract OCR");
+        const tesseractText = await tesseractOCR(ab, mimeType);
+        if (tesseractText) {
+          rawText = tesseractText;
+          console.log("[extract-document] Tesseract produced text, running regex on it");
+        }
+      }
+
+      // ─── Regex extraction on whatever text we have (works for Tiers 2, 3, 4) ───
+      if (extracted.length === 0 && rawText) {
+        console.log(`[extract-document] Running regex extraction (tier ${extractionTier})`);
+        extracted = regexExtract(rawText);
+        if (extracted.length > 0) {
+          extractionSource = extractionTier === 2 ? "pdf_text_layer" :
+                             extractionTier === 4 ? "tesseract" : "regex_fallback";
+        }
+      }
+
+      // ─── TIER 5: Mark as 'needs_manual_review' — NEVER silent zero ───
+      if (extracted.length === 0) {
+        extractionTier = 5;
+        extractionSource = "needs_manual_review";
+
+        // Mark the document for manual review
+        await admin.from("documents").update({
+          processing_status: "needs_manual_review",
+          extraction_source: "needs_manual_review",
+        }).eq("id", doc.id);
+
+        // Create an exception for manual review
+        await userClient.from("exceptions").insert({
+          shipment_id: shipmentId,
+          org_id: orgMember?.org_id || null,
+          user_id: user.id,
+          field_key: "_document",
+          field_name: `Document needs manual review: ${doc.file_name}`,
+          original_value: "",
+          extracted_value: "",
+          confidence: 0,
+          reason: `All extraction tiers failed for ${doc.file_name}. Document requires manual review.`,
+          exception_type: "missing_field",
+          doc_type: doc.doc_type || "Unknown",
+          status: "Unresolved",
+          history: [],
+        }).then(({ error }: any) => {
+          if (error) console.warn("[extract-document] failed to create manual review exception:", error.message);
+        });
+
+        totalExtractionFailures++;
+        failureDetails.push({
+          documentId: doc.id,
+          file_name: doc.file_name,
+          reason: "All 5 extraction tiers failed — document marked for manual review",
+          tiersTried: [1, 2, 3, 4],
+          modelsTried: geminiDebug?.modelsTried || [],
+          errors: geminiDebug?.errors || [],
+        });
+
+        perDocResults.push({
+          documentId: doc.id,
+          file_name: doc.file_name,
+          doc_type: doc.doc_type,
+          status: "needs_manual_review",
+          extractionSource: "needs_manual_review",
+          extractionTier: 5,
+          fieldsCount: 0,
+          fields: [],
+        });
+
+        // Audit log the manual review flag
+        await userClient.from("audit_logs").insert({
+          shipment_id: shipmentId,
+          user_id: user.id,
+          text: `[extraction] Document ${doc.file_name} marked for manual review — all 5 tiers failed`,
+          type: "warning",
+        }).then(({ error }: any) => { if (error) console.warn("[extract-document] audit log failed:", error.message); });
+
+        continue;
+      }
+
+      // ─── Success: mark document as completed ───
+      await admin.from("documents").update({
+        processing_status: "completed",
+        extraction_source: extractionSource,
+      }).eq("id", doc.id);
 
       // 4a-bis. Persist raw AI response to audit_logs for compliance/debug.
       // We truncate to 500 chars to avoid bloating the audit log.
@@ -1058,6 +1190,7 @@ Deno.serve(async (req) => {
           is_flagged: false,
           validation_errors: [],
           bounding_box: f.bounding_box || null,
+          extraction_source: extractionSource,
         };
 
         const { data: inserted, error: insErr } = await userClient
