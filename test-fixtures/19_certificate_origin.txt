@@ -1,0 +1,18 @@
+CERTIFICATE OF ORIGIN
+Invoice Number: INV-COO-019
+Invoice Date: 2026-07-12
+Shipper: Asian Manufacturing Ltd
+Consignee: North American Trading Co
+Country of Origin: CN
+Total Declared Value: $27,500.00
+HTS Code: 9403.10.0000
+Net Weight: 2,100 lbs
+Carrier: COSCO Shipping
+Port of Entry: Seattle (Tacoma - 3001)
+
+This is to certify that the goods described above
+were produced in the country identified above and
+that the information provided is true and accurate.
+
+Authorized Signature: [SIGNED]
+Date: July 12, 2026

@@ -1,0 +1,9 @@
+COMM[ERCIAL] INVOI[CE]
+Inv[oice] N[o]:] INV-FAX-016
+Dat[e:] 2026/07/05
+Ship[per:] Atlantic Trad[e] Co
+Consig[nee:] Pacific Imp[orts]
+T[otal] Val[ue:] $8,200.00
+HT[S:] 7308.90.0000
+Net W[t:] 650 lbs
+Origin: US

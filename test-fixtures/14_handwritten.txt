@@ -1,0 +1,10 @@
+COMMERCIAL INVOICE
+Invoice Number: [HANDWRITTEN: INV-HW-014]
+Invoice Date: 2026-06-30
+Shipper: Trade Solutions LLC
+Consignee: [STAMPED: Import Co of America]
+Total Declared Value: $15,450.00
+HTS Code: [HANDWRITTEN: 8504.40.9580]
+Net Weight: 850 lbs
+Country of Origin: JP
+Carrier: [STAMPED: Nippon Express]

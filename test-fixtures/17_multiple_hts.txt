@@ -1,0 +1,18 @@
+COMMERCIAL INVOICE
+Invoice Number: INV-MHTS-017
+Invoice Date: 2026-06-25
+Shipper: Tech Components Inc
+Consignee: Assembly Systems Corp
+Total Declared Value: $52,300.00
+Country of Origin: US
+
+LINE ITEMS:
+Circuit Boards Type A      200   8534.00.0000   $12,000.00
+Power Supplies              50   8504.40.9580   $15,500.00
+Connectors Type C          500   8536.69.0040   $8,800.00
+Sensors                     100   9031.80.8085   $16,000.00
+
+Net Weight: 2,800 lbs
+Gross Weight: 3,100 lbs
+Carrier: UPS Freight
+Port of Entry: Detroit (DTW - 3801)

@@ -1,0 +1,17 @@
+COMMERCIAL INVOICE
+Invoice Number: INV-MIX-011
+Invoice Date: 2026-07-01
+Shipper: Global Trading Partners Ltd
+Consignee: Midwest Manufacturing Corp
+Total Declared Value: €45,890.50
+HTS Code: 8471.50.0050
+Net Weight: 3,200 kg
+Gross Weight: 3,650 kg
+Country of Origin: DE
+Carrier: DHL Express
+Port of Entry: Chicago (O'Hare - 3901)
+
+LINE ITEMS:
+Laptops Model X1           50   8471.30.0100   €35,000.00
+Shipping Insurance                              €890.50
+Customs Duties                                 €10,000.00

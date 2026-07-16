@@ -752,3 +752,24 @@ Section 4: Bulk Upload Fix (CONFIRMED BUG)
 Migrations: 012 (rate limiting) + 013 (reconciliation)
 Edge functions redeployed: extract-document (with rate limiting + CORS)
 Tests verified: 17/17 Section 1 security tests PASS
+
+---
+Task ID: FINAL-EXECUTION
+Agent: main
+Task: Fix preview, set ALLOWED_ORIGIN, enable pg_cron, redeploy edge functions, run regression
+
+Work Log:
+- Fixed preview: rebuilt production server (next start, 2.5ms response), watchdog auto-restarts
+- Set ALLOWED_ORIGIN on all 11 edge functions (via Supabase secrets)
+- Enabled pg_cron + scheduled stuck-document reconciliation (every 10 min)
+- Redeployed all 11 edge functions with CORS fix + rate limiting
+- Generated 10 additional realistic test fixtures (docs 11-20): mixed currencies, OCR errors, multi-page tables, handwritten/stamped fields, complex addresses, fax quality, multiple HTS codes, packing lists, certificates of origin, bare minimum
+- Ran quick 5-doc regression: 29 fields extracted, 6 exceptions created, all errors routed to Exception UI
+- Verified security tests: 17/17 PASS
+
+Results:
+- Production server: 2.5ms response time
+- 20 test fixtures covering: clean, missing fields, bad formats, German/French/Chinese, OCR errors, multi-page, handwritten, fax quality, packing lists, certificates, bare minimum
+- Rate limiting: 50 extractions/hour/org (429 when exceeded)
+- pg_cron: runs flag_stuck_documents() every 10 minutes
+- CORS: configurable via ALLOWED_ORIGIN env var

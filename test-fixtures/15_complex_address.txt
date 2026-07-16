@@ -1,0 +1,13 @@
+COMMERCIAL INVOICE
+Invoice Number: INV-ADDR-015
+Invoice Date: 2026-07-10
+Shipper: Müller & Söhne GmbH
+Consignee: O'Brien & Associates, LLC
+Consignee Address: 123 Main St, Suite 400, New York, NY 10001, USA
+Total Declared Value: $33,750.00
+HTS Code: 8483.10.0000
+Net Weight: 1,200 kg
+Gross Weight: 1,450 kg
+Country of Origin: DE
+Carrier: Lufthansa Cargo
+Port of Entry: New York (JFK - 5201)

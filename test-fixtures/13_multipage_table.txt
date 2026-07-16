@@ -1,0 +1,24 @@
+COMMERCIAL INVOICE (Page 1 of 3)
+Invoice Number: INV-MP-013
+Invoice Date: 2026-05-20
+Shipper: Industrial Supply Co Ltd
+Consignee: Manufacturing Partners Inc
+Country of Origin: CN
+Carrier: Maersk Line
+Port of Entry: Los Angeles (LAX - 2720)
+
+--- PAGE 1: LINE ITEMS ---
+Steel Brackets Type A     100   7326.90.0100   $5,500.00
+Steel Brackets Type B      50   7326.90.0200   $3,200.00
+Aluminum Plates             20   7606.12.3000   $8,750.00
+
+--- PAGE 2: ADDITIONAL ITEMS ---
+Copper Wire Roll            30   7408.19.0000   $2,100.00
+Titanium Fasteners         500   8108.90.3060   $7,800.00
+Shipping Cost                                      $450.00
+
+--- PAGE 3: TOTALS ---
+TOTAL DECLARED VALUE: $27,800.00
+HTS Code (Primary): 7326.90.0100
+Net Weight: 4,500 lbs
+Gross Weight: 5,200 lbs
