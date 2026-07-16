@@ -1,0 +1,17 @@
+COMMERCIAL INVOICE
+Invoice Number: INV-2026-008
+Invoice Date: 2026-06-01
+Shipper: Industrial Supply Co
+Consignee: Manufacturing Partners Inc
+Country of Origin: US
+
+LINE ITEMS:
+Steel Brackets Grade 8     50   7326.90.0100   $3,500.00
+Shipping Cost                                      $250.00
+Insurance                                          $100.00
+Aluminum Plates            20   7606.12.3000    $8,750.00
+Handling Fee                                       $200.00
+
+TOTAL VALUE: $12,800.00
+Net Weight: 1,100 lbs
+Gross Weight: 1,350 lbs

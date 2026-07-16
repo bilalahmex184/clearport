@@ -1,0 +1,9 @@
+Commercial Invoice
+Invoice No: INV-2026-005
+Invoice Date: 2026-05-01
+Shipper: Tech Solutions Inc
+Consignee: Data Systems LLC
+HTS Code: 8517.62.0050
+Net Weight: 75 lbs
+Country of Origin: US
+Carrier: UPS

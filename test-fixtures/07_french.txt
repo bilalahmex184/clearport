@@ -1,0 +1,11 @@
+FACTURE COMMERCIALE
+Invoice Number: INV-2026-007
+Date: 15/05/2026
+Shipper: Société Française d'Export
+Consignee: American Imports Co
+Total Declared Value: €15,300.00
+HTS Code: 8504.40.9580
+Net Weight: 850 kg
+Gross Weight: 920 kg
+Country of Origin: FR
+Carrier: Air France Cargo

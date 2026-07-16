@@ -1,0 +1,14 @@
+HANDELSRECHNUNG
+Invoice Number: INV-2026-004
+Invoice Date: 2026-04-10
+Shipper: Präzisions GmbH
+Consignee: Midwest Machinery Works
+Consignee Address: Industriestraße 14, 80331 München, DE
+Total Declared Value: €28,900.00
+HTS Code: 8480.71.8010
+Net Weight: 2,500 kg
+Gross Weight: 2,800 kg
+Country of Origin: DE
+Carrier: Lufthansa Cargo
+
+Certified true and correct — Geprüft und genehmigt

@@ -1,0 +1,10 @@
+COMMERCIAL INVOICE
+Invoice #: INV-2026-003
+Date: 2026/03/15
+Shipper: Pacific Exports Inc
+Consignee: Summit Distribution Corp
+Total Declared Value: $45,000.00
+HTS Code: 8471300100
+Net Weight: 1,200 lbs
+Gross Weight: 1,450 lbs
+Country of Origin: JP

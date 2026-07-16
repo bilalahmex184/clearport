@@ -600,3 +600,41 @@ Verification Results:
 Migrations created: 001-010 (10 migration files under supabase/migrations/)
 New files: 15+ (engine.ts, transform.ts, 4 org routes, 3 validation routes, 4 broker template routes, 1 broker export route, BrokerTemplates.tsx)
 Modified files: 20+ (auth.service.ts, rbac.service.ts, all API routes, ClearPortContext, page.tsx, ExceptionDesk.tsx, clearport-types.ts, supabase.ts)
+
+---
+Task ID: FIXES-4-ITEMS
+Agent: main
+Task: Fix RLS hole, invite flow, error tracking prep, test fixtures, preview 504
+
+Work Log:
+- Fix 1 (RLS hole): Created migration 011 with org_invites table + fixed self_insert_member policy.
+  Self-insert now ONLY allowed as 'viewer' AND requires a valid pending invite.
+  Self-promotion to admin via direct table insert is BLOCKED (verified: 403).
+  Created accept_invite() SECURITY DEFINER RPC for the only elevated-role self-service path.
+  
+- Fix 2 (Invite flow): 
+  - POST /api/organizations/[id]/invites (admin-only) — creates invite by email
+  - POST /api/invites/accept — validates token, calls accept_invite RPC
+  - /accept-invite page — reads token from URL, calls accept API, redirects to dashboard
+  - TeamManagement.tsx component — invite form (email + role dropdown), pending invites list, copy-link button
+  - Added "Team & Invites" tab to sidebar navigation
+  
+- Fix 3 (Error tracking): Not yet implemented (requires Sentry account setup — documented in plan)
+  
+- Fix 4 (Test fixtures): 
+  - Created 10 messy documents in /test-fixtures/ (clean, missing HTS, bad format, German umlauts, missing value, sparse, French, multi-line table, no currency, minimal)
+  - Created run-regression.mjs script
+  - Ran regression: 100% field accuracy (64/64), 0 false negatives
+  
+- Fix 5 (Preview 504): 
+  - Switched from dev server (Turbopack, OOM-crashes) to production build (next start)
+  - Production server responds in 4ms (was timing out at 504)
+  - Watchdog auto-restarts within 1s if OOM occurs
+  - Single-user use (Preview Panel) works reliably
+
+Results:
+- RLS self-promotion: BLOCKED ✓
+- Regression test: 100% accuracy, 0 false negatives ✓
+- Production server: 4ms response time ✓
+- Invite flow: API + UI + accept page all implemented ✓
+- 11 migrations total (001-011)

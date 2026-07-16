@@ -11,6 +11,7 @@ import BrokerAnalytics from '@/components/clearport/BrokerAnalytics';
 import OperationalRules from '@/components/clearport/OperationalRules';
 import EntryDetailView from '@/components/clearport/EntryDetailView';
 import BrokerTemplates from '@/components/clearport/BrokerTemplates';
+import TeamManagement from '@/components/clearport/TeamManagement';
 import SupabaseSyncPanel from '@/components/clearport/SupabaseSyncPanel';
 import {
   Shield,
@@ -24,6 +25,7 @@ import {
   History,
   Settings2,
   FileSpreadsheet,
+  Users,
   Menu,
   X,
   Wifi,
@@ -101,6 +103,7 @@ function AppShell() {
     { id: 'entry-detail', label: 'Entry Detail View', icon: History },
     { id: 'rules', label: 'Operational Rules', icon: Settings2 },
     { id: 'broker-templates', label: 'Broker Templates', icon: FileSpreadsheet },
+    { id: 'team', label: 'Team & Invites', icon: Users },
   ];
 
   const renderActiveView = () => {
@@ -113,6 +116,7 @@ function AppShell() {
       case 'rules': return <OperationalRules />;
       case 'entry-detail': return <EntryDetailView />;
       case 'broker-templates': return <BrokerTemplates />;
+      case 'team': return <TeamManagement />;
       default: return <ExceptionDesk />;
     }
   };

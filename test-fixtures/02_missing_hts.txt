@@ -1,0 +1,9 @@
+COMMERCIAL INVOICE
+Invoice Number: INV-2026-002
+Invoice Date: 2026-02-20
+Shipper: Global Trade Co
+Consignee: Northwind Imports LLC
+Total Declared Value: $8,750.50
+Net Weight: 220 kg
+Country of Origin: CN
+Carrier: Maersk Line

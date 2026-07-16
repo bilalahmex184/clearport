@@ -1,0 +1,9 @@
+Invoice
+Invoice Number: INV-2026-009
+Date: 2026-06-15
+Shipper: Export Solutions
+Consignee: Import Partners
+Total Value: 9500.00
+HTS Code: 7308.90.0000
+Net Weight: 500 lbs
+Country of Origin: CN

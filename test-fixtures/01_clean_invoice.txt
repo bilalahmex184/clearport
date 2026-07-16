@@ -1,0 +1,12 @@
+COMMERCIAL INVOICE
+Invoice Number: INV-2026-001
+Invoice Date: 2026-01-15
+Shipper: Acme Industries Ltd.
+Consignee: Beta Manufacturing Corp
+Total Declared Value: $12,500.00
+HTS Code: 8471.30.0100
+Net Weight: 450 lbs
+Gross Weight: 520 lbs
+Country of Origin: US
+Carrier: FedEx International
+Port of Entry: Los Angeles (LAX - 2720)
