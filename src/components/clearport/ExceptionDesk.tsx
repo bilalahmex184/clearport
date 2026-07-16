@@ -4,7 +4,7 @@ import * as React from 'react';
 import { useClearPort } from '@/context/ClearPortContext';
 import {
   AlertCircle, CheckCircle2, ChevronRight, Eye, RefreshCw, XCircle, FileText,
-  ZoomIn, ZoomOut, RotateCw, Sparkles, Undo2, Loader2,
+  ZoomIn, ZoomOut, RotateCw, Sparkles, Undo2, Loader2, FileSpreadsheet,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { supabase, invokeEdgeFunction } from '@/lib/supabase';
@@ -22,6 +22,7 @@ export default function ExceptionDesk() {
     acceptAllHighConfidence,
     rules,
     userRole,
+    exportToCSV,
   } = useClearPort();
 
   // RBAC: viewer role cannot resolve exceptions. They can still browse the
@@ -201,7 +202,16 @@ export default function ExceptionDesk() {
   };
 
   // Data-driven document tabs (derive from shipment fields, not hardcoded IDs)
-  const availableDocTypes = Array.from(new Set(selectedEntry.fields.map(f => f.sourceDoc).filter(Boolean)));
+  // Derive available doc types from BOTH fields' sourceDoc AND uploaded documents
+  const availableDocTypes = Array.from(new Set([
+    ...selectedEntry.fields.map(f => f.sourceDoc).filter(Boolean),
+    ...selectedEntry.documents.map(d => d.docType).filter(Boolean),
+  ]));
+
+  // Filter fields by the active doc tab (if multiple doc types exist)
+  const fieldsForActiveTab = availableDocTypes.length > 1
+    ? selectedEntry.fields.filter(f => f.sourceDoc === activeDocTab || !activeDocTab)
+    : selectedEntry.fields;
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 h-full overflow-hidden p-6 font-sans">
@@ -219,6 +229,15 @@ export default function ExceptionDesk() {
             {selectedEntry.id}
           </h2>
           <p className="text-xs text-gray-500 mt-1 truncate">{selectedEntry.shipper}</p>
+
+          {/* CSV Export Button */}
+          <button
+            onClick={() => exportToCSV(selectedEntry.id)}
+            className="mt-3 w-full flex items-center justify-center gap-1.5 text-[10px] bg-emerald-600 hover:bg-emerald-500 text-black font-bold px-2 py-1.5 rounded-lg transition-all cursor-pointer uppercase tracking-wider"
+          >
+            <FileSpreadsheet className="w-3 h-3" />
+            Export CSV
+          </button>
         </div>
 
         {/* Filters */}
@@ -510,7 +529,7 @@ export default function ExceptionDesk() {
               </div>
 
               <div className="space-y-2">
-                {selectedEntry.fields.map((f, idx) => (
+                {fieldsForActiveTab.map((f, idx) => (
                   <div key={f.id || idx} className={`flex justify-between items-start p-2 rounded border ${
                     f.isFlagged ? 'bg-red-950/20 border-red-900/40' : 'bg-black/30 border-gray-900'
                   }`}>
@@ -534,9 +553,9 @@ export default function ExceptionDesk() {
                 ))}
               </div>
 
-              {selectedEntry.fields.length === 0 && (
+              {fieldsForActiveTab.length === 0 && (
                 <div className="text-center py-8 text-gray-600 text-xs">
-                  No fields extracted for this shipment.
+                  No fields for {activeDocTab || 'this document'}. Upload a {activeDocTab || 'document'} or check another tab.
                 </div>
               )}
 

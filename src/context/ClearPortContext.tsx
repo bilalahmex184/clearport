@@ -696,6 +696,16 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       let shipper = 'Unknown Shipper';
       let consignee = 'Unknown Consignee';
 
+      // Detect document type from the first file's name
+      const detectDocType = (fileName: string): string => {
+        const lower = fileName.toLowerCase();
+        if (lower.includes('packing') || lower.includes('pack')) return 'Packing List';
+        if (lower.includes('lading') || lower.includes('bol')) return 'Bill of Lading';
+        if (lower.includes('origin') || lower.includes('coo')) return 'Certificate of Origin';
+        return 'Commercial Invoice';
+      };
+      const detectedDocType = files.length > 0 ? detectDocType(files[0].name) : 'Commercial Invoice';
+
       try {
         const extractResponse = await invokeEdgeFunction<any>('extract-document', { shipmentId });
         if (extractResponse?.success && extractResponse.fields && extractResponse.fields.length > 0) {
@@ -704,7 +714,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             key: f.field_key,
             label: f.field_label,
             value: f.extracted_value,
-            sourceDoc: 'Commercial Invoice',
+            sourceDoc: detectedDocType,  // Use detected type, not hardcoded
             isFlagged: false,
             confidence: f.confidence,
             boundingBox: f.bounding_box,
@@ -714,6 +724,31 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       } catch (err) {
         console.warn('[extract] edge function failed:', err);
+      }
+
+      // Fetch the actual uploaded documents from the DB so the Exception Desk
+      // can show them in the document viewer
+      let uploadedDocuments: ShipmentEntry['documents'] = [];
+      if (supabase) {
+        try {
+          const { data: docsData } = await supabase
+            .from('documents')
+            .select('id, doc_type, file_name, storage_path, mime_type, uploaded_at')
+            .eq('shipment_id', shipmentId)
+            .order('uploaded_at', { ascending: true });
+          if (docsData) {
+            uploadedDocuments = docsData.map((d: any) => ({
+              id: d.id,
+              docType: d.doc_type || detectedDocType,
+              fileName: d.file_name,
+              storagePath: d.storage_path,
+              mimeType: d.mime_type,
+              uploadedAt: d.uploaded_at,
+            }));
+          }
+        } catch (err) {
+          console.warn('[upload] failed to fetch documents:', err);
+        }
       }
 
       // Step 4: Call the validation chain IN PARALLEL (not sequential)
@@ -782,7 +817,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           initialConfidence,
           currentConfidence: initialConfidence,
           createdAt: new Date().toISOString(),
-          documents: [],
+          documents: uploadedDocuments,  // Use fetched documents, not empty array
           exceptions: newExceptions,
           fields: updatedFields,
         };
