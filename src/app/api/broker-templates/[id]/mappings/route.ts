@@ -11,9 +11,9 @@ import { logger } from '@/lib/utils/logger';
 const mappingSchema = z.object({
   internal_field_key: z.string().min(1),
   external_field_name: z.string().min(1),
-  transform: z.record(z.any()).default({}),
-  is_required: z.boolean().default(false),
-  sort_order: z.number().int().default(0),
+  transform: z.record(z.string(), z.any()),
+  is_required: z.boolean(),
+  sort_order: z.number().int(),
 });
 
 // GET — list mappings for a template

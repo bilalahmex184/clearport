@@ -10,7 +10,7 @@ import { logger } from '@/lib/utils/logger';
 
 const inviteSchema = z.object({
   email: z.string().email(),
-  role: z.enum(['admin', 'operator', 'viewer']).default('viewer'),
+  role: z.enum(['admin', 'operator', 'viewer']),
 });
 
 // GET — list pending invites for the org (admin only)
@@ -61,13 +61,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
     if (error) throw new AppError('Failed to create invite', 500, 'DB_ERROR', error.message);
 
-    // Audit log
-    await client.from('audit_logs').insert({
-      org_id: orgId,
-      user_id: user.id,
-      text: `[invite] User ${getUserEmail(user)} invited ${parsed.data.email} as ${parsed.data.role}`,
-      type: 'info',
-    }).catch(() => {});
+    // Audit log (fire-and-forget, don't block on errors)
+    try {
+      await client.from('audit_logs').insert({
+        org_id: orgId,
+        user_id: user.id,
+        text: `[invite] User ${getUserEmail(user)} invited ${parsed.data.email} as ${parsed.data.role}`,
+        type: 'info',
+      });
+    } catch {}
 
     logger.info('Invite created', { inviteId: data.id, orgId, email: parsed.data.email, role: parsed.data.role });
 
