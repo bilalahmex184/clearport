@@ -75,63 +75,103 @@ export default function IngestUpload() {
   };
 
   const handleFileUpload = async (files: File[]) => {
-    // Defense in depth — the upload button is hidden for viewer role, but
-    // if a keyboard shortcut / devtools bypass reaches here, bail out.
     if (!canUploadFiles) {
       setErrorMsg('Your role does not have permission to upload documents.');
       return;
     }
 
-    // Validate first file
-    const file = files[0];
     const allowedMimeTypes = ['application/pdf', 'image/png', 'image/jpeg', 'image/jpg', 'image/tiff', 'text/plain', 'text/csv'];
-    if (!allowedMimeTypes.includes(file.type)) {
-      setErrorMsg(`Unsupported file format (${file.type || 'unknown'}). Please upload PDF, PNG, JPEG, or TIFF.`);
-      return;
-    }
-
     const maxSizeBytes = 10 * 1024 * 1024;
-    if (file.size > maxSizeBytes) {
-      setErrorMsg(`File size exceeds the 10MB limit. This file is ${(file.size / (1024 * 1024)).toFixed(2)} MB.`);
+
+    // Validate ALL files first — reject the batch only if ALL are invalid
+    const validFiles: File[] = [];
+    const invalidFiles: { name: string; reason: string }[] = [];
+
+    for (const file of files) {
+      if (!allowedMimeTypes.includes(file.type)) {
+        invalidFiles.push({ name: file.name, reason: `Unsupported format (${file.type || 'unknown'})` });
+      } else if (file.size > maxSizeBytes) {
+        invalidFiles.push({ name: file.name, reason: `Exceeds 10MB (${(file.size / (1024 * 1024)).toFixed(1)}MB)` });
+      } else {
+        validFiles.push(file);
+      }
+    }
+
+    if (validFiles.length === 0) {
+      setErrorMsg(`All ${files.length} file(s) rejected: ${invalidFiles.map(f => f.name).join(', ')}`);
       return;
     }
 
-    setUploadedFile(file);
+    // Duplicate detection within the batch
+    const seenHashes = new Set<string>();
+    const uniqueFiles: File[] = [];
+    const duplicates: string[] = [];
+
+    for (const file of validFiles) {
+      // Simple dedup by name+size (not a cryptographic hash, but catches accidental duplicates)
+      const hash = `${file.name}:${file.size}`;
+      if (seenHashes.has(hash)) {
+        duplicates.push(file.name);
+      } else {
+        seenHashes.add(hash);
+        uniqueFiles.push(file);
+      }
+    }
+
+    // Set up state for multi-file upload
+    setUploadedFile(uniqueFiles[0]); // Show first file in UI
     setUploadStep('uploading');
     setUploadProgress(0);
     setIsTypeConfirmed(false);
     setElapsedTime(0);
     setErrorMsg(null);
 
-    // Visual progress
-    const progressInterval = setInterval(() => {
-      setUploadProgress(prev => {
-        if (prev >= 95) {
-          clearInterval(progressInterval);
-          return 95;
+    // Per-file progress tracking
+    const fileResults: { name: string; success: boolean; error?: string; shipmentId?: string }[] = [];
+    const CONCURRENCY_LIMIT = 3; // Max 3 concurrent uploads
+
+    // Process files in batches of CONCURRENCY_LIMIT
+    for (let i = 0; i < uniqueFiles.length; i += CONCURRENCY_LIMIT) {
+      const batch = uniqueFiles.slice(i, i + CONCURRENCY_LIMIT);
+
+      const batchResults = await Promise.allSettled(
+        batch.map(async (file) => {
+          try {
+            const result = await uploadDocuments([file]);
+            return { name: file.name, success: result.success, error: result.error, shipmentId: result.shipmentId };
+          } catch (err) {
+            return { name: file.name, success: false, error: err instanceof Error ? err.message : 'Upload failed' };
+          }
+        }),
+      );
+
+      batchResults.forEach((result) => {
+        if (result.status === 'fulfilled') {
+          fileResults.push(result.value);
+        } else {
+          fileResults.push({ name: 'unknown', success: false, error: 'Promise rejected' });
         }
-        return prev + 5;
       });
-    }, 100);
 
-    try {
-      // Call the real upload pipeline
-      const result = await uploadDocuments(files);
+      // Update progress
+      const progress = Math.min(95, Math.round(((i + batch.length) / uniqueFiles.length) * 95));
+      setUploadProgress(progress);
+    }
 
-      clearInterval(progressInterval);
+    // Post-batch summary
+    const succeeded = fileResults.filter(r => r.success);
+    const failed = fileResults.filter(r => !r.success);
 
-      if (!result.success) {
-        throw new Error(result.error || 'Upload failed');
-      }
-
-      setShipmentIdState(result.shipmentId);
-      setSuccessShipmentId(result.shipmentId);
+    // Use the first successful shipment for the UI
+    const firstSuccess = succeeded[0];
+    if (firstSuccess) {
+      setShipmentIdState(firstSuccess.shipmentId || '');
+      setSuccessShipmentId(firstSuccess.shipmentId || '');
       setUploadProgress(100);
 
-      // Move to detecting step
       setTimeout(() => {
         setUploadStep('detecting');
-        const lowerName = file.name.toLowerCase();
+        const lowerName = (firstSuccess.name || '').toLowerCase();
         if (lowerName.includes('packing') || lowerName.includes('pack')) {
           setDetectedType('Packing List');
         } else if (lowerName.includes('lading') || lowerName.includes('bol')) {
@@ -142,12 +182,23 @@ export default function IngestUpload() {
           setDetectedType('Commercial Invoice');
         }
       }, 400);
-    } catch (err) {
-      clearInterval(progressInterval);
-      console.error('Upload failed:', err);
-      const errMsg = err instanceof Error ? err.message : 'The secure upload channel is unavailable.';
-      setErrorMsg(errMsg);
-      setUploadStep('idle');
+    }
+
+    // Show summary if there were any issues
+    if (invalidFiles.length > 0 || duplicates.length > 0 || failed.length > 0) {
+      const parts: string[] = [];
+      if (succeeded.length > 0) parts.push(`${succeeded.length} processed`);
+      if (failed.length > 0) parts.push(`${failed.length} failed: ${failed.map(f => f.name).join(', ')}`);
+      if (invalidFiles.length > 0) parts.push(`${invalidFiles.length} rejected: ${invalidFiles.map(f => f.name).join(', ')}`);
+      if (duplicates.length > 0) parts.push(`${duplicates.length} duplicates skipped: ${duplicates.join(', ')}`);
+
+      if (succeeded.length === 0) {
+        setErrorMsg(`Batch upload failed. ${parts.join('; ')}`);
+        setUploadStep('idle');
+      } else {
+        // Partial success — show warning but don't block
+        console.warn(`Batch upload partial: ${parts.join('; ')}`);
+      }
     }
   };
 

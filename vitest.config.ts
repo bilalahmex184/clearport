@@ -1,5 +1,9 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
+import { config } from 'dotenv';
+
+// Load .env before tests run
+config();
 
 export default defineConfig({
   test: {
@@ -10,6 +14,7 @@ export default defineConfig({
     include: ['tests/unit/**/*.test.ts'],
     reporters: ['default', 'json'],
     outputFile: 'test-results/vitest-results.json',
+    setupFiles: ['tests/helpers/setup.ts'],
   },
   resolve: {
     alias: {

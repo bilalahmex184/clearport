@@ -12,7 +12,7 @@ import { GoogleGenAI } from "npm:@google/genai@2";
 
 // --- CORS -------------------------------------------------------------------
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": Deno.env.get("ALLOWED_ORIGIN") || "*",
   "Access-Control-Allow-Headers":
     "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -832,6 +832,28 @@ Deno.serve(async (req) => {
     if (!userClient) return jsonRes({ error: "Missing Authorization header" }, 401);
     const user = await getUser(userClient);
     if (!user) return jsonRes({ error: "Unauthorized — invalid JWT" }, 401);
+
+    // 1b. Rate limit check — 50 extractions per hour per org
+    // Get the user's org from organization_members
+    const { data: orgMember } = await userClient
+      .from("organization_members")
+      .select("org_id")
+      .eq("user_id", user.id)
+      .limit(1)
+      .maybeSingle();
+
+    if (orgMember?.org_id) {
+      const { data: allowed, error: rlError } = await userClient.rpc("check_extraction_rate_limit", {
+        p_org_id: orgMember.org_id,
+        p_max_requests: 50,
+      });
+      if (rlError || allowed === false) {
+        return jsonRes(
+          { error: "Rate limit exceeded. Maximum 50 extractions per hour per organization. Please try again later." },
+          429,
+        );
+      }
+    }
 
     // 2. Parse JSON body
     let body: any = {};

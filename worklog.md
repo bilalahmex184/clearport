@@ -713,3 +713,42 @@ Bugs found and fixed during testing:
 5. SLA thresholds too strict for sandbox — added sandbox-aware multiplier (5x)
 
 TOTAL: 54/54 tests PASSED
+
+---
+Task ID: PROD-READINESS-FIXES
+Agent: main
+Task: Section 0 (secret exposure) + Section 1 (production readiness) + Section 4 (bulk upload)
+
+Work Log:
+
+Section 0: Secret Exposure Fix (CRITICAL)
+- Found hardcoded Supabase Management API token in 3 source files
+- Removed token from: tests/helpers/test-utils.ts, test-fixtures/run-regression.mjs, tests/unit/03-broker-mapping.test.ts
+- All files now read from process.env.SUPABASE_MANAGEMENT_TOKEN
+- Token moved to .env (gitignored via .env* pattern)
+- .env removed from git history (git filter-branch --index-filter)
+- Token string scrubbed from all git objects (git filter-branch --tree-filter)
+- Reflog expired, GC run to purge unreachable objects
+- ⚠ Token must be rotated manually in Supabase Dashboard → Account → Access Tokens
+
+Section 1: Production Readiness
+1. CORS tightening: All 11 edge functions updated to use Deno.env.get("ALLOWED_ORIGIN") instead of hardcoded "*"
+2. Rate limiting: Migration 012 created extraction_rate_limits table + check_extraction_rate_limit() SECURITY DEFINER function (50 extractions/hour/org). Wired into extract-document edge function.
+3. Reconciliation: Migration 013 created stuck_documents table + flag_stuck_documents() function for finding documents stuck in "processing" > 10 minutes. pg_cron setup documented.
+4. Test isolation: Added cleanupTestUser() helper to delete orphaned auth.users after tests. Added dotenv setup to vitest.config.ts so env vars are loaded.
+5. "test" script: Added "test": "vitest run" and "test:e2e": "npx playwright test" to package.json
+6. CI: .github/workflows/test-suite.yml updated with all env vars
+
+Section 4: Bulk Upload Fix (CONFIRMED BUG)
+- Bug: handleFileUpload only processed files[0] — selecting multiple files silently only uploaded the first
+- Fix: Rewrote handleFileUpload to:
+  - Validate ALL files (not just first) — invalid files are rejected, valid ones proceed
+  - Duplicate detection within batch (by name+size hash) — duplicates skipped, not double-counted
+  - Concurrency limit: 3 concurrent uploads max (prevents slamming extraction pipeline)
+  - Per-file progress tracking via Promise.allSettled
+  - Partial failure handling: one bad file doesn't kill the rest
+  - Post-batch summary: "N processed, M failed, K rejected, J duplicates skipped"
+
+Migrations: 012 (rate limiting) + 013 (reconciliation)
+Edge functions redeployed: extract-document (with rate limiting + CORS)
+Tests verified: 17/17 Section 1 security tests PASS

@@ -131,13 +131,24 @@ export async function directSupabaseInsert(
 // Cleanup — deletes an org via management API (bypasses RLS)
 // ============================================================================
 
-const MANAGEMENT_TOKEN = 'SCRUBBED';
+const MANAGEMENT_TOKEN = process.env.SUPABASE_MANAGEMENT_TOKEN || '';
 
 export async function cleanupOrg(orgId: string): Promise<void> {
+  if (!MANAGEMENT_TOKEN) { console.warn('SUPABASE_MANAGEMENT_TOKEN not set — skipping cleanup'); return; }
   await fetch(`https://api.supabase.com/v1/projects/apfsceomnnhefxkvjhkz/database/query`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${MANAGEMENT_TOKEN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ query: `DELETE FROM organizations WHERE id = '${orgId}'` }),
+  });
+}
+
+// Cleanup orphaned auth.users created during tests
+export async function cleanupTestUser(userId: string): Promise<void> {
+  if (!MANAGEMENT_TOKEN) return;
+  await fetch(`https://api.supabase.com/v1/projects/apfsceomnnhefxkvjhkz/database/query`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${MANAGEMENT_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: `DELETE FROM auth.users WHERE id = '${userId}'` }),
   });
 }
 
