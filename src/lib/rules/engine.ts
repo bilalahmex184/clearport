@@ -1,11 +1,12 @@
 // ============================================================================
-// ClearPort — Rule Engine
+// ClearPort — Rule Engine (Upgraded)
 // Loads active validation_rules for an org and runs them against document_fields.
-// Returns a list of { rule_id, passed, message } per rule per field.
+// Returns RuleEvaluationResult[] with severity, decision_trace, and dependencies.
 // ============================================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '@/lib/utils/logger';
+import type { RuleEvaluationResult, DecisionTrace } from '@/lib/pipeline/types';
 
 export interface ValidationRule {
   id: string;
@@ -18,6 +19,7 @@ export interface ValidationRule {
   is_active: boolean;
 }
 
+// Legacy result type (backward compat)
 export interface RuleResult {
   rule_id: string;
   rule_name: string;
@@ -96,6 +98,97 @@ export function runRules(rules: ValidationRule[], fields: DocumentField[]): Rule
   }
 
   return results;
+}
+
+/**
+ * Upgraded: Run all rules and produce RuleEvaluationResult[] with
+ * decision_trace, dependencies, and severity.
+ */
+export function runRulesUpgraded(rules: ValidationRule[], fields: DocumentField[]): RuleEvaluationResult[] {
+  const results: RuleEvaluationResult[] = [];
+
+  for (const rule of rules) {
+    if (rule.field_key) {
+      const matchingFields = fields.filter(f => f.field_key === rule.field_key);
+      if (matchingFields.length === 0) {
+        if (rule.rule_type === 'required_field') {
+          results.push({
+            rule_id: rule.id,
+            status: "failed",
+            severity: rule.severity === "block" ? "error" : "warning",
+            expected: "field present",
+            actual: "missing",
+            reason: `Required field "${rule.field_key}" is missing from the document.`,
+            dependencies: [rule.field_key],
+            decision_trace: {
+              fields_used: [rule.field_key],
+              evaluation_path: ["check_presence", "not_found"],
+              final_outcome: "failed",
+            },
+          });
+        }
+        continue;
+      }
+      for (const field of matchingFields) {
+        const passed = rulePassed(rule, field, fields);
+        const reason = generateMessage(rule, field, fields, passed);
+        const value = field.corrected_value || field.extracted_value || '';
+
+        results.push({
+          rule_id: rule.id,
+          status: passed ? "passed" : "failed",
+          severity: rule.severity === "block" ? "error" : "warning",
+          expected: getExpectedValue(rule),
+          actual: value,
+          reason,
+          dependencies: [rule.field_key],
+          decision_trace: {
+            fields_used: [rule.field_key],
+            evaluation_path: [rule.rule_type, passed ? "pass" : "fail"],
+            final_outcome: passed ? "passed" : "failed",
+          },
+        });
+      }
+    } else {
+      // Global rule
+      const legacyResults = evaluateGlobalRule(rule, fields);
+      for (const lr of legacyResults) {
+        results.push({
+          rule_id: lr.rule_id,
+          status: lr.passed ? "passed" : "failed",
+          severity: lr.severity === "block" ? "error" : "warning",
+          expected: "cross-document match",
+          actual: lr.message,
+          reason: lr.message,
+          dependencies: [lr.field_key].filter(Boolean) as string[],
+          decision_trace: {
+            fields_used: [lr.field_key].filter(Boolean) as string[],
+            evaluation_path: ["cross_doc_match", lr.passed ? "match" : "mismatch"],
+            final_outcome: lr.passed ? "passed" : "failed",
+          },
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
+function getExpectedValue(rule: ValidationRule): any {
+  switch (rule.rule_type) {
+    case "confidence_threshold":
+      return `confidence >= ${rule.config.min_confidence}`;
+    case "regex_format":
+      return `matches ${rule.config.pattern}`;
+    case "required_field":
+      return "field present and non-empty";
+    case "math_check":
+      return rule.config.check;
+    case "cross_doc_match":
+      return "all sources agree";
+    default:
+      return "unknown";
+  }
 }
 
 /**
