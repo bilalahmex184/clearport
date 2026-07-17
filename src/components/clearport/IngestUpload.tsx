@@ -82,8 +82,16 @@ export default function IngestUpload() {
 
     const allowedMimeTypes = ['application/pdf', 'image/png', 'image/jpeg', 'image/jpg', 'image/tiff', 'text/plain', 'text/csv'];
     // (§6) 20MB per-file limit — enforced client-side, server-side, and at bucket level.
+    // (§6.2) 100MB per-shipment aggregate limit — wired up, not a dead variable.
     const maxSizeBytes = 20 * 1024 * 1024; // 20MB per file
     const maxShipmentSize = 100 * 1024 * 1024; // 100MB per shipment aggregate
+
+    // Calculate total batch size
+    const totalBatchSize = files.reduce((sum, f) => sum + f.size, 0);
+    if (totalBatchSize > maxShipmentSize) {
+      setErrorMsg(`Total batch size (${(totalBatchSize / (1024 * 1024)).toFixed(1)}MB) exceeds the 100MB per-shipment limit. Please upload fewer files or smaller files.`);
+      return;
+    }
 
     // Validate ALL files first — reject the batch only if ALL are invalid
     const validFiles: File[] = [];

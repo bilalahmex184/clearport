@@ -279,7 +279,9 @@ export async function updateShipment(
   orgId?: string,
 ): Promise<DbShipment> {
   // Only allow known-safe columns to be updated through this path.
-  const allowed: Array<keyof DbShipment> = [
+  // (§2 fix: validation_status, last_validated_at, pipeline_trace_id were
+  //  silently stripped by this allowlist — now included.)
+  const allowed: Array<string> = [
     'shipper',
     'consignee',
     'status',
@@ -287,6 +289,9 @@ export async function updateShipment(
     'urgency',
     'initial_confidence',
     'current_confidence',
+    'validation_status',
+    'last_validated_at',
+    'pipeline_trace_id',
   ];
 
   const patch: Record<string, unknown> = {};

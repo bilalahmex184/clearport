@@ -82,6 +82,9 @@ export async function PATCH(
     if (parsed.data.consignee !== undefined) patch.consignee = parsed.data.consignee;
     if (parsed.data.status !== undefined) patch.status = parsed.data.status;
     if (parsed.data.urgency !== undefined) patch.urgency = parsed.data.urgency;
+    if (parsed.data.validation_status !== undefined) patch.validation_status = parsed.data.validation_status;
+    if (parsed.data.last_validated_at !== undefined) patch.last_validated_at = parsed.data.last_validated_at;
+    if (parsed.data.pipeline_trace_id !== undefined) patch.pipeline_trace_id = parsed.data.pipeline_trace_id;
 
     // Scope the update by orgId so a cross-org PATCH returns 404 instead of
     // silently no-op'ing.

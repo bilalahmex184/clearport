@@ -226,6 +226,9 @@ export function mapDbToShipment(
       uploadedAt: d.uploaded_at,
     })),
     createdAt: db.created_at,
+    validationStatus: (db as any).validation_status || 'pending',
+    lastValidatedAt: (db as any).last_validated_at || undefined,
+    pipelineTraceId: (db as any).pipeline_trace_id || undefined,
   };
 }
 

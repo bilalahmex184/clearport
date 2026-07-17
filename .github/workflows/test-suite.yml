@@ -27,6 +27,15 @@ jobs:
       - name: Install dependencies
         run: bun install
 
+      - name: (§6.3) Schema drift check — schema.sql must reference org-scoped policies
+        run: |
+          COUNT=$(grep -c "org_scoped" supabase/schema.sql || echo "0")
+          if [ "$COUNT" -eq "0" ]; then
+            echo "FAIL: supabase/schema.sql does not contain org_scoped policies — schema drift detected"
+            exit 1
+          fi
+          echo "OK: schema.sql contains $COUNT org_scoped references"
+
       - name: Build project
         run: NODE_OPTIONS="--max-old-space-size=4096" bun run build
         env:

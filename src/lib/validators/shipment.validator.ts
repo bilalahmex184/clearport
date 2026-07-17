@@ -19,6 +19,9 @@ export const updateShipmentSchema = z.object({
   consignee: z.string().min(1).max(200).optional(),
   status: z.enum(['Under Review', 'Approved', 'Exported']).optional(),
   urgency: z.string().max(50).optional(),
+  validation_status: z.enum(['pending', 'running', 'completed', 'failed', 'degraded']).optional(),
+  last_validated_at: z.string().optional(),
+  pipeline_trace_id: z.string().optional(),
 });
 
 export type CreateShipmentInput = z.infer<typeof createShipmentSchema>;

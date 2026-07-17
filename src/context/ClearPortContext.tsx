@@ -752,15 +752,52 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
 
       // Step 4: Validation chain — AWAITED, failure-tracked, no silent catches.
-      // (§4) Removed unawaited IIFE + Promise.allSettled + .catch(()=>{}).
-      // Any rejected validator sets validation_status='failed' + writes audit row.
+      // (§3) Full state machine: running → completed/failed/degraded
+      // (§5) Retry with exponential backoff before recording a failure.
       const traceId = crypto.randomUUID();
+
+      // (§3) Set validation_status = 'running' + pipeline_trace_id before starting
+      try {
+        await apiFetchOrg('/api/shipments/' + shipmentId, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            validation_status: 'running',
+            pipeline_trace_id: traceId,
+          }),
+        });
+      } catch (e) {
+        console.error('[validation-chain] failed to set validation_status=running:', e);
+      }
+
+      // (§5) Helper: invoke with retry (2 retries, 500ms then 1500ms backoff)
+      const invokeWithRetry = async (fnName: string, body: Record<string, any>): Promise<void> => {
+        const delays = [500, 1500];
+        let lastErr: unknown;
+        for (let attempt = 0; attempt <= delays.length; attempt++) {
+          try {
+            await invokeEdgeFunction(fnName, body);
+            if (attempt > 0) {
+              console.log(`[validation-chain] ${fnName} succeeded on attempt ${attempt + 1}`);
+              addAuditLog(`[retry] ${fnName} succeeded on attempt ${attempt + 1} for ${shipmentId}`, 'info', shipmentId);
+            }
+            return;
+          } catch (err) {
+            lastErr = err;
+            if (attempt < delays.length) {
+              console.warn(`[validation-chain] ${fnName} attempt ${attempt + 1} failed, retrying in ${delays[attempt]}ms:`, err instanceof Error ? err.message : err);
+              await new Promise(r => setTimeout(r, delays[attempt]));
+            }
+          }
+        }
+        throw lastErr;
+      };
+
       try {
         // Run the 3 independent validators in parallel, but INSPECT results
         const validatorResults = await Promise.allSettled([
-          invokeEdgeFunction('schema-validate', { shipmentId, trace_id: traceId }),
-          invokeEdgeFunction('math-validate', { shipmentId, trace_id: traceId }),
-          invokeEdgeFunction('cross-validate', { shipmentId, trace_id: traceId }),
+          invokeWithRetry('schema-validate', { shipmentId, trace_id: traceId }),
+          invokeWithRetry('math-validate', { shipmentId, trace_id: traceId }),
+          invokeWithRetry('cross-validate', { shipmentId, trace_id: traceId }),
         ]);
 
         // Check for rejected promises — these are validation chain failures
@@ -770,12 +807,12 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           if (result.status === 'rejected') {
             const errMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
             failures.push(`${validatorNames[idx]}: ${errMsg}`);
-            console.error(`[validation-chain] ${validatorNames[idx]} REJECTED:`, errMsg);
+            console.error(`[validation-chain] ${validatorNames[idx]} REJECTED after retries:`, errMsg);
           }
         });
 
         if (failures.length > 0) {
-          // (§2) Validation chain failed — persist failure, update shipment status
+          // (§3) Validation chain failed — set status to 'failed'
           try {
             await apiFetchOrg('/api/shipments/' + shipmentId, {
               method: 'PATCH',
@@ -785,7 +822,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             console.error('[validation-chain] failed to update shipment status:', e);
           }
           addAuditLog(
-            `[pipeline_error] Validation chain failed for ${shipmentId}. Failures: ${failures.join('; ')}`,
+            `[pipeline_error] Validation chain failed for ${shipmentId} (after retries). Failures: ${failures.join('; ')}`,
             'warning',
             shipmentId,
           );
@@ -798,7 +835,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               field_name: 'Validation Pipeline Error',
               extracted_value: '',
               confidence: 0,
-              reason: `Validation chain failed: ${failures.join('; ')}`,
+              reason: `Validation chain failed (after retries): ${failures.join('; ')}`,
               exception_type: 'missing_field',
               doc_type: 'System',
               status: 'Unresolved',
@@ -807,13 +844,15 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           }
         } else {
           // All validators succeeded — run flag-exceptions (no bare catch)
+          let flagExceptionsFailed = false;
           try {
-            await invokeEdgeFunction('flag-exceptions', { shipmentId, trace_id: traceId });
+            await invokeWithRetry('flag-exceptions', { shipmentId, trace_id: traceId });
           } catch (flagErr) {
+            flagExceptionsFailed = true;
             const errMsg = flagErr instanceof Error ? flagErr.message : String(flagErr);
-            console.error('[validation-chain] flag-exceptions FAILED:', errMsg);
+            console.error('[validation-chain] flag-exceptions FAILED after retries:', errMsg);
             addAuditLog(
-              `[pipeline_error] flag-exceptions failed for ${shipmentId}: ${errMsg}`,
+              `[pipeline_error] flag-exceptions failed for ${shipmentId} (after retries): ${errMsg}`,
               'warning',
               shipmentId,
             );
@@ -825,13 +864,27 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
                 field_name: 'Flag Exceptions Error',
                 extracted_value: '',
                 confidence: 0,
-                reason: `flag-exceptions failed: ${errMsg}`,
+                reason: `flag-exceptions failed (after retries): ${errMsg}`,
                 exception_type: 'missing_field',
                 doc_type: 'System',
                 status: 'Unresolved',
                 history: [],
               });
             }
+          }
+
+          // (§3) Set final validation status: 'completed' on full success, 'degraded' if flag-exceptions failed
+          const finalStatus = flagExceptionsFailed ? 'degraded' : 'completed';
+          try {
+            await apiFetchOrg('/api/shipments/' + shipmentId, {
+              method: 'PATCH',
+              body: JSON.stringify({
+                validation_status: finalStatus,
+                last_validated_at: new Date().toISOString(),
+              }),
+            });
+          } catch (e) {
+            console.error(`[validation-chain] failed to set validation_status=${finalStatus}:`, e);
           }
         }
       } catch (err) {
@@ -840,6 +893,14 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         const errMsg = err instanceof Error ? err.message : String(err);
         console.error('[validation-chain] unexpected error:', errMsg);
         addAuditLog(`[pipeline_error] Unexpected validation error for ${shipmentId}: ${errMsg}`, 'error', shipmentId);
+        try {
+          await apiFetchOrg('/api/shipments/' + shipmentId, {
+            method: 'PATCH',
+            body: JSON.stringify({ validation_status: 'failed' }),
+          });
+        } catch (e) {
+          console.error('[validation-chain] failed to set validation_status=failed:', e);
+        }
       }
 
       // Step 5: Reload from API to get the real DB state (with fields, exceptions, documents)

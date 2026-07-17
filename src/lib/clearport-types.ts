@@ -164,6 +164,8 @@ export interface Exception {
   resolvedBy?: string;
 }
 
+export type ValidationStatus = 'pending' | 'running' | 'completed' | 'failed' | 'degraded';
+
 export interface ShipmentEntry {
   id: string;
   shipper: string;
@@ -184,6 +186,9 @@ export interface ShipmentEntry {
     uploadedAt: string;
   }>;
   createdAt: string;
+  validationStatus?: ValidationStatus;
+  lastValidatedAt?: string;
+  pipelineTraceId?: string;
 }
 
 export interface OperationalRules {
