@@ -289,12 +289,20 @@ function mockFields(): any[] {
 // NOTE: Gemini handles multi-page PDFs natively via inlineData — the entire
 // PDF is sent as a single inlineData part and the model reads every page.
 // No special chunking or per-page calls are required.
+//
+// WALL-CLOCK BUDGET: a `deadline` (epoch ms) is threaded in from the caller.
+// Before every model attempt we check the remaining budget; if exhausted we
+// stop immediately so the caller can drop to manual review instead of
+// silently retrying for minutes. Each model call's race timeout is also
+// clamped to the remaining budget so a single slow model can't blow the
+// whole wall.
 async function callGeminiExtraction(
   ai: GoogleGenAI,
   mimeType: string,
   base64Data: string,
-  rawText?: string
-): Promise<{ fields: any[]; debug: any; model: string | null; rawResponse: string | null }> {
+  rawText: string | undefined,
+  deadline: number
+): Promise<{ fields: any[]; debug: any; model: string | null; rawResponse: string | null; budgetExhausted: boolean }> {
   // Ordered model cascade — Pro first (most accurate), then Flash variants.
   const models = ["gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-flash"];
   const debug: any = { modelsTried: [], errors: [], rawResponses: [], retries: [] };
@@ -305,12 +313,26 @@ async function callGeminiExtraction(
   const generationConfig = { temperature: 0, topP: 0, topK: 1 };
 
   for (const model of models) {
+    // ── Budget check before each model ──
+    const remaining = deadline - Date.now();
+    if (remaining <= 500) {
+      debug.errors.push(`budget exhausted before ${model} (remaining ${remaining}ms) — aborting Gemini cascade`);
+      debug.budgetExhausted = true;
+      return { fields: [], debug, model: null, rawResponse: null, budgetExhausted: true };
+    }
     debug.modelsTried.push(model);
     let lastErr: any = null;
 
     // Retry up to 2 times on transient errors (429 rate-limit, 503 server
     // error). Exponential backoff: 1s, then 2s.
     for (let attempt = 0; attempt <= 2; attempt++) {
+      // ── Budget check before each attempt ──
+      const rem = deadline - Date.now();
+      if (rem <= 500) {
+        debug.errors.push(`budget exhausted before ${model} attempt ${attempt + 1} (remaining ${rem}ms)`);
+        debug.budgetExhausted = true;
+        return { fields: [], debug, model: null, rawResponse: null, budgetExhausted: true };
+      }
       try {
         const parts: any[] = [];
 
@@ -321,8 +343,10 @@ async function callGeminiExtraction(
           parts.push({ text: GEMINI_PROMPT });
         }
 
-        // 30-second timeout — if the model is slow or hung, abort and fall
-        // back to the next model in the cascade.
+        // Per-call timeout — clamped to the remaining wall-clock budget so a
+        // single hung model can't burn the whole budget. Floor of 2s so we
+        // still give the model a real chance; ceiling of 15s.
+        const callTimeout = Math.max(2000, Math.min(15000, rem));
         const response = await Promise.race([
           ai.models.generateContent({
             model,
@@ -330,7 +354,7 @@ async function callGeminiExtraction(
             config: generationConfig,
           }),
           new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error(`TIMEOUT_15s after 15000ms`)), 15000)
+            setTimeout(() => reject(new Error(`TIMEOUT_${callTimeout}ms after ${callTimeout}ms`)), callTimeout)
           ),
         ]);
 
@@ -352,7 +376,7 @@ async function callGeminiExtraction(
         if (parsed.length > 0) {
           debug.success = true;
           debug.successModel = model;
-          return { fields: parsed, debug, model, rawResponse: text };
+          return { fields: parsed, debug, model, rawResponse: text, budgetExhausted: false };
         } else {
           debug.errors.push(`${model}: 0 parseable fields from ${text.length} chars`);
           lastErr = new Error(`0 parseable fields from ${text.length} chars`);
@@ -380,20 +404,27 @@ async function callGeminiExtraction(
         if (isQuotaExhausted) {
           debug.errors.push(`${model}: quota exhausted — skipping remaining models, using regex fallback`);
           debug.quotaExhausted = true;
-          return { fields: [], debug, model: null, rawResponse: null };
+          return { fields: [], debug, model: null, rawResponse: null, budgetExhausted: false };
         }
 
-        if (isRetryable && attempt < 1) {  // Reduced from 2 to 1 retry
-          const delay = 1000; // Fixed 1s delay (was exponential)
+        // ── Budget-aware retry: only sleep if the delay still fits the budget ──
+        if (isRetryable && attempt < 1) {
+          const delay = 1000; // Fixed 1s delay
+          const remAfterDelay = deadline - Date.now() - delay;
+          if (remAfterDelay <= 500) {
+            debug.errors.push(`${model}: retry skipped — budget would be exhausted (${remAfterDelay}ms left after ${delay}ms delay)`);
+            debug.budgetExhausted = true;
+            return { fields: [], debug, model: null, rawResponse: null, budgetExhausted: true };
+          }
           debug.retries.push({ model, attempt: attempt + 1, delayMs: delay, reason: errMsg });
           await new Promise((r) => setTimeout(r, delay));
           continue;
         }
 
-        // Non-retryable error (incl. TIMEOUT_30s) — break out of retry loop
+        // Non-retryable error (incl. TIMEOUT) — break out of retry loop
         // and fall through to the next model.
-        if (errMsg.startsWith("TIMEOUT_15s")) {
-          debug.errors.push(`${model}: timed out after 30s, falling back to next model`);
+        if (errMsg.startsWith("TIMEOUT_")) {
+          debug.errors.push(`${model}: timed out, falling back to next model`);
         }
         break;
       }
@@ -403,7 +434,7 @@ async function callGeminiExtraction(
     }
   }
 
-  return { fields: [], debug, model: null, rawResponse: null };
+  return { fields: [], debug, model: null, rawResponse: null, budgetExhausted: false };
 }
 
 // --- Helper functions for regex extraction ---
@@ -953,6 +984,17 @@ Deno.serve(async (req) => {
       );
     }
 
+    // ─── GLOBAL WALL-CLOCK BUDGET ───
+    // 18 seconds total across ALL documents and ALL tiers. If we blow past it,
+    // every remaining document is dropped straight to needs_manual_review with
+    // a clear "extraction timeout" message — never a silent multi-minute retry.
+    // The budget is shared across the whole shipment so a single huge PDF can't
+    // starve the rest. Configurable via EXTRACTION_BUDGET_MS env (for tests).
+    const BUDGET_MS = Number(Deno.env.get("EXTRACTION_BUDGET_MS") || 18000);
+    const deadline = Date.now() + BUDGET_MS;
+    let budgetExhausted = false;
+    const budgetRemaining = () => deadline - Date.now();
+
     const allFields: any[] = [];
     const perDocResults: any[] = [];
     let latestShipper: string | null = null;
@@ -971,6 +1013,14 @@ Deno.serve(async (req) => {
       let rawAiResponse: string | null = null;
       let extractionSource: string = "none";
       let extractionTier: number = 0;
+      let docBudgetExhausted = false;
+
+      // ── Global budget check before starting this document ──
+      if (budgetRemaining() <= 500) {
+        budgetExhausted = true;
+        docBudgetExhausted = true;
+        console.warn(`[extract-document] BUDGET EXHAUSTED before doc ${doc.file_name} (${budgetRemaining()}ms left) — routing to manual review`);
+      }
 
       // Mark document as 'extracting'
       await admin.from("documents").update({
@@ -1001,20 +1051,25 @@ Deno.serve(async (req) => {
       }
 
       // ─── TIER 1: Gemini Vision (primary) ───
-      if (ai) {
+      if (ai && !docBudgetExhausted) {
         extractionTier = 1;
-        const geminiResult = await callGeminiExtraction(ai, mimeType, base64, rawText);
+        const geminiResult = await callGeminiExtraction(ai, mimeType, base64, rawText, deadline);
         extracted = geminiResult.fields;
         geminiDebug = geminiResult.debug;
         usedModel = geminiResult.model;
         rawAiResponse = geminiResult.rawResponse;
+        if (geminiResult.budgetExhausted) {
+          docBudgetExhausted = true;
+          budgetExhausted = true;
+          console.warn(`[extract-document] BUDGET EXHAUSTED during Gemini cascade for ${doc.file_name} — dropping to manual review`);
+        }
         if (extracted.length > 0) {
           extractionSource = usedModel || "gemini";
         }
       }
 
       // ─── TIER 2: PDF text-layer extraction (if Gemini failed and it's a PDF) ───
-      if (extracted.length === 0 && mimeType === "application/pdf") {
+      if (extracted.length === 0 && !docBudgetExhausted && mimeType === "application/pdf") {
         extractionTier = 2;
         console.log("[extract-document] Tier 2: trying PDF text-layer extraction");
         const pdfText = extractPdfTextLayer(ab);
@@ -1027,14 +1082,14 @@ Deno.serve(async (req) => {
       // ─── TIER 3: Cloud Vision OCR placeholder ───
       // (Not implemented in this environment — would require a Google Cloud Vision API key
       // separate from Gemini. Falls through to Tier 4.)
-      if (extracted.length === 0 && !rawText) {
+      if (extracted.length === 0 && !docBudgetExhausted && !rawText) {
         extractionTier = 3;
         // Cloud Vision would go here: const visionText = await callCloudVision(base64, mimeType);
         // if (visionText) rawText = visionText;
       }
 
       // ─── TIER 4: Tesseract OCR (local, zero quota) ───
-      if (extracted.length === 0 && !rawText) {
+      if (extracted.length === 0 && !docBudgetExhausted && !rawText && budgetRemaining() > 500) {
         extractionTier = 4;
         console.log("[extract-document] Tier 4: trying Tesseract OCR");
         const tesseractText = await tesseractOCR(ab, mimeType);
@@ -1045,7 +1100,7 @@ Deno.serve(async (req) => {
       }
 
       // ─── Regex extraction on whatever text we have (works for Tiers 2, 3, 4) ───
-      if (extracted.length === 0 && rawText) {
+      if (extracted.length === 0 && !docBudgetExhausted && rawText) {
         console.log(`[extract-document] Running regex extraction (tier ${extractionTier})`);
         extracted = regexExtract(rawText);
         if (extracted.length > 0) {
@@ -1055,14 +1110,21 @@ Deno.serve(async (req) => {
       }
 
       // ─── TIER 5: Mark as 'needs_manual_review' — NEVER silent zero ───
-      if (extracted.length === 0) {
-        extractionTier = 5;
-        extractionSource = "needs_manual_review";
+      // This branch handles BOTH (a) all tiers genuinely failing and (b) the
+      // wall-clock budget being exhausted. In the budget case we use a clear
+      // "extraction timeout" reason so the user knows WHY it was dropped.
+      if (extracted.length === 0 || docBudgetExhausted) {
+        extractionTier = docBudgetExhausted ? 5 : 5;
+        extractionSource = docBudgetExhausted ? "timeout_manual_review" : "needs_manual_review";
+
+        const reviewReason = docBudgetExhausted
+          ? `Extraction timed out after ${BUDGET_MS / 1000}s wall-clock budget — the document could not be processed within the time limit. Please review manually.`
+          : `All extraction tiers failed for ${doc.file_name}. Document requires manual review.`;
 
         // Mark the document for manual review
         await admin.from("documents").update({
           processing_status: "needs_manual_review",
-          extraction_source: "needs_manual_review",
+          extraction_source: extractionSource,
         }).eq("id", doc.id);
 
         // Create an exception for manual review
@@ -1071,11 +1133,13 @@ Deno.serve(async (req) => {
           org_id: orgMember?.org_id || null,
           user_id: user.id,
           field_key: "_document",
-          field_name: `Document needs manual review: ${doc.file_name}`,
+          field_name: docBudgetExhausted
+            ? `Extraction timeout — manual review required: ${doc.file_name}`
+            : `Document needs manual review: ${doc.file_name}`,
           original_value: "",
           extracted_value: "",
           confidence: 0,
-          reason: `All extraction tiers failed for ${doc.file_name}. Document requires manual review.`,
+          reason: reviewReason,
           exception_type: "missing_field",
           doc_type: doc.doc_type || "Unknown",
           status: "Unresolved",
@@ -1088,7 +1152,8 @@ Deno.serve(async (req) => {
         failureDetails.push({
           documentId: doc.id,
           file_name: doc.file_name,
-          reason: "All 5 extraction tiers failed — document marked for manual review",
+          reason: reviewReason,
+          budgetExhausted: docBudgetExhausted,
           tiersTried: [1, 2, 3, 4],
           modelsTried: geminiDebug?.modelsTried || [],
           errors: geminiDebug?.errors || [],
@@ -1098,8 +1163,8 @@ Deno.serve(async (req) => {
           documentId: doc.id,
           file_name: doc.file_name,
           doc_type: doc.doc_type,
-          status: "needs_manual_review",
-          extractionSource: "needs_manual_review",
+          status: docBudgetExhausted ? "timeout_manual_review" : "needs_manual_review",
+          extractionSource,
           extractionTier: 5,
           fieldsCount: 0,
           fields: [],
@@ -1109,7 +1174,9 @@ Deno.serve(async (req) => {
         await userClient.from("audit_logs").insert({
           shipment_id: shipmentId,
           user_id: user.id,
-          text: `[extraction] Document ${doc.file_name} marked for manual review — all 5 tiers failed`,
+          text: docBudgetExhausted
+            ? `[extraction] Document ${doc.file_name} dropped to manual review — ${BUDGET_MS / 1000}s wall-clock budget exhausted`
+            : `[extraction] Document ${doc.file_name} marked for manual review — all 5 tiers failed`,
           type: "warning",
         }).then(({ error }: any) => { if (error) console.warn("[extract-document] audit log failed:", error.message); });
 
@@ -1302,12 +1369,17 @@ Deno.serve(async (req) => {
       consignee: latestConsignee || undefined,
       geminiUsed: !!ai,
       debug: geminiDebug,
+      // Surface the wall-clock budget exhaustion so the frontend can show a
+      // clear "extraction timed out" message instead of a generic failure.
+      budgetExhausted,
+      budgetMs: BUDGET_MS,
       ...(totalExtractionFailures > 0
         ? {
             partialFailure: {
               failedDocuments: totalExtractionFailures,
               totalDocuments: totalDocsAttempted,
               details: failureDetails,
+              budgetExhausted,
             },
           }
         : {}),

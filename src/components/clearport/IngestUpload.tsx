@@ -2,15 +2,15 @@
 
 import * as React from 'react';
 import { useClearPort } from '@/context/ClearPortContext';
-import { UploadCloud, CheckCircle2, FileText, Loader2, Sparkles, AlertCircle, HelpCircle, XCircle, Lock } from 'lucide-react';
+import { UploadCloud, CheckCircle2, FileText, Loader2, Sparkles, AlertCircle, HelpCircle, XCircle, Lock, Clock } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { supabase } from '@/lib/supabase';
 import { canUpload, roleLabel } from '@/lib/services/rbac.service';
 
-type StepType = 'idle' | 'uploading' | 'detecting' | 'extracting' | 'done';
+type StepType = 'idle' | 'uploading' | 'processing' | 'done';
 
 export default function IngestUpload() {
-  const { uploadDocuments, entries, setActiveTab, userRole } = useClearPort();
+  const { uploadDocuments, entries, selectedEntry, setActiveTab, userRole } = useClearPort();
 
   // RBAC: viewer role cannot upload. Show a locked panel instead of the
   // drag/drop zone so the viewer can still see recent shipment clusters
@@ -179,19 +179,15 @@ export default function IngestUpload() {
       setSuccessShipmentId(firstSuccess.shipmentId || '');
       setUploadProgress(100);
 
-      setTimeout(() => {
-        setUploadStep('detecting');
-        const lowerName = (firstSuccess.name || '').toLowerCase();
-        if (lowerName.includes('packing') || lowerName.includes('pack')) {
-          setDetectedType('Packing List');
-        } else if (lowerName.includes('lading') || lowerName.includes('bol')) {
-          setDetectedType('Bill of Lading');
-        } else if (lowerName.includes('origin') || lowerName.includes('coo')) {
-          setDetectedType('Certificate of Origin');
-        } else {
-          setDetectedType('Commercial Invoice');
-        }
-      }, 400);
+      // ── IMMEDIATE RESPONSE ──
+      // The upload has landed and the shipment row exists with
+      // validation_status='pending'. Skip the old 'detecting'/'extracting'
+      // theatre and go straight to 'processing' — the user sees "received,
+      // processing" the moment the file lands. The useEffect below watches the
+      // selected shipment's validation_status (refreshed every 4s by the
+      // context's polling) and transitions to 'done' when the pipeline reaches
+      // a terminal state (completed/failed/degraded).
+      setUploadStep('processing');
     }
 
     // Show summary if there were any issues
@@ -212,15 +208,19 @@ export default function IngestUpload() {
     }
   };
 
-  const handleConfirmType = () => {
-    setIsTypeConfirmed(true);
-    setUploadStep('extracting');
-
-    // Simulate extraction phase (the real extraction already ran during upload)
-    setTimeout(() => {
+  // ── Watch the selected shipment's validation_status ──
+  // While we're in the 'processing' step, poll-driven context updates refresh
+  // `selectedEntry.validationStatus` every 4s. The moment it reaches a
+  // terminal state (completed/failed/degraded) we transition to 'done' so the
+  // user sees the result without manually refreshing. This is what makes the
+  // status column built last round actually visible in real time.
+  React.useEffect(() => {
+    if (uploadStep !== 'processing') return;
+    const status = selectedEntry?.validationStatus;
+    if (status === 'completed' || status === 'failed' || status === 'degraded') {
       setUploadStep('done');
-    }, 1800);
-  };
+    }
+  }, [uploadStep, selectedEntry?.validationStatus]);
 
   const handleGoToExceptionDesk = () => {
     setActiveTab('exception-desk');
@@ -351,9 +351,9 @@ export default function IngestUpload() {
             </motion.div>
           )}
 
-          {uploadStep === 'detecting' && (
+          {uploadStep === 'processing' && (
             <motion.div
-              key="detecting-state"
+              key="processing-state"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
@@ -363,77 +363,45 @@ export default function IngestUpload() {
                 <Loader2 className="w-6 h-6 text-amber-500 animate-spin" />
               </div>
               <div>
-                <h3 className="text-sm font-semibold text-gray-200 uppercase tracking-wider font-mono">2. DETECTING DOCUMENT TYPE</h3>
-                <p className="text-xs text-gray-500 mt-1">Running NLP model layout classifications on uploaded structure...</p>
+                <h3 className="text-sm font-semibold text-gray-200 uppercase tracking-wider font-mono">
+                  RECEIVED — PROCESSING
+                </h3>
+                <p className="text-xs text-gray-500 mt-1">
+                  Shipment <span className="text-gray-300 font-mono">{successShipmentId}</span> is in the pipeline.
+                  Extraction, validation, and exception flagging are running — this page updates automatically.
+                </p>
               </div>
 
-              {!isTypeConfirmed && (
-                <div className="bg-[#120f0e] border border-amber-950/40 rounded-xl p-4 space-y-3">
-                  <div className="flex items-start gap-2 text-left">
-                    <HelpCircle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
-                    <div>
-                      <span className="text-xs font-mono text-gray-400 font-bold block uppercase">Uncertain Classification Warning</span>
-                      <p className="text-[11px] text-gray-400 mt-0.5 leading-normal">
-                        System is 84% confident this is a <span className="text-amber-400 font-bold font-mono">{detectedType}</span>. Confirm document class below to initiate parsing rules.
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex gap-2 justify-end">
-                    <button
-                      onClick={handleConfirmType}
-                      className="bg-amber-600 hover:bg-amber-500 text-black px-3.5 py-1.5 rounded-md font-bold text-xs transition-all cursor-pointer"
-                    >
-                      Confirm {detectedType}
-                    </button>
-                    <button
-                      onClick={() => {
-                        setDetectedType(detectedType === 'Commercial Invoice' ? 'Packing List' : 'Commercial Invoice');
-                      }}
-                      className="text-gray-400 hover:text-white bg-gray-950 hover:bg-gray-900 border border-gray-900 px-3.5 py-1.5 rounded-md text-xs transition-all cursor-pointer font-medium"
-                    >
-                      Toggle Type
-                    </button>
-                  </div>
-                </div>
-              )}
-            </motion.div>
-          )}
-
-          {uploadStep === 'extracting' && (
-            <motion.div
-              key="extracting-state"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="text-center space-y-5 max-w-md mx-auto"
-            >
-              <div className="w-12 h-12 bg-gray-950 border border-gray-900 rounded-full flex items-center justify-center mx-auto">
-                <Loader2 className="w-6 h-6 text-amber-500 animate-spin" />
-              </div>
-              <div>
-                <h3 className="text-sm font-semibold text-gray-200 uppercase tracking-wider font-mono">3. RUNNING FIELD EXTRACTION</h3>
-                <p className="text-xs text-gray-500 mt-1">Gemini two-pass extraction: OCR + cross-document validation + schema checks...</p>
-              </div>
-
+              {/* Live status indicator — driven by the context's 4s polling of
+                  validation_status. Shows the real pipeline state, not a fake
+                  progress bar. */}
               <div className="bg-black/60 border border-gray-950 rounded-xl p-3.5 flex flex-col text-left font-mono text-[10px] text-gray-400 divide-y divide-gray-900">
-                <div className="py-1.5 flex justify-between">
-                  <span>Gemini OCR Extraction:</span>
-                  <span className="text-emerald-500">COMPLETE</span>
+                <div className="py-1.5 flex justify-between items-center">
+                  <span className="flex items-center gap-1.5">
+                    <Clock className="w-3 h-3 text-gray-600" />
+                    Pipeline Status:
+                  </span>
+                  <span className={
+                    selectedEntry?.validationStatus === 'running' ? 'text-amber-500' :
+                    selectedEntry?.validationStatus === 'completed' ? 'text-emerald-500' :
+                    selectedEntry?.validationStatus === 'failed' || selectedEntry?.validationStatus === 'degraded' ? 'text-red-500' :
+                    'text-blue-500'
+                  }>
+                    {(selectedEntry?.validationStatus || 'pending').toUpperCase()}
+                  </span>
                 </div>
                 <div className="py-1.5 flex justify-between">
-                  <span>Cross-Document Validation:</span>
-                  <span className="text-amber-500">RUNNING...</span>
+                  <span>Fields Extracted:</span>
+                  <span className="text-gray-300">{selectedEntry?.fields?.length ?? 0}</span>
                 </div>
                 <div className="py-1.5 flex justify-between">
-                  <span>Schema & Math Validation:</span>
-                  <span className="text-gray-600">PENDING</span>
-                </div>
-                <div className="py-1.5 flex justify-between">
-                  <span>Exception Flagging:</span>
-                  <span className="text-gray-600">PENDING</span>
+                  <span>Exceptions Flagged:</span>
+                  <span className="text-gray-300">{selectedEntry?.exceptions?.length ?? 0}</span>
                 </div>
               </div>
+              <p className="text-[10px] text-gray-600 font-mono">
+                Auto-refreshing every 4s — no action needed.
+              </p>
             </motion.div>
           )}
 
@@ -445,15 +413,41 @@ export default function IngestUpload() {
               exit={{ opacity: 0 }}
               className="text-center space-y-5 max-w-md mx-auto"
             >
-              <div className="w-14 h-14 bg-emerald-950/40 border border-emerald-900 rounded-full flex items-center justify-center mx-auto">
-                <CheckCircle2 className="w-8 h-8 text-emerald-400" />
-              </div>
-              <div>
-                <h3 className="text-sm font-semibold text-gray-200 uppercase tracking-wider font-mono">4. SHIPMENT ANALYSIS READY</h3>
-                <p className="text-xs text-gray-400 mt-1 leading-normal">
-                  Shipment <span className="text-emerald-400 font-bold font-mono">{successShipmentId}</span> has been successfully indexed and validated. Review flagged exceptions in the Exception Desk.
-                </p>
-              </div>
+              {(() => {
+                const status = selectedEntry?.validationStatus;
+                const isClean = status === 'completed' && (selectedEntry?.exceptions?.length ?? 0) === 0;
+                const hasIssues = status === 'completed' && (selectedEntry?.exceptions?.length ?? 0) > 0;
+                const isFailed = status === 'failed' || status === 'degraded';
+                return (
+                  <>
+                    <div className={`w-14 h-14 rounded-full flex items-center justify-center mx-auto border ${
+                      isClean ? 'bg-emerald-950/40 border-emerald-900' :
+                      hasIssues ? 'bg-amber-950/40 border-amber-900' :
+                      isFailed ? 'bg-red-950/40 border-red-900' :
+                      'bg-gray-950 border-gray-900'
+                    }`}>
+                      {isClean ? <CheckCircle2 className="w-8 h-8 text-emerald-400" /> :
+                       isFailed ? <XCircle className="w-8 h-8 text-red-400" /> :
+                       <AlertCircle className="w-8 h-8 text-amber-400" />}
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-semibold text-gray-200 uppercase tracking-wider font-mono">
+                        {isClean ? 'SHIPMENT VALIDATED' :
+                         hasIssues ? 'VALIDATION COMPLETE — EXCEPTIONS FOUND' :
+                         isFailed ? 'VALIDATION INCOMPLETE' :
+                         'SHIPMENT ANALYSIS READY'}
+                      </h3>
+                      <p className="text-xs text-gray-400 mt-1 leading-normal">
+                        Shipment <span className="text-emerald-400 font-bold font-mono">{successShipmentId}</span>{' '}
+                        {isClean ? 'validated cleanly — zero exceptions.' :
+                         hasIssues ? `validated with ${selectedEntry?.exceptions?.length ?? 0} exception(s) to review.` :
+                         isFailed ? 'had a pipeline error — retry or manual review required.' :
+                         'has been indexed. Review flagged exceptions in the Exception Desk.'}
+                      </p>
+                    </div>
+                  </>
+                );
+              })()}
 
               <div className="flex gap-2.5 justify-center pt-2">
                 <button

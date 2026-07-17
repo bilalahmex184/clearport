@@ -303,6 +303,57 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     await loadData();
   }, [loadData]);
 
+  // --- refreshShipment: pull a single shipment's full state from the DB ---
+  // Used by (a) the polling effect below and (b) the end of the background
+  // pipeline so the selected entry always reflects the real DB state
+  // (fields, exceptions, validation_status). Replaces the entry in-place by id.
+  //
+  // If the shipment is NOT FOUND (404) — e.g. the row upsert failed silently
+  // but a placeholder was already added — we mark the entry as 'failed' so the
+  // polling effect stops retrying forever (it only polls while status is
+  // pending/running). This prevents orphaned placeholders from generating
+  // endless 404 requests.
+  const refreshShipment = React.useCallback(async (shipmentId: string) => {
+    if (!isSupabaseConfigured()) return;
+    try {
+      const res = await apiFetchOrg<{ shipment: ShipmentEntry }>(
+        '/api/shipments/' + shipmentId,
+      );
+      if (res?.shipment) {
+        setEntries(prev => {
+          const idx = prev.findIndex(e => e.id === shipmentId);
+          if (idx === -1) return prev; // not in list — nothing to update
+          const updated = [...prev];
+          // The DB row has the authoritative fields/exceptions/validation_status.
+          updated[idx] = res.shipment;
+          return updated;
+        });
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      // If the shipment doesn't exist (404 / not found), mark the placeholder
+      // as 'failed' so polling stops. This handles the edge case where the
+      // shipment row upsert failed but a 'pending' placeholder was already
+      // added to the UI — without this, the polling effect would retry forever.
+      if (/404|not found/i.test(errMsg)) {
+        setEntries(prev => {
+          const idx = prev.findIndex(e => e.id === shipmentId);
+          if (idx === -1) return prev;
+          const updated = [...prev];
+          updated[idx] = {
+            ...updated[idx],
+            validationStatus: 'failed',
+          };
+          return updated;
+        });
+      } else {
+        // Transient error (network blip, 500, etc.) — polling will retry on
+        // the next tick. Log at debug to avoid console spam.
+        console.debug('[ctx] refreshShipment failed for', shipmentId, errMsg);
+      }
+    }
+  }, [apiFetchOrg]);
+
   // --- Computed ---
   const selectedEntry = React.useMemo(
     () => entries.find(e => e.id === selectedEntryId),
@@ -313,6 +364,37 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     if (!selectedEntry) return undefined;
     return selectedEntry.exceptions.find(ex => ex.id === selectedExceptionId);
   }, [selectedEntry, selectedExceptionId]);
+
+  // --- Light polling: while the selected shipment's validation_status is
+  // 'pending' or 'running', refresh it from the DB every 4 seconds so the
+  // user sees status transitions + extracted fields + exceptions appear in
+  // real time without manually refreshing. Stops the moment the status
+  // reaches a terminal state (completed/failed/degraded) or the selection
+  // changes to an already-terminal shipment.
+  React.useEffect(() => {
+    if (!isSupabaseConfigured()) return;
+    const status = selectedEntry?.validationStatus;
+    if (status !== 'pending' && status !== 'running') return;
+    if (!selectedEntryId) return;
+
+    const POLL_INTERVAL_MS = 4000;
+    let cancelled = false;
+
+    const tick = async () => {
+      if (cancelled) return;
+      await refreshShipment(selectedEntryId);
+    };
+
+    // Fire one immediately (so a fast pipeline that already finished shows up
+    // without waiting 4s), then on the interval.
+    void tick();
+    const interval = setInterval(tick, POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [selectedEntryId, selectedEntry?.validationStatus, refreshShipment]);
 
   // --- Selection (fixes stale closure — uses functional update) ---
   const selectEntry = React.useCallback((id: string) => {
@@ -675,7 +757,9 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }
 
-      // Step 2: Create the shipment row in DB (if not already created by upload-document)
+      // Step 2: Create the shipment row in DB with validation_status = 'pending'
+      // so the UI can show "received, processing" the moment the upload lands —
+      // NOT after the full extraction + validation chain finishes.
       if (supabase) {
         await supabase.from('shipments').upsert({
           id: shipmentId,
@@ -686,15 +770,11 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           urgency: '08:30:00',
           initial_confidence: 0,
           current_confidence: 0,
+          validation_status: 'pending',
         }).then(({ error }) => {
           if (error) console.warn('[upload] shipment upsert:', error.message);
         });
       }
-
-      // Step 3: Extract fields via Gemini edge function
-      let extractedFields: ExtractedField[] = [];
-      let shipper = 'Unknown Shipper';
-      let consignee = 'Unknown Consignee';
 
       // Detect document type from the first file's name
       const detectDocType = (fileName: string): string => {
@@ -706,276 +786,261 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       };
       const detectedDocType = files.length > 0 ? detectDocType(files[0].name) : 'Commercial Invoice';
 
-      try {
-        const extractResponse = await invokeEdgeFunction<any>('extract-document', { shipmentId });
-        if (extractResponse?.success && extractResponse.fields && extractResponse.fields.length > 0) {
-          extractedFields = extractResponse.fields.map((f: any) => ({
-            id: typeof crypto !== 'undefined' ? crypto.randomUUID() : `f-${Date.now()}`,
-            key: f.field_key,
-            label: f.field_label,
-            value: f.extracted_value,
-            sourceDoc: detectedDocType,  // Use detected type, not hardcoded
-            isFlagged: false,
-            confidence: f.confidence,
-            boundingBox: f.bounding_box,
-          }));
-          if (extractResponse.shipper) shipper = extractResponse.shipper;
-          if (extractResponse.consignee) consignee = extractResponse.consignee;
-        }
-      } catch (err) {
-        console.warn('[extract] edge function failed:', err);
-      }
+      // ── IMMEDIATE RESPONSE: add a placeholder entry + select it ──
+      // The user sees "received, processing" right away. The background
+      // pipeline (below) + the polling effect keep the entry fresh as the
+      // chain progresses: pending → running → completed/failed/degraded.
+      const placeholderEntry: ShipmentEntry = {
+        id: shipmentId,
+        shipper: 'Pending Extraction',
+        consignee: 'Pending Extraction',
+        status: 'Under Review',
+        docsCount: files.length,
+        urgency: '08:30:00',
+        initialConfidence: 0,
+        currentConfidence: 0,
+        createdAt: new Date().toISOString(),
+        documents: [],
+        exceptions: [],
+        fields: [],
+        validationStatus: 'pending',
+      };
+      setEntries(prev => [placeholderEntry, ...prev.filter(e => e.id !== shipmentId)]);
+      setSelectedEntryId(shipmentId);
+      setSelectedExceptionId('');
+      addAuditLog(`Shipment ${shipmentId} received — processing started.`, 'info', shipmentId);
 
-      // Fetch the actual uploaded documents from the DB so the Exception Desk
-      // can show them in the document viewer
-      let uploadedDocuments: ShipmentEntry['documents'] = [];
-      if (supabase) {
+      // ── BACKGROUND PIPELINE ──
+      // Run extraction + validation WITHOUT blocking the return. The polling
+      // effect (every 4s) refreshes the selected shipment's status + fields +
+      // exceptions from the DB as the chain progresses. All needed helpers are
+      // captured in the closure so this runs to completion even if the user
+      // navigates away. We do a final refreshShipment() at the end so the
+      // terminal state is visible immediately (no 4s wait for the next poll).
+      const runPipeline = async () => {
+        let extractedFields: ExtractedField[] = [];
+
+        // Step 3: Extract fields via Gemini edge function (18s wall-clock budget)
         try {
-          const { data: docsData } = await supabase
-            .from('documents')
-            .select('id, doc_type, file_name, storage_path, mime_type, uploaded_at')
-            .eq('shipment_id', shipmentId)
-            .order('uploaded_at', { ascending: true });
-          if (docsData) {
-            uploadedDocuments = docsData.map((d: any) => ({
-              id: d.id,
-              docType: d.doc_type || detectedDocType,
-              fileName: d.file_name,
-              storagePath: d.storage_path,
-              mimeType: d.mime_type,
-              uploadedAt: d.uploaded_at,
+          const extractResponse = await invokeEdgeFunction<any>('extract-document', { shipmentId });
+          if (extractResponse?.success && extractResponse.fields && extractResponse.fields.length > 0) {
+            extractedFields = extractResponse.fields.map((f: any) => ({
+              id: typeof crypto !== 'undefined' ? crypto.randomUUID() : `f-${Date.now()}`,
+              key: f.field_key,
+              label: f.field_label,
+              value: f.extracted_value,
+              sourceDoc: detectedDocType,
+              isFlagged: false,
+              confidence: f.confidence,
+              boundingBox: f.bounding_box,
             }));
           }
-        } catch (err) {
-          console.warn('[upload] failed to fetch documents:', err);
-        }
-      }
-
-      // Step 4: Validation chain — AWAITED, failure-tracked, no silent catches.
-      // (§3) Full state machine: running → completed/failed/degraded
-      // (§5) Retry with exponential backoff before recording a failure.
-      const traceId = crypto.randomUUID();
-
-      // (§3) Set validation_status = 'running' + pipeline_trace_id before starting
-      try {
-        await apiFetchOrg('/api/shipments/' + shipmentId, {
-          method: 'PATCH',
-          body: JSON.stringify({
-            validation_status: 'running',
-            pipeline_trace_id: traceId,
-          }),
-        });
-      } catch (e) {
-        console.error('[validation-chain] failed to set validation_status=running:', e);
-      }
-
-      // (§5) Helper: invoke with retry (2 retries, 500ms then 1500ms backoff)
-      const invokeWithRetry = async (fnName: string, body: Record<string, any>): Promise<void> => {
-        const delays = [500, 1500];
-        let lastErr: unknown;
-        for (let attempt = 0; attempt <= delays.length; attempt++) {
-          try {
-            await invokeEdgeFunction(fnName, body);
-            if (attempt > 0) {
-              console.log(`[validation-chain] ${fnName} succeeded on attempt ${attempt + 1}`);
-              addAuditLog(`[retry] ${fnName} succeeded on attempt ${attempt + 1} for ${shipmentId}`, 'info', shipmentId);
-            }
-            return;
-          } catch (err) {
-            lastErr = err;
-            if (attempt < delays.length) {
-              console.warn(`[validation-chain] ${fnName} attempt ${attempt + 1} failed, retrying in ${delays[attempt]}ms:`, err instanceof Error ? err.message : err);
-              await new Promise(r => setTimeout(r, delays[attempt]));
-            }
-          }
-        }
-        throw lastErr;
-      };
-
-      try {
-        // Run the 3 independent validators in parallel, but INSPECT results
-        const validatorResults = await Promise.allSettled([
-          invokeWithRetry('schema-validate', { shipmentId, trace_id: traceId }),
-          invokeWithRetry('math-validate', { shipmentId, trace_id: traceId }),
-          invokeWithRetry('cross-validate', { shipmentId, trace_id: traceId }),
-        ]);
-
-        // Check for rejected promises — these are validation chain failures
-        const failures: string[] = [];
-        const validatorNames = ['schema-validate', 'math-validate', 'cross-validate'];
-        validatorResults.forEach((result, idx) => {
-          if (result.status === 'rejected') {
-            const errMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
-            failures.push(`${validatorNames[idx]}: ${errMsg}`);
-            console.error(`[validation-chain] ${validatorNames[idx]} REJECTED after retries:`, errMsg);
-          }
-        });
-
-        if (failures.length > 0) {
-          // (§3) Validation chain failed — set status to 'failed'
-          try {
-            await apiFetchOrg('/api/shipments/' + shipmentId, {
-              method: 'PATCH',
-              body: JSON.stringify({ validation_status: 'failed' }),
-            });
-          } catch (e) {
-            console.error('[validation-chain] failed to update shipment status:', e);
-          }
-          addAuditLog(
-            `[pipeline_error] Validation chain failed for ${shipmentId} (after retries). Failures: ${failures.join('; ')}`,
-            'warning',
-            shipmentId,
-          );
-          // Surface a pipeline_error exception so it's visible in the UI (§2)
-          if (supabase) {
-            await supabase.from('exceptions').insert({
-              shipment_id: shipmentId,
-              user_id: user.id,
-              field_key: '_pipeline',
-              field_name: 'Validation Pipeline Error',
-              extracted_value: '',
-              confidence: 0,
-              reason: `Validation chain failed (after retries): ${failures.join('; ')}`,
-              exception_type: 'missing_field',
-              doc_type: 'System',
-              status: 'Unresolved',
-              history: [],
-            });
-          }
-        } else {
-          // All validators succeeded — run flag-exceptions (no bare catch)
-          let flagExceptionsFailed = false;
-          try {
-            await invokeWithRetry('flag-exceptions', { shipmentId, trace_id: traceId });
-          } catch (flagErr) {
-            flagExceptionsFailed = true;
-            const errMsg = flagErr instanceof Error ? flagErr.message : String(flagErr);
-            console.error('[validation-chain] flag-exceptions FAILED after retries:', errMsg);
+          // Surface wall-clock budget exhaustion to the user via audit log so
+          // they understand WHY a document landed in manual review.
+          if (extractResponse?.budgetExhausted) {
+            const failedCount = extractResponse.partialFailure?.failedDocuments ?? 0;
             addAuditLog(
-              `[pipeline_error] flag-exceptions failed for ${shipmentId} (after retries): ${errMsg}`,
+              `[extraction] Wall-clock budget exhausted for ${shipmentId} — ${failedCount} document(s) routed to manual review.`,
               'warning',
               shipmentId,
             );
+          }
+        } catch (err) {
+          console.warn('[extract] edge function failed:', err);
+          addAuditLog(
+            `[extraction] failed for ${shipmentId}: ${err instanceof Error ? err.message : String(err)}`,
+            'warning',
+            shipmentId,
+          );
+        }
+
+        // Step 4: Validation chain — AWAITED, failure-tracked, no silent catches.
+        // (§3) Full state machine: running → completed/failed/degraded
+        // (§5) Retry with exponential backoff before recording a failure.
+        const traceId = typeof crypto !== 'undefined' ? crypto.randomUUID() : `trace-${Date.now()}`;
+
+        // (§3) Set validation_status = 'running' + pipeline_trace_id before starting
+        try {
+          await apiFetchOrg('/api/shipments/' + shipmentId, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              validation_status: 'running',
+              pipeline_trace_id: traceId,
+            }),
+          });
+        } catch (e) {
+          console.error('[validation-chain] failed to set validation_status=running:', e);
+        }
+
+        // (§5) Helper: invoke with retry (2 retries, 500ms then 1500ms backoff)
+        const invokeWithRetry = async (fnName: string, reqBody: Record<string, any>): Promise<void> => {
+          const delays = [500, 1500];
+          let lastErr: unknown;
+          for (let attempt = 0; attempt <= delays.length; attempt++) {
+            try {
+              await invokeEdgeFunction(fnName, reqBody);
+              if (attempt > 0) {
+                console.log(`[validation-chain] ${fnName} succeeded on attempt ${attempt + 1}`);
+                addAuditLog(`[retry] ${fnName} succeeded on attempt ${attempt + 1} for ${shipmentId}`, 'info', shipmentId);
+              }
+              return;
+            } catch (err) {
+              lastErr = err;
+              if (attempt < delays.length) {
+                console.warn(`[validation-chain] ${fnName} attempt ${attempt + 1} failed, retrying in ${delays[attempt]}ms:`, err instanceof Error ? err.message : err);
+                await new Promise(r => setTimeout(r, delays[attempt]));
+              }
+            }
+          }
+          throw lastErr;
+        };
+
+        try {
+          // Run the 3 independent validators in parallel, but INSPECT results
+          const validatorResults = await Promise.allSettled([
+            invokeWithRetry('schema-validate', { shipmentId, trace_id: traceId }),
+            invokeWithRetry('math-validate', { shipmentId, trace_id: traceId }),
+            invokeWithRetry('cross-validate', { shipmentId, trace_id: traceId }),
+          ]);
+
+          // Check for rejected promises — these are validation chain failures
+          const failures: string[] = [];
+          const validatorNames = ['schema-validate', 'math-validate', 'cross-validate'];
+          validatorResults.forEach((result, idx) => {
+            if (result.status === 'rejected') {
+              const errMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+              failures.push(`${validatorNames[idx]}: ${errMsg}`);
+              console.error(`[validation-chain] ${validatorNames[idx]} REJECTED after retries:`, errMsg);
+            }
+          });
+
+          if (failures.length > 0) {
+            // (§3) Validation chain failed — set status to 'failed'
+            try {
+              await apiFetchOrg('/api/shipments/' + shipmentId, {
+                method: 'PATCH',
+                body: JSON.stringify({ validation_status: 'failed' }),
+              });
+            } catch (e) {
+              console.error('[validation-chain] failed to update shipment status:', e);
+            }
+            addAuditLog(
+              `[pipeline_error] Validation chain failed for ${shipmentId} (after retries). Failures: ${failures.join('; ')}`,
+              'warning',
+              shipmentId,
+            );
+            // Surface a pipeline_error exception so it's visible in the UI (§2).
+            // NOTE: user_id is null here — the user-scoped supabase client
+            // attributes the row to the authenticated user via RLS/auth.uid(),
+            // so we don't need to pass it explicitly (and `user` is not in
+            // scope in this background closure).
             if (supabase) {
               await supabase.from('exceptions').insert({
                 shipment_id: shipmentId,
-                user_id: user.id,
                 field_key: '_pipeline',
-                field_name: 'Flag Exceptions Error',
+                field_name: 'Validation Pipeline Error',
                 extracted_value: '',
                 confidence: 0,
-                reason: `flag-exceptions failed (after retries): ${errMsg}`,
+                reason: `Validation chain failed (after retries): ${failures.join('; ')}`,
                 exception_type: 'missing_field',
                 doc_type: 'System',
                 status: 'Unresolved',
                 history: [],
               });
             }
-          }
+          } else {
+            // All validators succeeded — run flag-exceptions (no bare catch)
+            let flagExceptionsFailed = false;
+            try {
+              await invokeWithRetry('flag-exceptions', { shipmentId, trace_id: traceId });
+            } catch (flagErr) {
+              flagExceptionsFailed = true;
+              const errMsg = flagErr instanceof Error ? flagErr.message : String(flagErr);
+              console.error('[validation-chain] flag-exceptions FAILED after retries:', errMsg);
+              addAuditLog(
+                `[pipeline_error] flag-exceptions failed for ${shipmentId} (after retries): ${errMsg}`,
+                'warning',
+                shipmentId,
+              );
+              if (supabase) {
+                await supabase.from('exceptions').insert({
+                  shipment_id: shipmentId,
+                  field_key: '_pipeline',
+                  field_name: 'Flag Exceptions Error',
+                  extracted_value: '',
+                  confidence: 0,
+                  reason: `flag-exceptions failed (after retries): ${errMsg}`,
+                  exception_type: 'missing_field',
+                  doc_type: 'System',
+                  status: 'Unresolved',
+                  history: [],
+                });
+              }
+            }
 
-          // (§3) Set final validation status: 'completed' on full success, 'degraded' if flag-exceptions failed
-          const finalStatus = flagExceptionsFailed ? 'degraded' : 'completed';
+            // (§3) Set final validation status: 'completed' on full success, 'degraded' if flag-exceptions failed
+            const finalStatus = flagExceptionsFailed ? 'degraded' : 'completed';
+            try {
+              await apiFetchOrg('/api/shipments/' + shipmentId, {
+                method: 'PATCH',
+                body: JSON.stringify({
+                  validation_status: finalStatus,
+                  last_validated_at: new Date().toISOString(),
+                }),
+              });
+            } catch (e) {
+              console.error(`[validation-chain] failed to set validation_status=${finalStatus}:`, e);
+            }
+          }
+        } catch (err) {
+          // Outer catch — should never reach here since allSettled doesn't throw,
+          // but if it does, persist the failure (§2: no silent catches)
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error('[validation-chain] unexpected error:', errMsg);
+          addAuditLog(`[pipeline_error] Unexpected validation error for ${shipmentId}: ${errMsg}`, 'error', shipmentId);
           try {
             await apiFetchOrg('/api/shipments/' + shipmentId, {
               method: 'PATCH',
-              body: JSON.stringify({
-                validation_status: finalStatus,
-                last_validated_at: new Date().toISOString(),
-              }),
+              body: JSON.stringify({ validation_status: 'failed' }),
             });
           } catch (e) {
-            console.error(`[validation-chain] failed to set validation_status=${finalStatus}:`, e);
+            console.error('[validation-chain] failed to set validation_status=failed:', e);
           }
         }
-      } catch (err) {
-        // Outer catch — should never reach here since allSettled doesn't throw,
-        // but if it does, persist the failure (§2: no silent catches)
-        const errMsg = err instanceof Error ? err.message : String(err);
-        console.error('[validation-chain] unexpected error:', errMsg);
-        addAuditLog(`[pipeline_error] Unexpected validation error for ${shipmentId}: ${errMsg}`, 'error', shipmentId);
-        try {
-          await apiFetchOrg('/api/shipments/' + shipmentId, {
-            method: 'PATCH',
-            body: JSON.stringify({ validation_status: 'failed' }),
-          });
-        } catch (e) {
-          console.error('[validation-chain] failed to set validation_status=failed:', e);
-        }
-      }
 
-      // Step 5: Reload from API to get the real DB state (with fields, exceptions, documents)
-      if (extractedFields.length > 0) {
-        // If we have extracted fields, build the entry from extraction response
-        const newExceptions: Exception[] = [];
-        const updatedFields = extractedFields.map(f => {
-          let threshold = rules.invoiceThreshold;
-          if (f.key === 'htsCode') threshold = rules.htsThreshold;
-          else if (f.key === 'shipper' || f.key === 'consignee' || f.key === 'consigneeAddress') threshold = rules.partiesThreshold;
+        // Step 5: Final refresh from DB so the entry reflects the real terminal
+        // state (fields, exceptions, validation_status). Polling may have
+        // already done this, but an explicit final refresh guarantees the user
+        // sees the completed/failed/degraded state without waiting for the next
+        // 4s poll tick.
+        await refreshShipment(shipmentId);
 
-          if (f.confidence < threshold) {
-            const excId = crypto.randomUUID();
-            const exc: Exception = {
-              id: excId,
-              fieldName: f.label,
-              fieldKey: f.key,
-              originalValue: f.value,
-              extractedValue: f.value,
-              confidence: f.confidence,
-              reason: `Extracted confidence (${f.confidence}%) is below threshold (${threshold}%).`,
-              exceptionType: 'low_confidence',
-              docType: f.sourceDoc,
-              boundingBox: f.boundingBox || { x: 10, y: 35, w: 32, h: 5 },
-              status: 'Unresolved',
-              history: [],
-              createdAt: new Date().toISOString(),
-            };
-            newExceptions.push(exc);
-            return { ...f, isFlagged: true, exceptionId: excId };
-          }
-          return f;
-        });
-
-        const initialConfidence = Math.round(
-          updatedFields.reduce((acc, f) => acc + f.confidence, 0) / Math.max(updatedFields.length, 1)
+        addAuditLog(
+          `New entry ${shipmentId} ingestion completed: ${files.length} files, ${extractedFields.length} fields extracted.`,
+          extractedFields.length > 0 ? 'success' : 'warning',
+          shipmentId,
         );
+      };
 
-        const newEntry: ShipmentEntry = {
-          id: shipmentId,
-          shipper,
-          consignee,
-          status: 'Under Review',
-          docsCount: files.length,
-          urgency: '08:30:00',
-          initialConfidence,
-          currentConfidence: initialConfidence,
-          createdAt: new Date().toISOString(),
-          documents: uploadedDocuments,  // Use fetched documents, not empty array
-          exceptions: newExceptions,
-          fields: updatedFields,
-        };
+      // Fire-and-forget — the user already has their "received, processing" UI.
+      // Errors are handled inside runPipeline (no unhandled rejection).
+      void runPipeline().catch(err => {
+        console.error('[pipeline] unhandled error in background pipeline for', shipmentId, err);
+        addAuditLog(
+          `[pipeline] unexpected background error for ${shipmentId}: ${err instanceof Error ? err.message : String(err)}`,
+          'error',
+          shipmentId,
+        );
+      });
 
-        setEntries(prev => [newEntry, ...prev]);
-        setSelectedEntryId(shipmentId);
-        setSelectedExceptionId(newExceptions[0]?.id || '');
-      } else {
-        // No fields extracted — reload from API to get whatever the DB has
-        await loadData();
-        setSelectedEntryId(shipmentId);
-      }
-
-      addAuditLog(
-        `New entry ${shipmentId} ingestion completed: ${files.length} files, ${extractedFields.length} fields extracted.`,
-        extractedFields.length > 0 ? 'success' : 'warning',
-        shipmentId
-      );
-
+      // Return immediately — the user has already seen "received, processing".
       return { shipmentId, success: true };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : 'Upload pipeline failed';
       addAuditLog(`Upload failed for ${shipmentId}: ${errMsg}`, 'error', shipmentId);
       return { shipmentId, success: false, error: errMsg };
     }
-  }, [rules, addAuditLog]);
+  }, [rules, addAuditLog, refreshShipment, apiFetchOrg]);
 
   // --- Update rules ---
   const updateRules = React.useCallback((newRules: Partial<OperationalRules>) => {
