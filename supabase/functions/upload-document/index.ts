@@ -51,7 +51,8 @@ async function getUser(client: any) {
 }
 
 // --- File validation --------------------------------------------------------
-const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10 MB
+// (§6) 20MB per-file limit — enforced server-side. Never trust client check alone.
+const MAX_FILE_BYTES = 20 * 1024 * 1024; // 20 MB per file
 const ALLOWED_MIME: Record<string, string> = {
   "application/pdf": "pdf",
   "image/png": "png",
@@ -111,7 +112,7 @@ Deno.serve(async (req) => {
     }
     if (file.size > MAX_FILE_BYTES) {
       return jsonRes(
-        { error: `File exceeds 10MB limit (got ${file.size} bytes)` },
+        { error: `File exceeds 20MB limit (got ${file.size} bytes). Maximum file size is 20MB.` },
         413
       );
     }

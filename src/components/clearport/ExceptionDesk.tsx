@@ -238,6 +238,20 @@ export default function ExceptionDesk() {
             <FileSpreadsheet className="w-3 h-3" />
             Export CSV
           </button>
+
+          {/* (§2c) Validation status banner — distinguishes "clean" from "validation incomplete" */}
+          {totalExceptions === 0 && (
+            <div className="mt-2 p-2 rounded-lg border text-[10px] font-mono flex items-center gap-1.5 bg-emerald-950/30 border-emerald-900/40 text-emerald-400">
+              <CheckCircle2 className="w-3 h-3 shrink-0" />
+              <span>VALIDATED — zero exceptions found. Shipment is clean.</span>
+            </div>
+          )}
+          {totalExceptions > 0 && (
+            <div className="mt-2 p-2 rounded-lg border text-[10px] font-mono flex items-center gap-1.5 bg-amber-950/30 border-amber-900/40 text-amber-400">
+              <AlertCircle className="w-3 h-3 shrink-0" />
+              <span>VALIDATED — {totalExceptions} exceptions require review.</span>
+            </div>
+          )}
         </div>
 
         {/* Filters */}

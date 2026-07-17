@@ -81,7 +81,9 @@ export default function IngestUpload() {
     }
 
     const allowedMimeTypes = ['application/pdf', 'image/png', 'image/jpeg', 'image/jpg', 'image/tiff', 'text/plain', 'text/csv'];
-    const maxSizeBytes = 10 * 1024 * 1024;
+    // (§6) 20MB per-file limit — enforced client-side, server-side, and at bucket level.
+    const maxSizeBytes = 20 * 1024 * 1024; // 20MB per file
+    const maxShipmentSize = 100 * 1024 * 1024; // 100MB per shipment aggregate
 
     // Validate ALL files first — reject the batch only if ALL are invalid
     const validFiles: File[] = [];
@@ -91,7 +93,7 @@ export default function IngestUpload() {
       if (!allowedMimeTypes.includes(file.type)) {
         invalidFiles.push({ name: file.name, reason: `Unsupported format (${file.type || 'unknown'})` });
       } else if (file.size > maxSizeBytes) {
-        invalidFiles.push({ name: file.name, reason: `Exceeds 10MB (${(file.size / (1024 * 1024)).toFixed(1)}MB)` });
+        invalidFiles.push({ name: file.name, reason: `Exceeds 20MB limit (${(file.size / (1024 * 1024)).toFixed(1)}MB). Maximum file size is 20MB.` });
       } else {
         validFiles.push(file);
       }

@@ -72,9 +72,16 @@ const SCHEMA_HINT =
 // Per RFC 4180: wrap a value in double quotes if it contains a comma, double
 // quote, newline, or carriage return. Escape any inner double quotes by
 // doubling them.
+// (§7) CSV escape with formula-injection guard.
+// If first char is = + - @, prefix with ' to prevent Excel formula injection.
 function csvEscape(value: any): string {
   if (value === null || value === undefined) return "";
-  const str = String(value);
+  let str = String(value);
+  // Formula-injection guard: prefix dangerous leading chars with a single quote
+  if (/^[=+\-@]/.test(str)) {
+    str = "'" + str;
+  }
+  // RFC 4180 quoting
   if (/[",\r\n]/.test(str)) {
     return `"${str.replace(/"/g, '""')}"`;
   }

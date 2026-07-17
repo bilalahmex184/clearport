@@ -66,11 +66,23 @@ async function getUser(client: any) {
 }
 
 // --- Required fields (must be present somewhere in the shipment) ------------
-const REQUIRED_FIELDS: Record<string, string> = {
-  invoiceNo: "Commercial Invoice #",
-  shipper: "Shipper/Exporter",
-  consignee: "Consignee/Importer",
-  declaredValue: "Total Declared Value",
+// (§3) Expanded to cover ALL 13 FIELD_DEFINITIONS, not just 4.
+// Hard-required: missing → missing_field exception, blocks "clean" status.
+// Soft-expected: missing → lower-severity warning exception, does not block.
+const REQUIRED_FIELDS: Record<string, { label: string; severity: "hard" | "soft" }> = {
+  invoiceNo: { label: "Commercial Invoice #", severity: "hard" },
+  shipper: { label: "Shipper/Exporter", severity: "hard" },
+  consignee: { label: "Consignee/Importer", severity: "hard" },
+  declaredValue: { label: "Total Declared Value", severity: "hard" },
+  htsCode: { label: "HTS Code", severity: "hard" },
+  countryOfOrigin: { label: "Country of Origin", severity: "hard" },
+  invoiceDate: { label: "Invoice Date", severity: "soft" },
+  consigneeAddress: { label: "Consignee Address", severity: "soft" },
+  netWeight: { label: "Net Weight", severity: "soft" },
+  grossWeight: { label: "Gross Weight", severity: "soft" },
+  portOfEntry: { label: "Port of Entry", severity: "soft" },
+  carrier: { label: "Carrier", severity: "soft" },
+  billOfLading: { label: "Bill of Lading #", severity: "soft" },
 };
 
 // --- Validation rules -------------------------------------------------------
@@ -332,25 +344,27 @@ Deno.serve(async (req) => {
     //    absent from the shipment's extracted fields, flag as missing_field.
     // ---------------------------------------------------------------------
     const presentKeys = new Set(fields.map((f: any) => f.field_key));
-    for (const [key, label] of Object.entries(REQUIRED_FIELDS)) {
+    for (const [key, config] of Object.entries(REQUIRED_FIELDS)) {
       if (!presentKeys.has(key)) {
-        const reason = `Required field "${key}" (${label}) is missing from all documents in shipment`;
+        const reason = config.severity === "hard"
+          ? `Required field "${key}" (${config.label}) is missing from all documents in shipment`
+          : `Expected field "${key}" (${config.label}) was not found in any document (informational)`;
         errors.push({
           source: "schema",
           field_key: key,
-          field_label: label,
+          field_label: config.label,
           message: reason,
         });
         exceptionsToInsert.push({
           shipment_id: shipmentId,
-          field_id: null, // no specific field row — it's missing entirely
+          field_id: null,
           user_id: user.id,
           field_key: key,
-          field_name: label,
+          field_name: config.label,
           extracted_value: null,
           confidence: 0,
           reason,
-          exception_type: "missing_field",
+          exception_type: config.severity === "hard" ? "missing_field" : "low_confidence",
           doc_type: null,
           status: "Unresolved",
         });

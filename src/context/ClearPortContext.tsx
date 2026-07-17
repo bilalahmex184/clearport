@@ -751,25 +751,96 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }
 
-      // Step 4: Call the validation chain IN PARALLEL (not sequential)
-      // schema-validate, math-validate, cross-validate are independent → run together
-      // flag-exceptions runs after (it needs the validated fields)
-      // Fire-and-forget — don't block the UI on validation
-      const validationChain = (async () => {
-        try {
-          // Run the 3 independent validators in parallel
-          await Promise.allSettled([
-            invokeEdgeFunction('schema-validate', { shipmentId }),
-            invokeEdgeFunction('math-validate', { shipmentId }),
-            invokeEdgeFunction('cross-validate', { shipmentId }),
-          ]);
-          // Then run flag-exceptions (depends on validated fields)
-          await invokeEdgeFunction('flag-exceptions', { shipmentId }).catch(() => {});
-        } catch (err) {
-          console.warn('[validation-chain] error:', err);
+      // Step 4: Validation chain — AWAITED, failure-tracked, no silent catches.
+      // (§4) Removed unawaited IIFE + Promise.allSettled + .catch(()=>{}).
+      // Any rejected validator sets validation_status='failed' + writes audit row.
+      const traceId = crypto.randomUUID();
+      try {
+        // Run the 3 independent validators in parallel, but INSPECT results
+        const validatorResults = await Promise.allSettled([
+          invokeEdgeFunction('schema-validate', { shipmentId, trace_id: traceId }),
+          invokeEdgeFunction('math-validate', { shipmentId, trace_id: traceId }),
+          invokeEdgeFunction('cross-validate', { shipmentId, trace_id: traceId }),
+        ]);
+
+        // Check for rejected promises — these are validation chain failures
+        const failures: string[] = [];
+        const validatorNames = ['schema-validate', 'math-validate', 'cross-validate'];
+        validatorResults.forEach((result, idx) => {
+          if (result.status === 'rejected') {
+            const errMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+            failures.push(`${validatorNames[idx]}: ${errMsg}`);
+            console.error(`[validation-chain] ${validatorNames[idx]} REJECTED:`, errMsg);
+          }
+        });
+
+        if (failures.length > 0) {
+          // (§2) Validation chain failed — persist failure, update shipment status
+          try {
+            await apiFetchOrg('/api/shipments/' + shipmentId, {
+              method: 'PATCH',
+              body: JSON.stringify({ validation_status: 'failed' }),
+            });
+          } catch (e) {
+            console.error('[validation-chain] failed to update shipment status:', e);
+          }
+          addAuditLog(
+            `[pipeline_error] Validation chain failed for ${shipmentId}. Failures: ${failures.join('; ')}`,
+            'warning',
+            shipmentId,
+          );
+          // Surface a pipeline_error exception so it's visible in the UI (§2)
+          if (supabase) {
+            await supabase.from('exceptions').insert({
+              shipment_id: shipmentId,
+              user_id: user.id,
+              field_key: '_pipeline',
+              field_name: 'Validation Pipeline Error',
+              extracted_value: '',
+              confidence: 0,
+              reason: `Validation chain failed: ${failures.join('; ')}`,
+              exception_type: 'missing_field',
+              doc_type: 'System',
+              status: 'Unresolved',
+              history: [],
+            });
+          }
+        } else {
+          // All validators succeeded — run flag-exceptions (no bare catch)
+          try {
+            await invokeEdgeFunction('flag-exceptions', { shipmentId, trace_id: traceId });
+          } catch (flagErr) {
+            const errMsg = flagErr instanceof Error ? flagErr.message : String(flagErr);
+            console.error('[validation-chain] flag-exceptions FAILED:', errMsg);
+            addAuditLog(
+              `[pipeline_error] flag-exceptions failed for ${shipmentId}: ${errMsg}`,
+              'warning',
+              shipmentId,
+            );
+            if (supabase) {
+              await supabase.from('exceptions').insert({
+                shipment_id: shipmentId,
+                user_id: user.id,
+                field_key: '_pipeline',
+                field_name: 'Flag Exceptions Error',
+                extracted_value: '',
+                confidence: 0,
+                reason: `flag-exceptions failed: ${errMsg}`,
+                exception_type: 'missing_field',
+                doc_type: 'System',
+                status: 'Unresolved',
+                history: [],
+              });
+            }
+          }
         }
-      })();
-      // Don't await — let validation run in the background
+      } catch (err) {
+        // Outer catch — should never reach here since allSettled doesn't throw,
+        // but if it does, persist the failure (§2: no silent catches)
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.error('[validation-chain] unexpected error:', errMsg);
+        addAuditLog(`[pipeline_error] Unexpected validation error for ${shipmentId}: ${errMsg}`, 'error', shipmentId);
+      }
 
       // Step 5: Reload from API to get the real DB state (with fields, exceptions, documents)
       if (extractedFields.length > 0) {
