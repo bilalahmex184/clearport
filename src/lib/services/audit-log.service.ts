@@ -236,20 +236,37 @@ export async function logDelete(
 }
 
 /**
- * [rules] — fires when operational rules (thresholds) are updated.
+ * [rules] — fires when a validation rule is created, updated, or deleted.
  *
  * Example text:
- *   "[rules] User admin@clearport.corp updated thresholds (invoice=85, hts=90, parties=80)"
+ *   "[rules] User admin@clearport.corp created a validation rule (name=HTS confidence check, type=confidence_threshold)"
+ *   "[rules] User admin@clearport.corp updated a validation rule (id=abc-123, changes={"severity":"block"})"
+ *   "[rules] User admin@clearport.corp deleted a validation rule (id=abc-123)"
+ *
+ * NOTE: the previous signature accepted threshold-only fields
+ * ({invoiceThreshold, htsThreshold, partiesThreshold}) which didn't match
+ * any of the actual call sites in /api/rules/validation/* — those pass
+ * {action, ruleName, ruleType, ruleId, changes}. The old signature produced
+ * empty audit log entries like "[rules] User X updated thresholds ()" which
+ * is an audit-trail integrity gap for a compliance product. This signature
+ * matches what the call sites actually send.
  */
 export async function logRulesUpdate(
   client: SupabaseClient,
   userId: string,
-  rules: { invoiceThreshold?: number; htsThreshold?: number; partiesThreshold?: number },
+  details: {
+    action: 'created' | 'updated' | 'deleted';
+    ruleId?: string;
+    ruleName?: string;
+    ruleType?: string;
+    changes?: Record<string, unknown>;
+  },
 ): Promise<void> {
   const parts: string[] = [];
-  if (rules.invoiceThreshold !== undefined) parts.push(`invoice=${rules.invoiceThreshold}`);
-  if (rules.htsThreshold !== undefined) parts.push(`hts=${rules.htsThreshold}`);
-  if (rules.partiesThreshold !== undefined) parts.push(`parties=${rules.partiesThreshold}`);
-  const text = `[rules] User ${userId} updated thresholds (${parts.join(', ')})`;
+  if (details.ruleName) parts.push(`name=${details.ruleName}`);
+  if (details.ruleType) parts.push(`type=${details.ruleType}`);
+  if (details.ruleId) parts.push(`id=${details.ruleId}`);
+  if (details.changes) parts.push(`changes=${JSON.stringify(details.changes)}`);
+  const text = `[rules] User ${userId} ${details.action} a validation rule (${parts.join(', ')})`;
   await insertAuditLog(client, { text, type: 'info' });
 }

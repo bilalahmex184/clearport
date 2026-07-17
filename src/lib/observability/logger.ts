@@ -5,7 +5,20 @@
 // Every log includes: request_id, user_id, organization_id, action, timestamp.
 // ============================================================================
 
-import { randomUUID } from 'crypto';
+// ---------------------------------------------------------------------------
+// Edge-safe UUID generation
+// ---------------------------------------------------------------------------
+// `import { randomUUID } from 'crypto'` is Node-only and breaks Next.js
+// middleware (which runs on the Edge runtime). The global `crypto.randomUUID()`
+// is available in Node 19+, all evergreen browsers, and the Edge runtime.
+// We fall back to a timestamp+random string only if `crypto` is missing
+// entirely (very old environments).
+function safeUUID(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `id-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 // ---------------------------------------------------------------------------
 // Log Levels
@@ -60,7 +73,7 @@ let _currentContext: RequestContext | null = null;
 
 export function createRequestContext(action: string, userId?: string, orgId?: string): RequestContext {
   const ctx: RequestContext = {
-    request_id: randomUUID(),
+    request_id: safeUUID(),
     user_id: userId,
     organization_id: orgId,
     action,

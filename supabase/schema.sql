@@ -1,19 +1,35 @@
 -- ============================================================================
--- ClearPort Production Schema — Auto-generated from migrations/
+-- ClearPort Production Schema — Hand-maintained summary
 -- ============================================================================
--- This file is regenerated from supabase/migrations/*.sql
--- Do NOT edit directly — edit the migration files and re-run this script.
+-- This file is a HAND-MAINTAINED SUMMARY of the database schema, NOT an
+-- auto-generated artifact. It exists to give developers a quick overview of
+-- the tables, RLS model, and helper functions; it is not run by any tool and
+-- is not the source of truth.
+--
+-- AUTHORITATIVE SOURCE OF TRUTH
+--   supabase/migrations/000_baseline_schema.sql  — the reconstructed baseline
+--     (creates the 6 core tables + users_profile + storage bucket + helpers
+--     that migrations 001-016 expect to already exist).
+--   supabase/migrations/001_*.sql through 016_*.sql — every ALTER, new table,
+--     index, RLS policy, and helper function introduced after the baseline.
+--
+-- To bring a fresh Supabase project up to the current schema, run migrations
+-- 000 through 016 in order (by filename) in the Supabase SQL Editor or via
+-- `supabase db push`. Do NOT paste this file into the SQL editor — it's a
+-- summary, not executable DDL.
+--
 -- CI check: grep -c "org_scoped" supabase/schema.sql must return > 0
+-- (verifies the summary still describes the org-scoped RLS model).
 -- ============================================================================
 
--- Run all migration files in order:
--- 001_multi_tenant_rbac.sql through 015_fix_rate_limit_race_and_validation_status.sql
--- See supabase/migrations/ for the actual SQL.
+-- Migrations in order:
+--   000_baseline_schema.sql                              — core tables + helpers
+--   001_multi_tenant_rbac.sql            through 016_bucket_size_limit.sql
 --
--- Key tables:
+-- Key tables (after all migrations have run):
 --   organizations, organization_members (multi-tenant)
 --   shipments (with org_id, validation_status, pipeline_trace_id)
---   documents (with processing_status, extraction_source)
+--   documents (with processing_status, extraction_source, overall_confidence)
 --   document_fields (with extraction_source)
 --   exceptions (with explanation, exception_type)
 --   validation_rules (configurable rule engine)
@@ -23,40 +39,34 @@
 --   org_invites (email-based invitations)
 --   extraction_rate_limits (per-org rate limiting)
 --   stuck_documents (reconciliation)
+--   users_profile (referenced by migration 004 RLS policy)
 --
--- RLS: All tables use org-scoped policies via is_org_member() SECURITY DEFINER function.
--- No owner_all_* policies remain — they were replaced in migration 001.
--- ============================================================================
-
--- Core helper functions (from migration 001)
-CREATE OR REPLACE FUNCTION is_org_member(check_org_id UUID, check_user_id UUID)
-RETURNS BOOLEAN LANGUAGE sql SECURITY DEFINER SET search_path = public, auth AS $$
-  SELECT EXISTS(SELECT 1 FROM organization_members WHERE org_id = check_org_id AND user_id = check_user_id);
-$$;
-
-CREATE OR REPLACE FUNCTION get_user_org_role(check_org_id UUID, check_user_id UUID)
-RETURNS TEXT LANGUAGE sql SECURITY DEFINER SET search_path = public, auth AS $$
-  SELECT role FROM organization_members WHERE org_id = check_org_id AND user_id = check_user_id;
-$$;
-
-CREATE OR REPLACE FUNCTION create_organization(p_org_name TEXT, p_creator_uid UUID)
-RETURNS TABLE(org_id UUID, org_name TEXT) LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, auth AS $$
-DECLARE v_new_org_id UUID;
-BEGIN
-  INSERT INTO organizations (name) VALUES (p_org_name) RETURNING id INTO v_new_org_id;
-  INSERT INTO organization_members (org_id, user_id, role, invited_by) VALUES (v_new_org_id, p_creator_uid, 'admin', p_creator_uid);
-  PERFORM seed_default_validation_rules(v_new_org_id);
-  PERFORM seed_default_broker_templates(v_new_org_id);
-  org_id := v_new_org_id; org_name := p_org_name; RETURN NEXT;
-END;
-$$;
-
--- Example org-scoped RLS policy (applies to all data tables):
+-- RLS: All data tables use org-scoped policies via the is_org_member()
+-- SECURITY DEFINER function (created in migration 001). 000_baseline_schema.sql
+-- ENABLEs RLS on the 6 core tables but intentionally does NOT create any
+-- policies — migration 001 creates the org_scoped_* policies directly.
+-- (The original live DB had owner_all_* user_id-based policies, but those
+-- are not recreated in 000 because re-running 000 on the live DB would
+-- re-add them alongside the org_scoped_* policies and break org isolation.)
+--
+-- Helper functions (each created by the migration that needs it):
+--   is_org_member, get_user_org_role                       — migration 001
+--   create_organization                                    — migration 006 (rewritten in 010)
+--   seed_default_validation_rules                          — migration 010
+--   seed_default_broker_templates                          — migration 010
+--   accept_invite                                          — migration 011
+--   check_extraction_rate_limit                            — migration 012 (rewritten in 015)
+--   cleanup_old_rate_limits                                — migration 012
+--   flag_stuck_documents                                   — migration 013
+--   set_user_id, update_updated_at                         — migration 000 (baseline)
+--   set_org_id (and per-table variants)                    — migrations 001, 007, 009
+--
+-- Example org-scoped RLS policy (applies to all data tables, from 001):
 -- CREATE POLICY "org_scoped_shipments" ON shipments
 --   FOR ALL TO authenticated
 --   USING ((org_id IS NOT NULL AND is_org_member(org_id, auth.uid())) OR (org_id IS NULL AND user_id = auth.uid()))
 --   WITH CHECK ((org_id IS NOT NULL AND is_org_member(org_id, auth.uid())) OR (org_id IS NULL AND user_id = auth.uid()));
-
+--
 -- Rate limiting (atomic, race-free from migration 015):
 -- CREATE FUNCTION check_extraction_rate_limit(p_org_id UUID, p_max_requests INTEGER DEFAULT 50)
 --   Uses INSERT ... ON CONFLICT DO UPDATE ... RETURNING for atomic count-and-increment

@@ -1,16 +1,21 @@
 // ============================================================================
 // ClearPort — Request Middleware
 // ============================================================================
-// Wraps every API route with:
-//   - request_id generation
-//   - structured logging (start + end)
-//   - latency tracking
-//   - error handling (converts any error to ErrorResponse)
-//   - zero silent failures
+// Two distinct concerns live here:
+//
+//   1. `requestMiddleware` — a Next.js middleware (activated by src/middleware.ts)
+//      that runs on every matched request, generates a request_id, logs the
+//      request, and stamps the response with `X-Request-Id`. Lightweight by
+//      design — no DB calls, no auth, no body parsing.
+//
+//   2. `withMiddleware` — a per-route-handler wrapper that adds structured
+//      logging + error handling around an individual API route. Opt-in per
+//      route; not currently used by the live routes (see worklog P5).
+//
+// Both share the observability logger so all output is structured JSON.
 // ============================================================================
 
-import { NextResponse } from 'next/server';
-import { randomUUID } from 'crypto';
+import { NextResponse, type NextRequest } from 'next/server';
 import {
   createRequestContext,
   clearRequestContext,
@@ -21,7 +26,57 @@ import {
 import { toErrorResponse, getHttpStatus, ClearPortError } from '@/lib/errors';
 
 // ---------------------------------------------------------------------------
-// API Route Wrapper
+// Next.js Middleware (runs on every matched request)
+// ---------------------------------------------------------------------------
+
+/**
+ * Next.js middleware entry point. Activated by `src/middleware.ts`.
+ *
+ * Lightweight: generates a request_id, logs the request line, stamps the
+ * response with `X-Request-Id`, and propagates the id to upstream API routes
+ * via the `x-request-id` header so route handlers can correlate logs.
+ *
+ * No auth, no DB, no body parsing — those concerns belong to route handlers.
+ */
+export function requestMiddleware(req: NextRequest): NextResponse {
+  // crypto.randomUUID() is available globally in both Node 19+ and the Edge
+  // runtime. We avoid `import { randomUUID } from 'crypto'` because that
+  // Node-only import breaks Edge compilation if Next.js ever flips this app
+  // to the Edge runtime for middleware.
+  const requestId =
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+  const method = req.method;
+  const path = req.nextUrl.pathname;
+
+  // Lightweight per-request log line. Structured JSON so it's grep-able in
+  // dev.log and shippable to a log aggregator in prod.
+  logger.info(`[middleware] ${method} ${path}`, {
+    request_id: requestId,
+    method,
+    path,
+    // Don't log query strings or headers — may contain PII / tokens.
+  });
+
+  // Propagate request_id to downstream route handlers via a custom header
+  // so they can include it in their own log lines + error responses.
+  const requestHeaders = new Headers(req.headers);
+  requestHeaders.set('x-request-id', requestId);
+
+  const response = NextResponse.next({
+    request: { headers: requestHeaders },
+  });
+
+  // Surface request_id on the response so the UI / client can correlate.
+  response.headers.set('X-Request-Id', requestId);
+
+  return response;
+}
+
+// ---------------------------------------------------------------------------
+// API Route Wrapper (opt-in per route)
 // ---------------------------------------------------------------------------
 
 type RouteHandler = (req: Request, ctx: RouteContext) => Promise<Response | NextResponse>;
@@ -45,7 +100,10 @@ export interface RouteContext {
  */
 export function withMiddleware(handler: RouteHandler): (req: Request) => Promise<Response> {
   return async (req: Request) => {
-    const requestId = randomUUID();
+    const requestId =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     const action = `${req.method} ${new URL(req.url).pathname}`;
 
     // Extract user_id and org_id from headers if available

@@ -11,7 +11,10 @@ export default defineConfig({
     environment: 'node',
     testTimeout: 60000,
     hookTimeout: 60000,
-    include: ['tests/unit/**/*.test.ts'],
+    include: [
+      'tests/unit/**/*.test.ts',
+      'tests/unit-pure/**/*.test.ts',
+    ],
     reporters: ['default', 'json'],
     outputFile: 'test-results/vitest-results.json',
     setupFiles: ['tests/helpers/setup.ts'],

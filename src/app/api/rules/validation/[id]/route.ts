@@ -13,7 +13,7 @@ const updateRuleSchema = z.object({
   name: z.string().min(1).max(200).optional(),
   field_key: z.string().nullable().optional(),
   rule_type: z.enum(['confidence_threshold', 'math_check', 'cross_doc_match', 'required_field', 'regex_format']).optional(),
-  config: z.record(z.any()).optional(),
+  config: z.record(z.string(), z.any()).optional(),
   severity: z.enum(['block', 'flag', 'warn']).optional(),
   is_active: z.boolean().optional(),
 });

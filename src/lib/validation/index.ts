@@ -227,7 +227,12 @@ export function validateSchema<T>(
     return { success: true, data: result.data };
   }
 
-  const errors: ValidationFieldError[] = result.error.errors.map((err: any) => ({
+  // Zod v4 renamed ZodError.errors → ZodError.issues. `.errors` is undefined
+  // in Zod v4, so accessing `.errors.map(...)` throws
+  // "Cannot read properties of undefined (reading 'map')".
+  // Use `.issues` (the Zod v4 name), with a fallback for Zod v3.
+  const zodIssues = (result.error.issues ?? (result.error as any).errors) as any[];
+  const errors: ValidationFieldError[] = zodIssues.map((err: any) => ({
     field: err.path.join('.'),
     reason: err.message,
     code: `SCHEMA_${err.code.toUpperCase()}`,

@@ -117,10 +117,19 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   // the latest values without being recreated on every state change. This
   // keeps loadData's deps stable ([]) so the initial mount effect only fires
   // once, and switchOrg can explicitly trigger a reload.
+  //
+  // P7 fix: ref assignments are done in useEffect (not during render) to be
+  // safe under React's concurrent rendering model. A component can render
+  // more than once per commit in concurrent mode; mutating refs during render
+  // would corrupt them. useEffect runs exactly once per commit.
   const currentOrgIdRef = React.useRef<string | null>(null);
-  currentOrgIdRef.current = currentOrgId;
   const userOrgsRef = React.useRef<typeof userOrgs>([]);
-  userOrgsRef.current = userOrgs;
+  React.useEffect(() => {
+    currentOrgIdRef.current = currentOrgId;
+  }, [currentOrgId]);
+  React.useEffect(() => {
+    userOrgsRef.current = userOrgs;
+  }, [userOrgs]);
 
   // --- apiFetch wrapper that injects the X-Org-Id header for org-scoped routes ---
   // Uses the ref so the callback identity is stable (no dependency on state).
@@ -171,8 +180,11 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   // --- Load data ---
+  // P7 fix: ref assignment in useEffect (not during render) for concurrent-mode safety.
   const selectedEntryIdRef = React.useRef(selectedEntryId);
-  selectedEntryIdRef.current = selectedEntryId;
+  React.useEffect(() => {
+    selectedEntryIdRef.current = selectedEntryId;
+  }, [selectedEntryId]);
 
   const loadData = React.useCallback(async () => {
     if (!isSupabaseConfigured()) {

@@ -888,19 +888,91 @@ function extractPdfTextLayer(arrayBuffer: ArrayBuffer): string | null {
   }
 }
 
-// --- Tesseract OCR placeholder (Tier 4) --------------------------------------
-// In production, this would call a Tesseract service or a serverless function.
-// For now, it returns null (indicating Tesseract is not available in this environment).
-// To enable: deploy a Tesseract serverless function and call it here.
-async function tesseractOCR(_arrayBuffer: ArrayBuffer, _mimeType: string): Promise<string | null> {
-  // Tesseract requires a separate service (not available in Deno edge functions).
-  // To enable: deploy a Tesseract service (e.g., on Railway/Render) and call it:
-  // const response = await fetch('https://your-tesseract-service.com/ocr', { ... });
-  // return await response.text();
-  return null;
+// --- Tesseract OCR (Tier 3) ------------------------------------------------
+// Self-hosted tesseract.js running in a separate Node.js API route
+// (/api/internal/ocr) inside the Next.js app. The edge function (Deno) can't
+// host tesseract.js directly, so it base64-encodes the file and ships it over
+// HTTPS to the Node route, which runs OCR and returns the text.
+//
+// Config: set OCR_SERVICE_URL + INTERNAL_OCR_SECRET as Supabase secrets. If
+// either is missing, this function returns null and the cascade falls through
+// to Tier 4 (needs_manual_review) — it NEVER throws.
+//
+// The 25s timeout here is longer than the edge function's 18s wall-clock
+// budget on purpose: the budget will kick in first if needed, which is the
+// correct behaviour (budget is the global ceiling, the per-call timeout is
+// the local safety net for misconfigured / hung services).
+async function tesseractOCR(arrayBuffer: ArrayBuffer, mimeType: string): Promise<string | null> {
+  const ocrUrl = Deno.env.get("OCR_SERVICE_URL");
+  const secret = Deno.env.get("INTERNAL_OCR_SECRET");
+  if (!ocrUrl || !secret) return null; // misconfigured — falls through to Tier 4, never crashes
+  try {
+    const res = await fetch(ocrUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal-Secret": secret },
+      body: JSON.stringify({ data: bufToBase64(arrayBuffer), mimeType }),
+      signal: AbortSignal.timeout(25000),
+    });
+    if (!res.ok) {
+      console.error(`[extract-document] OCR service returned ${res.status}`);
+      return null;
+    }
+    const { text } = await res.json();
+    return text || null;
+  } catch (err) {
+    console.error("[extract-document] OCR service call failed", err);
+    return null; // never throw — Tier 4 manual-review is the safety net
+  }
 }
 
-// --- Main handler with 5-tier extraction fallback chain ----------------------
+// --- Extraction Attempts Ledger (fire-and-forget) ---------------------------
+// Best-effort audit-trail writer. NEVER throws, NEVER consumes wall-clock
+// budget — called with `void recordAttempt(...)` so it runs in the background.
+// The extraction_attempts table is RLS-locked to SELECT-only for authenticated
+// users; only the service-role (admin) client can INSERT. A failure here (e.g.
+// table not deployed, transient DB error) is logged to console.warn and
+// swallowed so it can never abort the extraction pipeline.
+async function recordAttempt(
+  admin: any,
+  params: {
+    document_id: string;
+    org_id: string;
+    pipeline_trace_id: string;
+    tier: number;
+    tier_name: string;
+    status: 'success' | 'failure' | 'skipped';
+    fields_extracted?: number | null;
+    error_code?: string | null;
+    error_message?: string | null;
+    latency_ms?: number | null;
+  },
+): Promise<void> {
+  try {
+    await admin.from('extraction_attempts').insert({
+      document_id: params.document_id,
+      org_id: params.org_id,
+      pipeline_trace_id: params.pipeline_trace_id,
+      tier: params.tier,
+      tier_name: params.tier_name,
+      status: params.status,
+      fields_extracted: params.fields_extracted ?? null,
+      error_code: params.error_code ?? null,
+      error_message: params.error_message ?? null,
+      latency_ms: params.latency_ms ?? null,
+    });
+  } catch (err) {
+    console.warn(
+      '[extract-document] ledger write failed (tier',
+      params.tier,
+      'status',
+      params.status,
+      '):',
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+// --- Main handler with 4-tier extraction fallback chain ----------------------
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -947,10 +1019,10 @@ Deno.serve(async (req) => {
       return jsonRes({ error: "Missing 'shipmentId'" }, 400);
     }
 
-    // 3. Fetch documents for shipment
+    // 3. Fetch documents for shipment (include org_id for ledger writes)
     let docQuery = userClient
       .from("documents")
-      .select("id, shipment_id, doc_type, file_name, storage_path, mime_type")
+      .select("id, shipment_id, doc_type, file_name, storage_path, mime_type, org_id")
       .eq("shipment_id", shipmentId);
 
     if (documentId) {
@@ -984,6 +1056,39 @@ Deno.serve(async (req) => {
       );
     }
 
+    // 3b. Resolve / mint the pipeline_trace_id for this invocation. The
+    // validation chain may have already stamped one on the shipment — reuse
+    // it so all ledger rows for this shipment share a single trace. If absent,
+    // mint a fresh UUID and persist it (fire-and-forget) for downstream
+    // consumers (cross-validate, flag-exceptions, etc.).
+    let pipelineTraceId: string = crypto.randomUUID();
+    try {
+      const { data: shipmentRow } = await userClient
+        .from("shipments")
+        .select("id, pipeline_trace_id")
+        .eq("id", shipmentId)
+        .maybeSingle();
+      if (shipmentRow?.pipeline_trace_id) {
+        pipelineTraceId = shipmentRow.pipeline_trace_id;
+      } else {
+        // Persist the freshly-minted trace_id so the rest of the pipeline
+        // (and the extraction-trace UI) can join on it. Fire-and-forget.
+        void admin
+          .from("shipments")
+          .update({ pipeline_trace_id: pipelineTraceId })
+          .eq("id", shipmentId)
+          .then(({ error }: any) => {
+            if (error) {
+              console.warn('[extract-document] failed to persist pipeline_trace_id:', error.message);
+            }
+          });
+      }
+    } catch (err) {
+      // Non-fatal — keep the freshly-minted UUID. Ledger writes will still
+      // work, they just won't join to the shipment row's trace_id.
+      console.warn('[extract-document] shipment trace_id lookup failed:', err instanceof Error ? err.message : String(err));
+    }
+
     // ─── GLOBAL WALL-CLOCK BUDGET ───
     // 18 seconds total across ALL documents and ALL tiers. If we blow past it,
     // every remaining document is dropped straight to needs_manual_review with
@@ -1006,7 +1111,7 @@ Deno.serve(async (req) => {
     let totalExtractionFailures = 0;
     const failureDetails: any[] = [];
 
-    // 4. Process each document through the 5-tier extraction fallback chain
+    // 4. Process each document through the 4-tier extraction fallback chain
     for (const doc of docs) {
       let extracted: any[] = [];
       let usedModel: string | null = null;
@@ -1050,10 +1155,34 @@ Deno.serve(async (req) => {
         try { rawText = new TextDecoder().decode(ab); } catch {}
       }
 
+      // Resolve this document's org_id for ledger writes. Prefer the
+      // document's org_id (set by the trg_documents_set_org trigger); fall
+      // back to the caller's org membership. If neither is available (legacy
+      // data), skip ledger writes for this doc — extraction still proceeds.
+      const docOrgId: string | null = (doc as any).org_id || orgMember?.org_id || null;
+
       // ─── TIER 1: Gemini Vision (primary) ───
-      if (ai && !docBudgetExhausted) {
+      if (!ai || docBudgetExhausted) {
+        // Tier 1 skipped — Gemini not configured OR budget exhausted before
+        // we even started this document.
+        if (docOrgId) {
+          void recordAttempt(admin, {
+            document_id: doc.id,
+            org_id: docOrgId,
+            pipeline_trace_id: pipelineTraceId,
+            tier: 1,
+            tier_name: 'gemini_vision',
+            status: 'skipped',
+            error_message: !ai
+              ? 'GEMINI_API_KEY not set'
+              : 'Budget exhausted before Tier 1',
+          });
+        }
+      } else {
         extractionTier = 1;
+        const t1Start = Date.now();
         const geminiResult = await callGeminiExtraction(ai, mimeType, base64, rawText, deadline);
+        const t1Latency = Date.now() - t1Start;
         extracted = geminiResult.fields;
         geminiDebug = geminiResult.debug;
         usedModel = geminiResult.model;
@@ -1066,60 +1195,173 @@ Deno.serve(async (req) => {
         if (extracted.length > 0) {
           extractionSource = usedModel || "gemini";
         }
+        // Ledger: success (with fields_extracted + model + latency) or failure.
+        if (docOrgId) {
+          if (extracted.length > 0) {
+            void recordAttempt(admin, {
+              document_id: doc.id,
+              org_id: docOrgId,
+              pipeline_trace_id: pipelineTraceId,
+              tier: 1,
+              tier_name: 'gemini_vision',
+              status: 'success',
+              fields_extracted: extracted.length,
+              latency_ms: t1Latency,
+              // No dedicated `model` column — store the model identifier in
+              // error_message so the trace UI can surface it. Prefixed with
+              // `model:` to distinguish from real error messages.
+              error_message: `model:${usedModel || 'gemini'}`,
+            });
+          } else {
+            const errMsg = (geminiDebug?.errors && geminiDebug.errors.length > 0)
+              ? geminiDebug.errors.join('; ')
+              : 'No fields extracted from any Gemini model';
+            const isBudget = geminiResult.budgetExhausted;
+            void recordAttempt(admin, {
+              document_id: doc.id,
+              org_id: docOrgId,
+              pipeline_trace_id: pipelineTraceId,
+              tier: 1,
+              tier_name: 'gemini_vision',
+              status: 'failure',
+              latency_ms: t1Latency,
+              error_code: isBudget ? 'budget_exhausted' : 'no_fields',
+              error_message: errMsg,
+            });
+          }
+        }
       }
 
       // ─── TIER 2: PDF text-layer extraction (if Gemini failed and it's a PDF) ───
-      if (extracted.length === 0 && !docBudgetExhausted && mimeType === "application/pdf") {
+      if (extracted.length > 0 || docBudgetExhausted || mimeType !== "application/pdf") {
+        // Tier 2 not reached — either Tier 1 already succeeded, budget is
+        // exhausted, or this isn't a PDF. Record as skipped.
+        if (docOrgId) {
+          const skipReason = extracted.length > 0
+            ? 'Not needed — Tier 1 succeeded'
+            : docBudgetExhausted
+              ? 'Budget exhausted'
+              : 'Not a PDF';
+          void recordAttempt(admin, {
+            document_id: doc.id,
+            org_id: docOrgId,
+            pipeline_trace_id: pipelineTraceId,
+            tier: 2,
+            tier_name: 'pdf_text_layer',
+            status: 'skipped',
+            error_message: skipReason,
+          });
+        }
+      } else {
         extractionTier = 2;
         console.log("[extract-document] Tier 2: trying PDF text-layer extraction");
+        const t2Start = Date.now();
         const pdfText = extractPdfTextLayer(ab);
+        const t2Latency = Date.now() - t2Start;
         if (pdfText) {
           rawText = pdfText; // Use the extracted PDF text for regex
           console.log("[extract-document] PDF text-layer found, running regex on it");
         }
+        if (docOrgId) {
+          void recordAttempt(admin, {
+            document_id: doc.id,
+            org_id: docOrgId,
+            pipeline_trace_id: pipelineTraceId,
+            tier: 2,
+            tier_name: 'pdf_text_layer',
+            status: pdfText ? 'success' : 'failure',
+            latency_ms: t2Latency,
+            error_message: pdfText ? null : 'No embedded text layer in PDF',
+          });
+        }
       }
 
-      // ─── TIER 3: Cloud Vision OCR placeholder ───
-      // (Not implemented in this environment — would require a Google Cloud Vision API key
-      // separate from Gemini. Falls through to Tier 4.)
-      if (extracted.length === 0 && !docBudgetExhausted && !rawText) {
+      // ─── TIER 3: Tesseract OCR (self-hosted, free) ───
+      // Calls the /api/internal/ocr Node route which runs tesseract.js.
+      // Returns null silently when OCR_SERVICE_URL/INTERNAL_OCR_SECRET are
+      // unset or the service is unreachable — Tier 4 is the safety net.
+      const tier3NotReached = extracted.length > 0 || docBudgetExhausted || !!rawText || budgetRemaining() <= 500;
+      if (tier3NotReached) {
+        // Tier 3 not reached — Tier 1/2 already produced text, budget is
+        // exhausted, or remaining budget is too small for OCR.
+        if (docOrgId) {
+          const skipReason = extracted.length > 0
+            ? 'Not needed — earlier tier succeeded'
+            : docBudgetExhausted
+              ? 'Budget exhausted'
+              : rawText
+                ? 'Not needed — text already available from Tier 2'
+                : 'Budget remaining too low for OCR';
+          void recordAttempt(admin, {
+            document_id: doc.id,
+            org_id: docOrgId,
+            pipeline_trace_id: pipelineTraceId,
+            tier: 3,
+            tier_name: 'tesseract_ocr',
+            status: 'skipped',
+            error_message: skipReason,
+          });
+        }
+      } else {
         extractionTier = 3;
-        // Cloud Vision would go here: const visionText = await callCloudVision(base64, mimeType);
-        // if (visionText) rawText = visionText;
-      }
-
-      // ─── TIER 4: Tesseract OCR (local, zero quota) ───
-      if (extracted.length === 0 && !docBudgetExhausted && !rawText && budgetRemaining() > 500) {
-        extractionTier = 4;
-        console.log("[extract-document] Tier 4: trying Tesseract OCR");
+        console.log("[extract-document] Tier 3: trying Tesseract OCR");
+        const t3Start = Date.now();
         const tesseractText = await tesseractOCR(ab, mimeType);
+        const t3Latency = Date.now() - t3Start;
         if (tesseractText) {
           rawText = tesseractText;
           console.log("[extract-document] Tesseract produced text, running regex on it");
         }
+        if (docOrgId) {
+          void recordAttempt(admin, {
+            document_id: doc.id,
+            org_id: docOrgId,
+            pipeline_trace_id: pipelineTraceId,
+            tier: 3,
+            tier_name: 'tesseract_ocr',
+            status: tesseractText ? 'success' : 'failure',
+            latency_ms: t3Latency,
+            error_message: tesseractText ? null : 'Tesseract OCR returned no text (service unavailable or no text recognized)',
+          });
+        }
       }
 
-      // ─── Regex extraction on whatever text we have (works for Tiers 2, 3, 4) ───
+      // ─── Regex extraction on whatever text we have (works for Tiers 2, 3) ───
       if (extracted.length === 0 && !docBudgetExhausted && rawText) {
         console.log(`[extract-document] Running regex extraction (tier ${extractionTier})`);
         extracted = regexExtract(rawText);
         if (extracted.length > 0) {
           extractionSource = extractionTier === 2 ? "pdf_text_layer" :
-                             extractionTier === 4 ? "tesseract" : "regex_fallback";
+                             extractionTier === 3 ? "tesseract" : "regex_fallback";
         }
       }
 
-      // ─── TIER 5: Mark as 'needs_manual_review' — NEVER silent zero ───
+      // ─── TIER 4: Mark as 'needs_manual_review' — NEVER silent zero ───
       // This branch handles BOTH (a) all tiers genuinely failing and (b) the
       // wall-clock budget being exhausted. In the budget case we use a clear
       // "extraction timeout" reason so the user knows WHY it was dropped.
       if (extracted.length === 0 || docBudgetExhausted) {
-        extractionTier = docBudgetExhausted ? 5 : 5;
+        extractionTier = 4;
         extractionSource = docBudgetExhausted ? "timeout_manual_review" : "needs_manual_review";
 
         const reviewReason = docBudgetExhausted
           ? `Extraction timed out after ${BUDGET_MS / 1000}s wall-clock budget — the document could not be processed within the time limit. Please review manually.`
           : `All extraction tiers failed for ${doc.file_name}. Document requires manual review.`;
+
+        // Ledger: Tier 4 is always a failure (reaching here means every
+        // upstream tier failed or the budget was exhausted).
+        if (docOrgId) {
+          void recordAttempt(admin, {
+            document_id: doc.id,
+            org_id: docOrgId,
+            pipeline_trace_id: pipelineTraceId,
+            tier: 4,
+            tier_name: 'needs_manual_review',
+            status: 'failure',
+            error_code: docBudgetExhausted ? 'budget_exhausted' : 'all_tiers_failed',
+            error_message: reviewReason,
+          });
+        }
 
         // Mark the document for manual review
         await admin.from("documents").update({
@@ -1154,7 +1396,7 @@ Deno.serve(async (req) => {
           file_name: doc.file_name,
           reason: reviewReason,
           budgetExhausted: docBudgetExhausted,
-          tiersTried: [1, 2, 3, 4],
+          tiersTried: [1, 2, 3],
           modelsTried: geminiDebug?.modelsTried || [],
           errors: geminiDebug?.errors || [],
         });
@@ -1165,7 +1407,7 @@ Deno.serve(async (req) => {
           doc_type: doc.doc_type,
           status: docBudgetExhausted ? "timeout_manual_review" : "needs_manual_review",
           extractionSource,
-          extractionTier: 5,
+          extractionTier: 4,
           fieldsCount: 0,
           fields: [],
         });
@@ -1176,7 +1418,7 @@ Deno.serve(async (req) => {
           user_id: user.id,
           text: docBudgetExhausted
             ? `[extraction] Document ${doc.file_name} dropped to manual review — ${BUDGET_MS / 1000}s wall-clock budget exhausted`
-            : `[extraction] Document ${doc.file_name} marked for manual review — all 5 tiers failed`,
+            : `[extraction] Document ${doc.file_name} marked for manual review — all 4 tiers failed`,
           type: "warning",
         }).then(({ error }: any) => { if (error) console.warn("[extract-document] audit log failed:", error.message); });
 

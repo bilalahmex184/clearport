@@ -98,14 +98,18 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
 
     const csv = rows.join('\n');
 
-    // Audit log
-    await client.from('audit_logs').insert({
-      org_id: orgId,
-      user_id: user.id,
-      shipment_id: id,
-      text: `[export] User ${getUserEmail(user)} exported shipment ${id} via broker template "${template.name}"`,
-      type: 'success',
-    }).catch(() => {});
+    // Audit log — never let an audit-log failure block the CSV response.
+    try {
+      await client.from('audit_logs').insert({
+        org_id: orgId,
+        user_id: user.id,
+        shipment_id: id,
+        text: `[export] User ${getUserEmail(user)} exported shipment ${id} via broker template "${template.name}"`,
+        type: 'success',
+      });
+    } catch (auditErr) {
+      logger.warn('Audit log insert failed (broker export)', { error: (auditErr as Error).message, shipmentId: id });
+    }
 
     logger.info('Broker export completed', { shipmentId: id, templateId, orgId, user: getUserEmail(user) });
 

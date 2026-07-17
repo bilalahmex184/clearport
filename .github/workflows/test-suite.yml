@@ -27,6 +27,19 @@ jobs:
       - name: Install dependencies
         run: bun install
 
+      # P6: The compiler and linter now gate the build. This is the guard that
+      # would have caught the P1 (.catch on raw query builder), P2 (logRulesUpdate
+      # signature mismatch), and P5 (Zod .errors vs .issues) bugs before they
+      # shipped. Runs BEFORE build so a type error fails fast.
+      - name: Type check (tsc --noEmit)
+        run: npx tsc --noEmit
+
+      - name: Lint (eslint)
+        run: bun run lint
+
+      - name: Run pure unit tests (no network required)
+        run: bun run test:pure
+
       - name: (§6.3) Schema drift check — schema.sql must reference org-scoped policies
         run: |
           COUNT=$(grep -c "org_scoped" supabase/schema.sql || echo "0")

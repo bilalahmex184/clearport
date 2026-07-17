@@ -1,7 +1,18 @@
-#!/bin/bash
-cd /home/z/my-project
-while true; do
-  NODE_OPTIONS="--max-old-space-size=1024" npx next start -p 3000 >> server.log 2>&1
-  echo "[$(date)] Server exited, restarting in 1s..." >> server.log
-  sleep 1
-done
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# Start or restart ClearPort via pm2
+if pm2 describe clearport > /dev/null 2>&1; then
+  echo "[start-prod] Restarting clearport..."
+  pm2 restart ecosystem.config.js
+else
+  echo "[start-prod] Starting clearport..."
+  pm2 start ecosystem.config.js
+fi
+
+# Save the process list so pm2 resurrects it on reboot
+pm2 save
+
+echo "[start-prod] ClearPort is running. Use 'pm2 logs clearport' to view logs."
+echo "[start-prod] To enable auto-restart on boot, run: pm2 startup && pm2 save"

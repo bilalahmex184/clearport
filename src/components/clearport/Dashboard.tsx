@@ -16,6 +16,7 @@ import {
   Clock,
   CircleDollarSign,
 } from 'lucide-react';
+import ExtractionHealthPanel from './ExtractionHealthPanel';
 
 export default function Dashboard() {
   const { entries, selectEntry, setActiveTab, selectException, auditLogs, theme, toggleTheme } = useClearPort();
@@ -399,6 +400,13 @@ export default function Dashboard() {
               ))}
             </div>
           </div>
+
+          {/* Extraction Health — operational panel showing tier success rates
+              over the last 24h + the manual-review queue. Auto-refreshes
+              every 30s. Only visible to org members (the underlying API is
+              viewer-gated). Hidden in demo/fallback mode (the API returns
+              empty arrays). */}
+          <ExtractionHealthPanel />
         </div>
       </div>
     </div>

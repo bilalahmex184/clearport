@@ -54,13 +54,20 @@ export async function POST(req: Request) {
 
     const result = rpcResult[0];
 
-    // Audit log
-    await client.from('audit_logs').insert({
-      org_id: result.org_id,
-      user_id: user.id,
-      text: `[invite] User ${getUserEmail(user)} accepted invite and joined as ${result.role}`,
-      type: 'success',
-    }).catch(() => {});
+    // Audit log — never let an audit-log failure block the invite-accept
+    // response. The RPC has already committed the membership; a crash here
+    // would leave the user in the org but show them a 500, and a retry would
+    // fail with "already accepted" — a dead end.
+    try {
+      await client.from('audit_logs').insert({
+        org_id: result.org_id,
+        user_id: user.id,
+        text: `[invite] User ${getUserEmail(user)} accepted invite and joined as ${result.role}`,
+        type: 'success',
+      });
+    } catch (auditErr) {
+      logger.warn('Audit log insert failed (invite accept)', { error: (auditErr as Error).message, orgId: result.org_id, userId: user.id });
+    }
 
     logger.info('Invite accepted', { orgId: result.org_id, userId: user.id, role: result.role });
 

@@ -4,9 +4,10 @@ import * as React from 'react';
 import { useClearPort } from '@/context/ClearPortContext';
 import { CheckCircle2, FileSpreadsheet, AlertCircle, FileText } from 'lucide-react';
 import { canExport, roleLabel } from '@/lib/services/rbac.service';
+import ExtractionTracePanel from './ExtractionTracePanel';
 
 export default function EntryDetailView() {
-  const { entries, selectedEntryId, selectedEntry, selectEntry, selectException, setActiveTab, exportToCSV, userRole } = useClearPort();
+  const { entries, selectedEntryId, selectedEntry, selectEntry, selectException, setActiveTab, exportToCSV, userRole, apiFetchOrg } = useClearPort();
 
   // RBAC: every role (admin / operator / viewer) has the 'export' permission,
   // so this gate is currently a no-op for the default role assignment. It's
@@ -219,6 +220,17 @@ export default function EntryDetailView() {
               Open Exception Desk
             </button>
           </div>
+        )}
+
+        {/* Extraction Trace — collapsible audit timeline. Only shows rows for
+            documents that have extraction_attempts entries (i.e. the
+            extract-document edge function has run since migration 017 was
+            applied). Hidden entirely in seed/demo mode (no documents). */}
+        {selectedEntry.documents.length > 0 && (
+          <ExtractionTracePanel
+            documents={selectedEntry.documents}
+            apiFetchOrg={apiFetchOrg}
+          />
         )}
       </div>
     </div>

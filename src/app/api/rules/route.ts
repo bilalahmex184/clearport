@@ -184,9 +184,14 @@ export async function PATCH(req: Request) {
     // Structured audit log — records which thresholds changed + who changed
     // them. Best-effort: failures are logged but don't break the response.
     await logRulesUpdate(client, getUserEmail(user), {
-      invoiceThreshold: merged.invoiceThreshold,
-      htsThreshold: merged.htsThreshold,
-      partiesThreshold: merged.partiesThreshold,
+      action: 'updated',
+      ruleName: 'operational_thresholds',
+      ruleType: 'threshold_update',
+      changes: {
+        invoiceThreshold: merged.invoiceThreshold,
+        htsThreshold: merged.htsThreshold,
+        partiesThreshold: merged.partiesThreshold,
+      },
     }).catch((err) => {
       logger.warn('rules: audit log failed', {
         error: err instanceof Error ? err.message : String(err),
