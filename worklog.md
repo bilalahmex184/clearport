@@ -1311,3 +1311,96 @@ Stage Summary:
 - Fixed-width elements (`w-[500px]`) replaced with `w-full max-w-[500px]` + responsive heights
 - Tables get horizontal scroll via `overflow-auto` wrappers
 - Padding scales: `p-3 sm:p-4 md:p-6` (mobile → tablet → desktop)
+
+---
+Task ID: P16
+Agent: general-purpose
+Task: Finish dependency cleanup — remove dead deps + Prisma scaffold
+
+Work Log:
+- Pre-removal verification: ran `grep -rl "<pkg>" src/` for each of the 5 candidate packages — all returned zero hits, so all 5 were safe to remove.
+- Removed 5 dead npm packages via `bun remove @hookform/resolvers @tanstack/react-query @tanstack/react-table date-fns react-markdown` (single command, lockfile updated).
+- Verified `grep -rl "@/lib/db" src/` returned zero hits → safe to delete `src/lib/db.ts`.
+- Deleted `prisma/` directory (only contained `schema.prisma` — a generic blog-starter schema with User + Post models, never wired into ClearPort's data model).
+- Deleted `src/lib/db.ts` (PrismaClient singleton, only file in repo that imported `@prisma/client`, with zero importers of its own).
+- Removed `@prisma/client` and `prisma` via `bun remove @prisma/client prisma`.
+- Removed the now-broken `db:push`, `db:generate`, `db:migrate`, `db:reset` scripts from `package.json` (they shelled out to the `prisma` binary that no longer exists).
+- Verified `DATABASE_URL` was referenced only by Prisma scaffold (none in `src/`, none in tests). Removed it from:
+  - `.env` (was `DATABASE_URL=file:/home/z/my-project/db/custom.db`)
+  - `.env.example` (was `DATABASE_URL=file:./db/custom.db` + comment line)
+  - `.github/workflows/test-suite.yml` (was `DATABASE_URL: file:/tmp/test.db` env on the build step)
+- Cleaned up the dead-scaffold leftovers in `.zscripts/` (deployment packaging scripts that referenced the removed scaffold):
+  - `.zscripts/build.sh`: removed the `if [ -f "./db/custom.db" ]` block that called `DATABASE_URL=... bun run db:push` (would have failed post-removal since the `db:push` script no longer exists).
+  - `.zscripts/start.sh`: removed the `DEFAULT_PACKAGED_DB_PATH` / `DEFAULT_PACKAGED_DATABASE_URL` setup + the missing-db-file early-exit guard (no consumer of `DATABASE_URL` exists anymore).
+  - Deleted the orphaned `db/` directory (just contained `custom.db`, a 24KB SQLite file that was the Prisma dev DB).
+- Ran `bun install` to refresh the lockfile (no changes — bun had already saved lockfile after each `bun remove`).
+- Side-fix: `npx tsc --noEmit` surfaced a pre-existing (uncommitted, introduced by another task's PDF-support work on `src/app/api/internal/ocr/route.ts`) error — line 44 imported `existsSync` from `node:fs/promises`, but that function lives in `node:fs` (line 45 already imported the correct sync version as `existsSyncSync`). The `existsSync` from line 44 was never used. Removed the dead `existsSync` token from the broken import to unblock the tsc gate. One-token change, no behavior change.
+- Final gate verification:
+  - `npx tsc --noEmit`: 0 errors in `src/`. 6 errors remain in `tests/unit-pure/` (ignored per task — being fixed by a different task).
+  - `bun run lint`: clean (no output, exit 0).
+  - `bun run build`: succeeded — "Compiled successfully in 18.0s", 18 static pages generated, all 26 routes (incl. `/api/internal/ocr`) present.
+  - Dev server smoke test (server already running on :3000, not restarted): `curl http://localhost:3000` → 200; `curl http://localhost:3000/api/organizations` → 401 (unauthenticated, as expected).
+
+Stage Summary:
+- 7 npm packages removed in total:
+  - Dead UI/utility deps (5): `@hookform/resolvers`, `@tanstack/react-query`, `@tanstack/react-table`, `date-fns`, `react-markdown` — all verified zero references in `src/` before removal.
+  - Prisma scaffold (2): `@prisma/client`, `prisma` — only importer was the deleted `src/lib/db.ts`.
+- All 5 candidate packages were genuinely unused (no false positives, none had to be kept).
+- Prisma/SQLite scaffold fully removed: `prisma/schema.prisma`, `src/lib/db.ts`, `db/custom.db`, 4 `db:*` npm scripts, and `DATABASE_URL` from `.env` + `.env.example` + CI workflow + 2 `.zscripts/` deploy scripts.
+- Tesseract.js, sharp, and pm2 all preserved (still actively used by OCR route / deployment, as instructed).
+- One collateral src/ fix: removed a dead `existsSync` import from `src/app/api/internal/ocr/route.ts` (was introduced by another task's uncommitted PDF-support changes; was breaking the tsc gate).
+- All 4 verification gates pass: tsc clean (src/), lint clean, build succeeds, dev server returns 200 / 401 as expected.
+
+---
+Task ID: P14-P17-OCR-AND-CI-GATES
+Agent: main
+Task: P14 (real PDF OCR via pdftoppm), P15 (structured tesseractOCR result), P16 (finish dep cleanup), P17 (fix CI gates)
+
+Work Log:
+
+P14 (Real PDF OCR support via pdftoppm):
+- /api/internal/ocr/route.ts: Added rasterizePdfFirstPage() function using poppler-utils' pdftoppm binary
+  - Writes decoded PDF to temp file, shells out to `pdftoppm -png -r 300 -f 1 -l 1`, reads back the PNG
+  - 20s exec timeout, temp files cleaned up in finally block
+  - PDFs now flow through: decode → pdftoppm rasterize → sharp normalize → tesseract OCR (same path as images)
+- Removed the unconditional 415 rejection for PDFs — PDFs now attempt rasterization first
+- 415 only returned if pdftoppm binary is missing (config issue); 422 for corrupt PDFs
+- Fixed tesseract.js worker path resolution: Turbopack rewrites require.resolve/createRequire.resolve into virtual paths; fixed by constructing path from process.cwd() with fallback to createRequire if it returns a real filesystem path
+- Browser-verified: test invoice PDF → 13 fields extracted, 95% confidence, 2.1s total (pdftoppm ~0.5s + tesseract ~1.5s)
+
+P15 (Structured tesseractOCR result with accurate error reasons):
+- Edge function tesseractOCR() now returns { text, errorCode, reason } instead of string | null
+- Distinct error codes for each failure mode:
+  - MISCONFIGURED: OCR_SERVICE_URL or INTERNAL_OCR_SECRET missing
+  - 401: shared secret mismatch
+  - 415: unsupported mime type / pdftoppm missing
+  - 408: OCR service timeout
+  - 422: preprocessing failed (corrupt PDF, bad image)
+  - 5xx: OCR service error (with detail from response body)
+  - EMPTY_TEXT: OCR ran but recognized nothing (blank/illegible image)
+  - FETCH_TIMEOUT: AbortSignal timeout
+  - FETCH_FAILED: network error
+- Extraction attempts ledger now records errorCode + the actual reason, not a generic one-size-fits-all string
+- A reviewer can now tell "unsupported mime type" apart from "service down" apart from "OCR ran but couldn't read the image"
+
+P16 (Finish dependency cleanup):
+- Removed 5 dead UI/utility deps: @hookform/resolvers, @tanstack/react-query, @tanstack/react-table, date-fns, react-markdown (all verified zero references in src/)
+- Removed dead Prisma/SQLite scaffold entirely: prisma/ directory, src/lib/db.ts, @prisma/client, prisma
+- Removed DATABASE_URL from .env, .env.example, CI workflow, and build scripts
+- Runtime deps: 58 → 51
+
+P17 (Fix CI gates):
+- Fixed 6 tsc errors in tests/unit-pure/:
+  1. 01-audit-log-formatting.test.ts:124 — removed stale @ts-expect-error (was needed when logRulesUpdate had old signature, no longer needed after P2 rewrite)
+  2-3. 04-rules-engine.test.ts:37,39 — removed redundant explicit name/rule_type assignments in makeRule (already provided via ...overrides spread)
+  4-6. 04-rules-engine.test.ts:612,613,629 — added optional chaining (?.) on decision_trace access (optional on type, guaranteed by runRulesUpgraded at runtime)
+- react-hooks anti-patterns: the ref-mutation-in-render issues were already fixed in P7 (moved to useEffect). The remaining setState-in-effect patterns are legitimate mount-time syncs (theme loader, data loader) — eslint rules are disabled in config so these don't surface as errors.
+
+Stage Summary:
+- All 4 gates pass: tsc 0 errors, eslint 0 errors, 175/175 pure tests pass, dev server 200
+- PDF OCR verified end-to-end: test invoice PDF → 13 fields, 95% confidence, 2.1s
+- Corrupt PDF handled gracefully: clear error message, no crash
+- Unauthenticated requests: /api/internal/ocr → 401, /api/organizations → 401
+- Extraction ledger now records accurate, distinct error reasons per failure mode
+- 7 more dead deps removed, Prisma scaffold deleted
+- CI gates (tsc + eslint + test:pure) will now pass on every push

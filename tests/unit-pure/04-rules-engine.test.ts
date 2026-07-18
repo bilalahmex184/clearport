@@ -34,13 +34,11 @@ function makeRule(
   return {
     id: nextRuleId(),
     org_id: 'org-test',
-    name: overrides.name,
     field_key: overrides.field_key ?? null,
-    rule_type: overrides.rule_type,
     config: overrides.config ?? {},
     severity: overrides.severity ?? 'flag',
     is_active: true,
-    ...overrides,
+    ...overrides, // name + rule_type come from here (Pick guarantees them)
   };
 }
 
@@ -609,8 +607,9 @@ describe('rules/engine (P13)', () => {
       expect(r.status).toBe('failed');
       expect(r.severity).toBe('error'); // 'block' maps to 'error'
       expect(r.dependencies).toContain('htsCode');
-      expect(r.decision_trace.evaluation_path).toContain('confidence_threshold');
-      expect(r.decision_trace.final_outcome).toBe('failed');
+      // (P17) decision_trace is optional on the type but guaranteed by runRulesUpgraded
+      expect(r.decision_trace?.evaluation_path).toContain('confidence_threshold');
+      expect(r.decision_trace?.final_outcome).toBe('failed');
       expect(r.expected).toContain('confidence >= 85');
     });
 
@@ -626,7 +625,7 @@ describe('rules/engine (P13)', () => {
       expect(results[0].status).toBe('failed');
       expect(results[0].severity).toBe('warning'); // 'flag' maps to 'warning'
       expect(results[0].actual).toBe('missing');
-      expect(results[0].decision_trace.evaluation_path).toContain('not_found');
+      expect(results[0].decision_trace?.evaluation_path).toContain('not_found');
     });
   });
 

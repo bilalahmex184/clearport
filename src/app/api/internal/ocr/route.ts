@@ -20,22 +20,61 @@
 //   200 OK:  { text: string, confidence: number }
 //   401:     { error: "Unauthorized" }
 //   400:     { error: "Bad request", detail: string }
-//   415:     { error: "Unsupported mime type", detail: string }   // PDFs (no rasterizer)
+//   415:     { error: "Unsupported mime type", detail: string }
 //   408:     { error: "OCR timeout" }
 //   500/502: { error: "OCR failed", detail: string }
 //
 // Notes:
 //   - 25s internal timeout (AbortController). The edge function's 18s wall-clock
 //     budget will fire first if needed — that's intentional.
-//   - PDF support requires sharp built with poppler/libvips-pdf. This route
-//     returns a 415 for PDFs so the edge function falls through to manual
-//     review (Tier 4). See worklog P3.
+//   - PDF support: rasterizes the first page to PNG at 300 DPI via poppler-utils'
+//     `pdftoppm` binary (apt-get install poppler-utils), then feeds the PNG into
+//     the existing normalizeImage → tesseract path. This is a one-time OS-level
+//     install documented in the deployment README. If pdftoppm is missing or
+//     the PDF is corrupt, returns a 415/502 so the edge function falls through
+//     to manual review (Tier 4).
 // ============================================================================
 
 import { NextResponse } from 'next/server';
 import sharp from 'sharp';
 import { createWorker } from 'tesseract.js';
 import { logger } from '@/lib/utils/logger';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { writeFile, readFile, mkdir, rm } from 'node:fs/promises';
+import { existsSync as existsSyncSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
+
+const execFileAsync = promisify(execFile);
+
+// Resolve the tesseract.js worker script's real filesystem path.
+// Turbopack rewrites both `require.resolve(...)` and `createRequire().resolve()`
+// into virtual module paths that Node's `new Worker(path)` rejects. We
+// construct the path directly from process.cwd() instead — this works because
+// ClearPort is self-hosted (not serverless), so node_modules is always at the
+// project root. The path is validated at module load; if missing, OCR calls
+// will fail with a clear error rather than a confusing worker-spawn crash.
+function resolveTesseractWorkerPath(): string {
+  // Try createRequire first (works in some bundler configs)
+  try {
+    const nodeRequire = createRequire(import.meta.url);
+    const resolved = nodeRequire.resolve(
+      'tesseract.js/src/worker-script/node/index.js',
+    );
+    // If Turbopack rewrote it, the path won't start with '/' — check for that
+    if (resolved.startsWith('/') && existsSyncSync(resolved)) {
+      return resolved;
+    }
+  } catch {
+    // Fall through to manual path construction
+  }
+  // Fallback: construct from process.cwd() (self-hosted deployment)
+  return join(process.cwd(), 'node_modules', 'tesseract.js', 'src', 'worker-script', 'node', 'index.js');
+}
+const TESSERACT_WORKER_PATH = resolveTesseractWorkerPath();
 
 // Force the Node.js runtime — tesseract.js spawns a Node worker and WASM and
 // cannot run on the edge runtime.
@@ -145,6 +184,67 @@ async function normalizeImage(buffer: Buffer, mimeType: string): Promise<Buffer>
     .toBuffer();
 }
 
+/**
+ * Rasterize the first page of a PDF to a PNG buffer using poppler-utils'
+ * `pdftoppm` binary. Returns the PNG buffer on success.
+ * Throws if pdftoppm is missing, the PDF is corrupt, or the conversion fails.
+ *
+ * Uses a temp directory in the OS tmpdir. The caller is responsible for
+ * cleanup — use the cleanup callback returned alongside the buffer, or
+ * call the function inside a try/finally that removes the temp path.
+ */
+async function rasterizePdfFirstPage(pdfBuffer: Buffer): Promise<{ pngBuffer: Buffer; cleanup: () => Promise<void> }> {
+  const sessionId = randomUUID();
+  const tempDir = join(tmpdir(), `clearport-ocr-${sessionId}`);
+  await mkdir(tempDir, { recursive: true });
+
+  const pdfPath = join(tempDir, 'input.pdf');
+  const outputPrefix = join(tempDir, 'page'); // pdftoppm appends -1.png
+  let pngPath = join(tempDir, 'page-1.png'); // pdftoppm -png naming: <prefix>-1.png
+
+  const cleanup = async () => {
+    try {
+      await rm(tempDir, { recursive: true, force: true });
+    } catch {
+      // Best-effort — ignore.
+    }
+  };
+
+  try {
+    // Write the PDF to disk for pdftoppm
+    await writeFile(pdfPath, pdfBuffer);
+
+    // pdftoppm -png -r 300 -f 1 -l 1 <pdf> <output-prefix>
+    //   -png      : output PNG format
+    //   -r 300    : 300 DPI (good balance of quality + speed for OCR)
+    //   -f 1 -l 1 : first page to last page (just page 1)
+    try {
+      await execFileAsync('pdftoppm', ['-png', '-r', '300', '-f', '1', '-l', '1', pdfPath, outputPrefix], {
+        timeout: 20_000, // hard cap — pdftoppm must finish well within the route's 25s budget
+        maxBuffer: 10 * 1024 * 1024, // 10MB stdout/stderr cap
+      });
+    } catch (err: unknown) {
+      const e = err as { code?: string; stderr?: string; message?: string };
+      // ENOENT means pdftoppm binary isn't installed
+      if (e.code === 'ENOENT') {
+        throw new Error('pdftoppm binary not found — install poppler-utils (apt-get install poppler-utils)');
+      }
+      throw new Error(`pdftoppm failed: ${e.stderr || e.message || String(err)}`);
+    }
+
+    // pdftoppm names files <prefix>-1.png (single digit for page 1)
+    const pngBuffer = await readFile(pngPath);
+    if (pngBuffer.length === 0) {
+      throw new Error('pdftoppm produced an empty PNG');
+    }
+
+    return { pngBuffer, cleanup };
+  } catch (err) {
+    await cleanup();
+    throw err;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // POST handler
 // ---------------------------------------------------------------------------
@@ -189,34 +289,11 @@ export async function POST(req: Request): Promise<Response> {
 
   const { mimeType, data } = body;
 
-  // ── 3. Mime-type gate ──
-  // PDFs require a rasterizer. Sharp in this environment is NOT built with
-  // poppler/libvips-pdf (sharp.format.pdf.input.{file,buffer,stream} = false),
-  // so we can't rasterize PDFs here. Return 415 so the edge function falls
-  // through to manual review (Tier 4) cleanly.
-  if (mimeType === 'application/pdf') {
-    logger.info('OCR route — PDF not supported, returning 415', {
-      route: '/api/internal/ocr',
-      mimeType,
-    });
-    return unsupportedType(
-      'PDF rasterization is not available in this environment — sharp was built without poppler/libvips-pdf support. Falling through to manual review.',
-    );
-  }
-
-  if (!IMAGE_MIME_TYPES.has(mimeType.toLowerCase())) {
-    logger.warn('OCR route — unsupported mime type', {
-      route: '/api/internal/ocr',
-      mimeType,
-    });
-    return unsupportedType(`Unsupported mime type: ${mimeType}. Supported: ${[...IMAGE_MIME_TYPES].join(', ')}`);
-  }
-
-  // ── 4. Decode base64 ──
-  let imageBuffer: Buffer;
+  // ── 3. Decode base64 ──
+  let rawBuffer: Buffer;
   try {
-    imageBuffer = decodeBase64ToBuffer(data);
-    if (imageBuffer.length === 0) {
+    rawBuffer = decodeBase64ToBuffer(data);
+    if (rawBuffer.length === 0) {
       return badRequest('Decoded buffer is empty');
     }
   } catch (err) {
@@ -227,10 +304,51 @@ export async function POST(req: Request): Promise<Response> {
     return badRequest('Failed to decode base64 data');
   }
 
+  // ── 4. Handle PDFs: rasterize first page via pdftoppm, then OCR the PNG ──
+  // PDFs need a rasterizer. Sharp in this environment is NOT built with
+  // poppler/libvips-pdf, so we shell out to poppler-utils' `pdftoppm` binary
+  // instead (apt-get install poppler-utils). The first page is rasterized at
+  // 300 DPI to a PNG, then fed into the existing normalizeImage → tesseract
+  // path unchanged. Temp files are cleaned up in a finally block.
+  let imageBuffer: Buffer;
+  let pdfCleanup: (() => Promise<void>) | null = null;
+
+  if (mimeType === 'application/pdf') {
+    logger.info('OCR route — rasterizing PDF first page via pdftoppm', {
+      route: '/api/internal/ocr',
+      inputBytes: rawBuffer.length,
+    });
+    try {
+      const result = await rasterizePdfFirstPage(rawBuffer);
+      imageBuffer = result.pngBuffer;
+      pdfCleanup = result.cleanup;
+    } catch (err) {
+      const msg = (err as Error)?.message || String(err);
+      logger.error('OCR route — PDF rasterization failed', {
+        route: '/api/internal/ocr',
+        error: msg,
+      });
+      // If pdftoppm is missing, that's a configuration issue → 415
+      if (msg.includes('pdftoppm binary not found')) {
+        return unsupportedType('PDF rasterization unavailable — pdftoppm not installed. Install poppler-utils.');
+      }
+      // Corrupt PDF or rasterization failure → 422 (processable entity but failed)
+      return ocrFailed(`PDF rasterization failed: ${msg}`, 422);
+    }
+  } else if (IMAGE_MIME_TYPES.has(mimeType.toLowerCase())) {
+    imageBuffer = rawBuffer;
+  } else {
+    logger.warn('OCR route — unsupported mime type', {
+      route: '/api/internal/ocr',
+      mimeType,
+    });
+    return unsupportedType(`Unsupported mime type: ${mimeType}. Supported: ${[...IMAGE_MIME_TYPES].join(', ')}, application/pdf`);
+  }
+
   // ── 5. Normalize via sharp ──
   let normalizedBuffer: Buffer;
   try {
-    normalizedBuffer = await normalizeImage(imageBuffer, mimeType);
+    normalizedBuffer = await normalizeImage(imageBuffer, mimeType === 'application/pdf' ? 'image/png' : mimeType);
   } catch (err) {
     logger.error('OCR route — sharp normalize failed', {
       route: '/api/internal/ocr',
@@ -238,6 +356,7 @@ export async function POST(req: Request): Promise<Response> {
       byteLength: imageBuffer.length,
       error: String((err as Error)?.message || err),
     });
+    if (pdfCleanup) await pdfCleanup();
     return ocrFailed(`Image preprocessing failed: ${(err as Error)?.message || String(err)}`, 422);
   }
 
@@ -262,7 +381,15 @@ export async function POST(req: Request): Promise<Response> {
   const holder: { worker: { terminate: () => Promise<unknown> } | null } = { worker: null };
 
   const tesseractPromise = (async (): Promise<OcrSuccessResponse> => {
-    const worker = await createWorker('eng');
+    // Explicitly set workerPath so Next.js's Turbopack bundler doesn't break
+    // tesseract.js's __dirname-based path resolution. TESSERACT_WORKER_PATH is
+    // resolved at module load via createRequire (bypasses Turbopack's virtual
+    // module rewriting) to a real filesystem path.
+    const worker = await createWorker('eng', 1, {
+      workerPath: TESSERACT_WORKER_PATH,
+      corePath: undefined, // let tesseract.js auto-download the WASM core
+      langPath: undefined, // let tesseract.js auto-download language data
+    });
     holder.worker = worker;
     const { data: result } = await worker.recognize(normalizedBuffer);
     return {
@@ -315,6 +442,14 @@ export async function POST(req: Request): Promise<Response> {
         await w.terminate();
       } catch {
         // Best-effort cleanup — ignore.
+      }
+    }
+    // Clean up PDF temp files if we rasterized one
+    if (pdfCleanup) {
+      try {
+        await pdfCleanup();
+      } catch {
+        // Best-effort — ignore.
       }
     }
   }

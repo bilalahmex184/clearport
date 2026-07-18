@@ -121,7 +121,10 @@ describe('audit-log message formatting (P13)', () => {
       // refactor reverts to the threshold-only signature, `ruleName` won't
       // appear and this test will fail.
       const { client, inserts } = createMockClient();
-      // @ts-expect-error — intentionally exercise the new-shape contract
+      // (P17) The @ts-expect-error was needed when logRulesUpdate still had
+      // the old threshold-only signature. After the P2 rewrite, the signature
+      // correctly accepts {action, ruleName, ruleType} — so the directive is
+      // stale and must be removed (a stale @ts-expect-error is itself a tsc error).
       await logRulesUpdate(client, 'u@x.com', {
         action: 'created',
         ruleName: 'Regression Guard Rule',

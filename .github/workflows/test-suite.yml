@@ -51,8 +51,6 @@ jobs:
 
       - name: Build project
         run: NODE_OPTIONS="--max-old-space-size=4096" bun run build
-        env:
-          DATABASE_URL: file:/tmp/test.db
 
       - name: Start production server
         run: |

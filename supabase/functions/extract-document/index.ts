@@ -902,10 +902,29 @@ function extractPdfTextLayer(arrayBuffer: ArrayBuffer): string | null {
 // budget on purpose: the budget will kick in first if needed, which is the
 // correct behaviour (budget is the global ceiling, the per-call timeout is
 // the local safety net for misconfigured / hung services).
-async function tesseractOCR(arrayBuffer: ArrayBuffer, mimeType: string): Promise<string | null> {
+// (P15) Structured result so the extraction_attempts ledger records the
+// ACTUAL failure reason instead of a one-size-fits-all generic string.
+// A reviewer looking at the ledger should be able to tell "unsupported
+// document type" apart from "OCR service was down" apart from "OCR ran
+// but genuinely couldn't read this image."
+interface TesseractResult {
+  text: string | null;
+  /** Machine-readable error code for the ledger (e.g. "415", "408", "FETCH_FAILED") */
+  errorCode?: string;
+  /** Human-readable reason explaining why OCR didn't produce text */
+  reason?: string;
+}
+
+async function tesseractOCR(arrayBuffer: ArrayBuffer, mimeType: string): Promise<TesseractResult> {
   const ocrUrl = Deno.env.get("OCR_SERVICE_URL");
   const secret = Deno.env.get("INTERNAL_OCR_SECRET");
-  if (!ocrUrl || !secret) return null; // misconfigured — falls through to Tier 4, never crashes
+  if (!ocrUrl || !secret) {
+    return {
+      text: null,
+      errorCode: "MISCONFIGURED",
+      reason: "OCR service not configured (OCR_SERVICE_URL or INTERNAL_OCR_SECRET missing) — falls through to manual review",
+    };
+  }
   try {
     const res = await fetch(ocrUrl, {
       method: "POST",
@@ -914,14 +933,59 @@ async function tesseractOCR(arrayBuffer: ArrayBuffer, mimeType: string): Promise
       signal: AbortSignal.timeout(25000),
     });
     if (!res.ok) {
-      console.error(`[extract-document] OCR service returned ${res.status}`);
-      return null;
+      // Map HTTP status to a clear, distinct reason for the ledger
+      let reason: string;
+      let errorCode: string;
+      if (res.status === 401) {
+        errorCode = "401";
+        reason = "OCR service rejected the shared secret — INTERNAL_OCR_SECRET mismatch between edge function and Next.js app";
+      } else if (res.status === 415) {
+        errorCode = "415";
+        reason = `Unsupported document type for OCR (${mimeType}) — pdftoppm not installed or mime type not supported`;
+      } else if (res.status === 408) {
+        errorCode = "408";
+        reason = "OCR service timed out (tesseract.js exceeded 25s internal limit)";
+      } else if (res.status === 422) {
+        errorCode = "422";
+        const errBody = await res.json().catch(() => ({}));
+        reason = `OCR preprocessing failed: ${errBody.detail || res.statusText}`;
+      } else if (res.status >= 500) {
+        errorCode = String(res.status);
+        const errBody = await res.json().catch(() => ({}));
+        reason = `OCR service error (${res.status}): ${errBody.detail || errBody.error || res.statusText}`;
+      } else {
+        errorCode = String(res.status);
+        reason = `OCR service returned HTTP ${res.status}: ${res.statusText}`;
+      }
+      console.error(`[extract-document] OCR service returned ${res.status}: ${reason}`);
+      return { text: null, errorCode, reason };
     }
-    const { text } = await res.json();
-    return text || null;
+    const body = await res.json();
+    const text: string | null = body.text || null;
+    if (!text) {
+      return {
+        text: null,
+        errorCode: "EMPTY_TEXT",
+        reason: "OCR ran successfully but recognized no text (blank or illegible image)",
+      };
+    }
+    return { text };
   } catch (err) {
-    console.error("[extract-document] OCR service call failed", err);
-    return null; // never throw — Tier 4 manual-review is the safety net
+    const errMsg = err instanceof Error ? err.message : String(err);
+    // Distinguish timeout (AbortSignal) from other fetch failures
+    if (/timed out|timeout|abort/i.test(errMsg)) {
+      return {
+        text: null,
+        errorCode: "FETCH_TIMEOUT",
+        reason: `OCR service call timed out: ${errMsg}`,
+      };
+    }
+    return {
+      text: null,
+      errorCode: "FETCH_FAILED",
+      reason: `OCR service call failed: ${errMsg}`,
+    };
+    // never throw — Tier 4 manual-review is the safety net
   }
 }
 
@@ -1306,10 +1370,10 @@ Deno.serve(async (req) => {
         extractionTier = 3;
         console.log("[extract-document] Tier 3: trying Tesseract OCR");
         const t3Start = Date.now();
-        const tesseractText = await tesseractOCR(ab, mimeType);
+        const tesseractResult = await tesseractOCR(ab, mimeType);
         const t3Latency = Date.now() - t3Start;
-        if (tesseractText) {
-          rawText = tesseractText;
+        if (tesseractResult.text) {
+          rawText = tesseractResult.text;
           console.log("[extract-document] Tesseract produced text, running regex on it");
         }
         if (docOrgId) {
@@ -1319,9 +1383,14 @@ Deno.serve(async (req) => {
             pipeline_trace_id: pipelineTraceId,
             tier: 3,
             tier_name: 'tesseract_ocr',
-            status: tesseractText ? 'success' : 'failure',
+            status: tesseractResult.text ? 'success' : 'failure',
             latency_ms: t3Latency,
-            error_message: tesseractText ? null : 'Tesseract OCR returned no text (service unavailable or no text recognized)',
+            error_code: tesseractResult.errorCode || null,
+            // (P15) Use the actual failure reason from tesseractOCR, not a
+            // one-size-fits-all generic string. A reviewer can now tell
+            // "unsupported mime type" apart from "service down" apart from
+            // "OCR ran but couldn't read the image."
+            error_message: tesseractResult.text ? null : (tesseractResult.reason || 'Tesseract OCR returned no text'),
           });
         }
       }
