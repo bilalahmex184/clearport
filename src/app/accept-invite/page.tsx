@@ -13,7 +13,7 @@
 
 import * as React from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { supabase, isDemoMode } from '@/lib/supabase';
+import { supabase, decideInviteAction } from '@/lib/supabase';
 import { CheckCircle2, AlertCircle, Loader2, LogIn, UserPlus, Mail } from 'lucide-react';
 
 function AcceptInviteContent() {
@@ -22,6 +22,9 @@ function AcceptInviteContent() {
   const token = searchParams.get('token');
   const [status, setStatus] = React.useState<'checking' | 'accepting' | 'success' | 'error' | 'needs-auth'>('checking');
   const [message, setMessage] = React.useState('');
+  // Store the needs-auth redirect URLs from decideInviteAction so the
+  // needs-auth UI can use them (avoids re-deriving the URLs inline).
+  const [authUrls, setAuthUrls] = React.useState<{ signupUrl: string; loginUrl: string }>({ signupUrl: '', loginUrl: '' });
 
   React.useEffect(() => {
     if (!token) {
@@ -34,21 +37,30 @@ function AcceptInviteContent() {
       try {
         // Check if already authenticated
         const { data: { session } } = await supabase?.auth.getSession() ?? { data: { session: null } };
+        const demoMode = process.env.NEXT_PUBLIC_DEMO_MODE === 'true';
 
-        if (!session && !isDemoMode()) {
-          // Not authenticated — redirect to signup with the invite token
-          // so they can create a real account, then the signup page will
-          // accept the invite after account creation.
+        // Use the shared decision function (extracted from supabase.ts) so the
+        // invite-redirect logic is testable without rendering the page.
+        const decision = decideInviteAction(token, !!session, demoMode);
+
+        if (decision.action === 'error') {
+          setStatus('error');
+          setMessage('No invite token provided. Check your invite link and try again.');
+          return;
+        }
+
+        if (decision.action === 'needs_auth') {
+          setAuthUrls({ signupUrl: decision.signupUrl, loginUrl: decision.loginUrl });
           setStatus('needs-auth');
           return;
         }
 
-        // Authenticated (or demo mode) — accept the invite
+        // decision.action === 'accept' — call /api/invites/accept
         setStatus('accepting');
         const response = await fetch('/api/invites/accept', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token }),
+          body: JSON.stringify({ token: decision.token }),
         });
 
         const data = await response.json();
@@ -83,14 +95,14 @@ function AcceptInviteContent() {
           </p>
           <div className="space-y-3">
             <button
-              onClick={() => router.push(`/signup?invite=${token}`)}
+              onClick={() => router.push(authUrls.signupUrl)}
               className="w-full bg-amber-500 hover:bg-amber-600 text-black font-bold py-2.5 rounded-lg text-sm uppercase tracking-wider transition-all flex items-center justify-center gap-2 cursor-pointer"
             >
               <UserPlus className="w-4 h-4" />
               Create Account
             </button>
             <button
-              onClick={() => router.push(`/login?redirect=/accept-invite?token=${token}`)}
+              onClick={() => router.push(authUrls.loginUrl)}
               className="w-full bg-transparent border border-gray-700 hover:border-gray-600 text-gray-300 font-bold py-2.5 rounded-lg text-sm uppercase tracking-wider transition-all flex items-center justify-center gap-2 cursor-pointer"
             >
               <LogIn className="w-4 h-4" />

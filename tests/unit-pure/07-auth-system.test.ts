@@ -28,7 +28,6 @@ import {
 // ---------------------------------------------------------------------------
 function mockLocation(pathname: string = '/dashboard') {
   const href = `http://localhost:3000${pathname}`;
-  // @ts-expect-error — partial mock of window.location
   const original = window.location;
   const mock = {
     pathname,
@@ -40,14 +39,12 @@ function mockLocation(pathname: string = '/dashboard') {
     reload: vi.fn(),
     toString: () => href,
   };
-  // @ts-expect-error — partial mock
   Object.defineProperty(window, 'location', {
     value: mock,
     writable: true,
     configurable: true,
   });
   return () => {
-    // @ts-expect-error — restore
     Object.defineProperty(window, 'location', { value: original, writable: true, configurable: true });
   };
 }
