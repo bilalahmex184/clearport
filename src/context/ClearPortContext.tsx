@@ -48,7 +48,7 @@ interface ClearPortContextType {
   theme: 'dark' | 'light';
   supabaseStatus: SupabaseStatus;
   edgeFunctionStatus: EdgeFunctionStatus;
-  currentUser: string;
+  currentUser: string | null;
   currentTime: string;
   // RBAC role for the current user — fetched from /api/organizations on
   // load (reflects the user's role in their active org). Defaults to
@@ -103,7 +103,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     isSupabaseConfigured() ? 'loading' : 'unconfigured'
   );
   const [edgeFunctionStatus, setEdgeFunctionStatus] = React.useState<EdgeFunctionStatus>('unknown');
-  const [currentUser, setCurrentUser] = React.useState<string>('Broker');
+  const [currentUser, setCurrentUser] = React.useState<string | null>(null);
   const [currentTime, setCurrentTime] = React.useState<string>('');
   // Initial value 'operator' preserves the no-login UX. The real role is
   // fetched from /api/organizations on load (see loadData below).
@@ -472,7 +472,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             const updatedVal = newValue !== undefined ? newValue : ex.extractedValue;
 
             const historyItem: ExceptionHistoryEntry = {
-              user: currentUser,
+              user: currentUser || 'unknown',
               oldValue: oldVal,
               newValue: updatedVal,
               timestamp: new Date().toISOString(),
@@ -485,7 +485,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               correctedValue: status === 'Corrected' ? newValue : undefined,
               history: [historyItem, ...ex.history],
               resolvedAt: new Date().toISOString(),
-              resolvedBy: currentUser,
+              resolvedBy: currentUser || undefined,
             };
           });
 
@@ -624,7 +624,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           if (ex.status === 'Unresolved' && ex.confidence >= cutoff) {
             acceptedCount++;
             const historyItem: ExceptionHistoryEntry = {
-              user: currentUser,
+              user: currentUser || 'unknown',
               oldValue: ex.extractedValue,
               newValue: ex.extractedValue,
               timestamp: new Date().toISOString(),
@@ -635,7 +635,7 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               status: 'Accepted' as ExceptionStatus,
               history: [historyItem, ...ex.history],
               resolvedAt: new Date().toISOString(),
-              resolvedBy: currentUser,
+              resolvedBy: currentUser || undefined,
             };
           }
           return ex;

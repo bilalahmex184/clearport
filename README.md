@@ -146,3 +146,40 @@ This pipeline runs at **$0/month** at the current 10-user MVP scale:
 
 The only paid cost that could arise is if Gemini volume exceeds the free tier — at which point a paid Gemini plan is the sole incremental expense. No other part of the stack has a per-request or per-user cost.
 
+## CORS Configuration
+
+Every Supabase edge function in this repo (`supabase/functions/*/index.ts`) sets its `Access-Control-Allow-Origin` header from the `ALLOWED_ORIGIN` environment variable:
+
+```ts
+"Access-Control-Allow-Origin": Deno.env.get("ALLOWED_ORIGIN") || "*",
+```
+
+**Production requirement — set `ALLOWED_ORIGIN` on every edge function before going live:**
+
+```bash
+npx supabase secrets set ALLOWED_ORIGIN=https://app.clearport.com
+# Re-deploy each function so the new secret is picked up.
+for fn in upload-document extract-document cross-validate schema-validate \
+          math-validate flag-exceptions get-shipments update-exception \
+          batch-accept export-csv get-document-url; do
+  npx supabase functions deploy $fn --no-verify-jwt
+done
+```
+
+The value MUST be the exact origin of your deployed frontend (e.g. `https://app.clearport.com`):
+- No trailing slash.
+- No wildcards (Supabase's CORS helper doesn't do origin-pattern matching — it echoes the literal value).
+- No scheme mismatch (`https://` vs `http://` must match what the browser sends in the `Origin` header).
+
+**The default `"*"` fallback is intentional for local dev only.** It exists so the app boots with zero configuration when you're running `bun run dev` against a local Supabase instance — the gateway config in `supabase/config.toml` matches. Leaving `"*"` in a deployment reachable on the public internet is a security hole: it lets any website make authenticated cross-origin requests against your edge functions using the browser's Supabase session. The `.env.example` file warns about this explicitly next to the `ALLOWED_ORIGIN` entry.
+
+Verify the deployed value with:
+```bash
+curl -sI -X OPTIONS \
+  -H "Origin: https://attacker.example" \
+  -H "Access-Control-Request-Method: POST" \
+  https://your-project.supabase.co/functions/v1/upload-document \
+  | grep -i 'access-control-allow-origin'
+# Should print the configured origin (NOT "*") in production.
+```
+

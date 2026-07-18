@@ -14,6 +14,7 @@ import BrokerTemplates from '@/components/clearport/BrokerTemplates';
 import TeamManagement from '@/components/clearport/TeamManagement';
 import SupabaseSyncPanel from '@/components/clearport/SupabaseSyncPanel';
 import AlertBanner from '@/components/clearport/AlertBanner';
+import ErrorBoundary from '@/components/clearport/ErrorBoundary';
 import {
   Shield,
   Cpu,
@@ -31,8 +32,10 @@ import {
   X,
   Wifi,
   WifiOff,
+  LogOut,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { supabase } from '@/lib/supabase';
 
 function AppShell() {
   const {
@@ -127,10 +130,20 @@ function AppShell() {
     return item ? item.label : 'ClearPort';
   };
 
-  // Shorten user display
-  const userDisplay = currentUser.includes('@')
-    ? currentUser.split('@')[0]
-    : currentUser;
+  // Logout — signs out of Supabase and redirects to /login
+  const handleLogout = async () => {
+    try {
+      await supabase?.auth.signOut();
+    } catch (err) {
+      console.warn('[auth] signOut error:', err);
+    }
+    window.location.href = '/login';
+  };
+
+  // Shorten user display (handle null — user may not be logged in yet)
+  const userDisplay = currentUser
+    ? (currentUser.includes('@') ? currentUser.split('@')[0] : currentUser)
+    : 'Guest';
   const userInitials = userDisplay.slice(0, 2).toUpperCase();
 
   const sidebarContent = (
@@ -207,12 +220,28 @@ function AppShell() {
           }`}>
             {userInitials}
           </div>
-          <div className="overflow-hidden">
+          <div className="overflow-hidden flex-1 min-w-0">
             <span className={`text-[11px] font-bold block truncate ${
               theme === 'light' ? 'text-gray-700' : 'text-gray-300'
-            }`}>{userDisplay}</span>
-            <span className="text-[9px] text-gray-500 font-mono block leading-none mt-0.5">Customs Broker</span>
+            }`} title={currentUser || undefined}>{userDisplay}</span>
+            <span className="text-[9px] text-gray-500 font-mono block leading-none mt-0.5">
+              {currentUser ? 'Signed in' : 'Not signed in'}
+            </span>
           </div>
+          {/* Logout button — visible only when authenticated */}
+          {currentUser && (
+            <button
+              onClick={handleLogout}
+              title="Sign out"
+              className={`p-1.5 rounded-md transition-all cursor-pointer shrink-0 ${
+                theme === 'light'
+                  ? 'hover:bg-gray-200 text-gray-500 hover:text-gray-700'
+                  : 'hover:bg-gray-900 text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              <LogOut className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
 
         <div className={`flex items-center justify-between text-[10px] font-mono border-t pt-2 ${
@@ -526,7 +555,14 @@ export default function MasterPage() {
 
   return (
     <ClearPortProvider>
-      <AppShell />
+      {/* §7: ErrorBoundary catches render-time exceptions in the AppShell
+          subtree, reports them to Sentry, and shows a graceful dark-theme
+          fallback UI with a Reload button instead of a white screen. Mounted
+          INSIDE ClearPortProvider so the provider itself is not unmounted by
+          the boundary (the provider owns Supabase auth state). */}
+      <ErrorBoundary>
+        <AppShell />
+      </ErrorBoundary>
     </ClearPortProvider>
   );
 }

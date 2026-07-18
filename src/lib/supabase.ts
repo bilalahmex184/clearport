@@ -49,48 +49,84 @@ export function isSupabaseConfigured(): boolean {
 }
 
 // ============================================================================
-// AUTH — anonymous sign-in (preserves no-login UX, enables RLS)
+// AUTH — real accounts (email/password), with optional demo mode
+// ============================================================================
+// Production: users sign in via /login (supabase.auth.signInWithPassword)
+// or sign up via /signup (supabase.auth.signUp). The proxy (src/proxy.ts)
+// redirects unauthenticated users to /login on protected routes.
+//
+// Demo mode: if NEXT_PUBLIC_DEMO_MODE=true, ensureAuthenticated() falls back
+// to anonymous sign-in so the app works without a login page (for local
+// demos / CI smoke tests). Defaults to OFF — anonymous sign-in is never used
+// in production unless explicitly enabled.
 // ============================================================================
 
+const DEMO_MODE = process.env.NEXT_PUBLIC_DEMO_MODE === 'true';
 let _anonSignInPromise: Promise<boolean> | null = null;
 
+/**
+ * Ensure the client has an authenticated session.
+ *
+ * In production (default): returns true if there's a real session, false
+ * otherwise. Does NOT auto-create anonymous sessions — the caller (page/proxy)
+ * is responsible for redirecting to /login if false.
+ *
+ * In demo mode (NEXT_PUBLIC_DEMO_MODE=true): falls back to anonymous sign-in
+ * so the app works without a login page. This is for local demos only.
+ */
 export async function ensureAuthenticated(): Promise<boolean> {
   const client = getSupabase();
   if (!client) return false;
 
   try {
-    // Check if already has a session
     const { data: { session } } = await client.auth.getSession();
     if (session) return true;
 
-    // Sign in anonymously (dedupe concurrent calls)
-    if (!_anonSignInPromise) {
-      _anonSignInPromise = client.auth.signInAnonymously()
-        .then(({ data, error }) => {
-          if (error) {
-            console.warn('[auth] anonymous sign-in failed:', error.message);
-            return false;
-          }
-          return !!data.session;
-        })
-        .finally(() => {
-          _anonSignInPromise = null;
-        });
+    // Demo mode only: auto-create anonymous sessions
+    if (DEMO_MODE) {
+      if (!_anonSignInPromise) {
+        _anonSignInPromise = client.auth.signInAnonymously()
+          .then(({ data, error }) => {
+            if (error) {
+              console.warn('[auth] demo-mode anonymous sign-in failed:', error.message);
+              return false;
+            }
+            return !!data.session;
+          })
+          .finally(() => {
+            _anonSignInPromise = null;
+          });
+      }
+      return _anonSignInPromise;
     }
-    return _anonSignInPromise;
+
+    // Production: no session, no demo mode → not authenticated
+    return false;
   } catch (err) {
     console.warn('[auth] ensureAuthenticated error:', err);
     return false;
   }
 }
 
-export async function getCurrentUserEmail(): Promise<string> {
+/**
+ * Returns the current authenticated user's email, or a placeholder only in
+ * demo mode. In production, returns null if no session (caller should
+ * redirect to /login).
+ */
+export async function getCurrentUserEmail(): Promise<string | null> {
   const client = getSupabase();
-  if (!client) return 'demo@clearport.local';
+  if (!client) return DEMO_MODE ? 'demo@clearport.local' : null;
   const { data: { user } } = await client.auth.getUser();
   if (user?.email) return user.email;
-  if (user?.id) return `anon-${user.id.slice(0, 8)}@clearport.local`;
-  return 'demo@clearport.local';
+  if (DEMO_MODE && user?.id) return `anon-${user.id.slice(0, 8)}@clearport.local`;
+  return DEMO_MODE ? 'demo@clearport.local' : null;
+}
+
+/**
+ * Check if demo mode is enabled (anonymous sign-in fallback).
+ */
+export function isDemoMode(): boolean {
+  return DEMO_MODE;
 }
 
 // ============================================================================

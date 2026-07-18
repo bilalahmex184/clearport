@@ -18,7 +18,7 @@ export default function OperationalRules() {
     updateRules({ [category]: value });
   };
 
-  const userDisplay = currentUser.includes('@') ? currentUser : 'Broker';
+  const userDisplay = currentUser && currentUser.includes('@') ? currentUser : 'Broker';
 
   return (
     <div className="space-y-4 sm:space-y-6 overflow-y-auto h-full pb-6 sm:pb-8 pr-1 sm:pr-2 p-3 sm:p-4 md:p-6 font-sans">

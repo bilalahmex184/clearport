@@ -26,23 +26,46 @@ import {
 import { toErrorResponse, getHttpStatus, ClearPortError } from '@/lib/errors';
 
 // ---------------------------------------------------------------------------
+// Public routes — no auth required
+// ---------------------------------------------------------------------------
+// These routes are accessible without a session: the auth pages themselves,
+// the legal pages, and the invite-acceptance flow (which handles its own auth).
+const PUBLIC_ROUTES = new Set([
+  '/login',
+  '/signup',
+  '/reset-password',
+  '/accept-invite',
+  '/terms',
+  '/privacy',
+  '/legal',
+]);
+
+function isPublicRoute(pathname: string): boolean {
+  // Exact match for static public routes
+  if (PUBLIC_ROUTES.has(pathname)) return true;
+  // API routes handle their own auth (Bearer token check in requireOrgRole)
+  if (pathname.startsWith('/api/')) return true;
+  // Next.js internal routes
+  if (pathname.startsWith('/_next/')) return true;
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Next.js Middleware (runs on every matched request)
 // ---------------------------------------------------------------------------
 
 /**
- * Next.js middleware entry point. Activated by `src/middleware.ts`.
+ * Next.js middleware entry point. Activated by `src/proxy.ts`.
  *
- * Lightweight: generates a request_id, logs the request line, stamps the
- * response with `X-Request-Id`, and propagates the id to upstream API routes
- * via the `x-request-id` header so route handlers can correlate logs.
- *
- * No auth, no DB, no body parsing — those concerns belong to route handlers.
+ * Two concerns:
+ *   1. Request observability: generates a request_id, logs the request line,
+ *      stamps the response with X-Request-Id, and propagates the id to
+ *      downstream API routes via the x-request-id header.
+ *   2. Auth guard: checks for a Supabase session on non-public routes. If no
+ *      session (and demo mode is off), redirects to /login. API routes handle
+ *      their own auth (Bearer token), so they're exempt.
  */
-export function requestMiddleware(req: NextRequest): NextResponse {
-  // crypto.randomUUID() is available globally in both Node 19+ and the Edge
-  // runtime. We avoid `import { randomUUID } from 'crypto'` because that
-  // Node-only import breaks Edge compilation if Next.js ever flips this app
-  // to the Edge runtime for middleware.
+export async function requestMiddleware(req: NextRequest): Promise<NextResponse> {
   const requestId =
     typeof crypto !== 'undefined' && 'randomUUID' in crypto
       ? crypto.randomUUID()
@@ -57,13 +80,36 @@ export function requestMiddleware(req: NextRequest): NextResponse {
     request_id: requestId,
     method,
     path,
-    // Don't log query strings or headers — may contain PII / tokens.
   });
 
   // Propagate request_id to downstream route handlers via a custom header
-  // so they can include it in their own log lines + error responses.
   const requestHeaders = new Headers(req.headers);
   requestHeaders.set('x-request-id', requestId);
+
+  // ── Auth guard ──
+  // Check for a Supabase session on non-public, non-API routes. If no session
+  // and demo mode is off, redirect to /login.
+  if (!isPublicRoute(path)) {
+    const demoMode = process.env.NEXT_PUBLIC_DEMO_MODE === 'true';
+    if (!demoMode) {
+      // Read the session token from the supabase auth cookie. The cookie name
+      // follows the pattern sb-<project-ref>-auth-token. We check for its
+      // presence — the actual session validation happens server-side in the
+      // API routes via requireOrgRole(). This is just a redirect guard to
+      // avoid a flash of "logged out" content.
+      const hasAuthCookie = req.cookies.getAll().some(c =>
+        c.name.startsWith('sb-') && c.name.includes('auth-token')
+      );
+
+      if (!hasAuthCookie) {
+        const loginUrl = new URL('/login', req.url);
+        loginUrl.searchParams.set('redirect', path);
+        const redirectResponse = NextResponse.redirect(loginUrl);
+        redirectResponse.headers.set('X-Request-Id', requestId);
+        return redirectResponse;
+      }
+    }
+  }
 
   const response = NextResponse.next({
     request: { headers: requestHeaders },

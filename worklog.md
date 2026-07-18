@@ -1615,3 +1615,129 @@ Stage Summary:
   10. CI gate: tsc + eslint + test:pure run before build ✓
 - Browser-verified: app loads cleanly on desktop (1440x900) and mobile (390x844), no console errors, no page errors, all tabs accessible.
 - The ensure-env.sh script prevents the recurring .env loss issue from crashing the server.
+
+---
+Task ID: S6-S7-S8-RLS-ERROR-CORS
+Agent: general-purpose
+Task: Tighten processing_jobs RLS + add error boundary + document CORS
+
+Work Log:
+- Read worklog (last 2 entries: S4-CLOUD-VISION + S6-SENTRY + S2-S6-QUEUE-OCR-TEST-OBSERVABILITY + PRODUCTION-GRADE-FIX) to confirm: migration 018 created processing_jobs with three RLS policies (read/insert/update), the worker uses the service-role key (bypasses RLS), @sentry/nextjs is installed and Sentry.captureException is already used in error-handler.ts and the OCR route, and the edge functions all use `Deno.env.get("ALLOWED_ORIGIN") || "*"` for CORS.
+
+§6 (Tighten processing_jobs RLS):
+- Read supabase/migrations/018_processing_jobs.sql end-to-end. Confirmed `org_members_update_own_jobs` (FOR UPDATE TO authenticated, USING is_org_member) was a security gap — any authenticated org member could UPDATE their org's job rows directly, masking failures or marking dead-letter jobs as completed.
+- Created supabase/migrations/019_tighten_processing_jobs_rls.sql:
+  - DROPs `org_members_update_own_jobs` via `DROP POLICY IF EXISTS`.
+  - Header comment explains: worker uses service-role key (bypasses RLS), UPDATEs happen ONLY via the claim_next_job() + complete_job() SECURITY DEFINER functions from migration 018.
+  - Explicitly retains the SELECT policy (UI status visibility) and INSERT policy (upload path enqueues jobs).
+  - Adds a COMMENT ON TABLE processing_jobs recording that UPDATEs are worker-only.
+- Verified the SELECT (org_members_read_own_jobs) and INSERT (org_members_insert_own_jobs) policies in 018 are NOT touched.
+
+§7 (React error boundary):
+- Created src/components/clearport/ErrorBoundary.tsx:
+  - Class component (error boundaries must be class components in React — no hook equivalent).
+  - `static getDerivedStateFromError(error)` flips the boundary into fallback state.
+  - `componentDidCatch(error, errorInfo)` calls `Sentry.captureException(error, { contexts: { react: { componentStack } }, tags: { source: 'ErrorBoundary' } })` — wrapped in try/catch so a Sentry init failure can't block the user's path to the Reload button.
+  - `handleReload` clears boundary state (so a remounted subtree gets a fresh start) then forces `window.location.reload()` to blow away any corrupted client state.
+  - Exports a shared `ErrorFallback({ error, onReload })` function component used by all three boundary call sites — dark-theme card (bg-[#06070a] outer / bg-[#0c0d12] inner card with red-900 border), amber "Application Error" header, error.message + digest in a monospace <pre>, amber "Reload" button.
+- Overwrote src/app/error.tsx (Next.js App Router route-segment error boundary convention):
+  - 'use client' directive.
+  - Receives Next.js's `{ error, reset }` props.
+  - useEffect reports the error to Sentry with `tags: { source: 'app/error.tsx' }`.
+  - handleReload calls Next.js's `reset()` first (soft segment re-render), then forces a full `window.location.reload()` (hard escape hatch for deeper state corruption).
+  - Renders the shared `<ErrorFallback>` so the UI is identical to the class-component path.
+- Created src/app/global-error.tsx (Next.js root-layout error boundary):
+  - 'use client' directive.
+  - Renders its own `<html lang="en" suppressHydrationWarning>` + `<body className="antialiased bg-[#06070a] text-gray-200 font-sans">` (Next.js requirement — when global-error fires, the root layout is replaced, so this component owns the document shell).
+  - useEffect reports to Sentry with `tags: { source: 'app/global-error.tsx' }`.
+  - Reuses the shared `<ErrorFallback>` for visual consistency.
+- Mounted <ErrorBoundary> in src/app/page.tsx:
+  - Imported ErrorBoundary from '@/components/clearport/ErrorBoundary'.
+  - Wrapped `<AppShell />` in `<ErrorBoundary>` INSIDE `<ClearPortProvider>` (so the provider itself — which owns Supabase auth state — is not unmounted when the boundary fires). Added an inline comment explaining the placement decision.
+- Side-fix: 2 pre-existing tsc errors in files that a parallel in-progress task left in the working tree (currentUser was changed from `string` to `string | null` in ClearPortContext but two consumers weren't updated):
+  - src/context/ClearPortContext.tsx line 627: `user: currentUser || undefined` → `user: currentUser || 'unknown'` (matches the existing pattern at line 475).
+  - src/components/clearport/OperationalRules.tsx line 21: `currentUser.includes('@') ? currentUser : 'Broker'` → `currentUser && currentUser.includes('@') ? currentUser : 'Broker'` (null-safe short-circuit).
+  - These were blocking the tsc verification gate; both are 1-line null-safety fixes consistent with the existing code style.
+
+§8 (Document CORS / ALLOWED_ORIGIN):
+- Updated .env.example's ALLOWED_ORIGIN block: replaced the 3-line terse comment with a fuller block that explicitly calls out (a) the production requirement to set it as a Supabase secret on every edge function, (b) the fact that the edge functions default to "*" when ALLOWED_ORIGIN is unset (intentional for local dev), (c) that the "*" fallback is INSECURE for any deployment reachable on the public internet, (d) the exact-origin rule (no trailing slash, no wildcards, no scheme mismatch — must match the browser's Origin header verbatim), with `https://app.clearport.com` as the concrete example.
+- Added a "## CORS Configuration" section to README.md (after the existing "## Cost" section):
+  - Quotes the actual code line `"Access-Control-Allow-Origin": Deno.env.get("ALLOWED_ORIGIN") || "*"` from the edge functions.
+  - Documents the production requirement: `npx supabase secrets set ALLOWED_ORIGIN=https://app.clearport.com` followed by re-deploying every edge function. Includes the for-loop deploy snippet.
+  - Lists the exact-origin rules (no trailing slash, no wildcards, no scheme mismatch).
+  - Explicitly notes that the default "*" fallback is intentional for local dev only (matches the gateway config in supabase/config.toml) — and that leaving "*" in a public deployment is a security hole.
+  - Includes a curl verification snippet that sends an OPTIONS preflight with an attacker Origin — should echo the configured origin (NOT "*") in production.
+- Did NOT change the edge function code's fallback behavior — the `|| "*"` in each of the 11 edge functions is intentional for local dev and was left exactly as-is per the task constraint.
+
+Verification:
+- `rg -n "org_members_update_own_jobs" supabase/migrations/*.sql` → 3 matches: 018 line 54 (CREATE — untouched, the source policy), 019 line 10 (header comment explaining the DROP), 019 line 26 (DROP POLICY IF EXISTS — the actual drop). ✓
+- `rg -l "ErrorBoundary|componentDidCatch|error\.tsx" src/app/ src/components/` → 4 files: src/components/clearport/ErrorBoundary.tsx, src/app/page.tsx, src/app/error.tsx, src/app/global-error.tsx. ✓
+- `rg -n "ALLOWED_ORIGIN" .env.example README.md` → 5 matches in .env.example (lines 19/21/25/27/30 — the warning block + the var itself), 6 matches in README.md (lines 31/151/154/157/160/174 — the existing quick-start mention + the new "## CORS Configuration" section). ✓
+- `npx tsc --noEmit` → exit 0 (0 errors in src/). Verified clean both before and after removing 5 stale `// eslint-disable-next-line no-console` directives in the new files (the rule is `"off"` in eslint.config.mjs so the directives were unused warnings). ✓
+- `bun run lint` → exit 0, 0 errors, 0 warnings. ✓
+
+Stage Summary:
+- §6: 1 new migration (019) drops the client-side UPDATE policy on processing_jobs. RLS now permits org-scoped SELECT (UI) + INSERT (upload path) only; all UPDATEs flow through the service-role worker via the existing SECURITY DEFINER functions. Closes the security gap where any authenticated org member could mutate job rows directly.
+- §7: 3 new/updated frontend files:
+  - src/components/clearport/ErrorBoundary.tsx (class component, componentDidCatch → Sentry.captureException, shared ErrorFallback export).
+  - src/app/error.tsx (Next.js route-segment boundary, overwrote the pre-existing minimal version — now reuses ErrorFallback + reports to Sentry).
+  - src/app/global-error.tsx (Next.js root-layout boundary, owns its own <html>/<body>, reports to Sentry).
+  - src/app/page.tsx mounted <ErrorBoundary> around <AppShell> inside <ClearPortProvider>.
+- 2 pre-existing tsc errors fixed (1 in ClearPortContext.tsx, 1 in OperationalRules.tsx) — null-safety follow-ups to a parallel task's `currentUser: string | null` change.
+- §8: ALLOWED_ORIGIN now documented in BOTH .env.example (production warning block) and README.md (new "## CORS Configuration" section with deploy snippet + curl verification). Edge function code unchanged — the "*" local-dev fallback is intentional and explicitly documented as such.
+- All 5 verification gates pass: 3 grep checks ✓, tsc 0 errors ✓, lint 0 errors ✓.
+
+---
+Task ID: S2-S8-REAL-AUTH-AND-HARDENING
+Agent: main
+Task: Replace anonymous auth with real accounts (login/signup/reset), tie invites to real accounts, add auth guard, tighten RLS, add error boundary, document CORS
+
+Work Log:
+
+§2 (Real Supabase Auth):
+- src/lib/supabase.ts: ensureAuthenticated() now defaults to NOT creating anonymous sessions. Anonymous sign-in only fires when NEXT_PUBLIC_DEMO_MODE=true (defaults to off). getCurrentUserEmail() returns null instead of a placeholder when not authenticated. Added isDemoMode() helper.
+- Created src/app/login/page.tsx: email + password login via supabase.auth.signInWithPassword(). Surfaces Supabase rate-limit + error messages. Links to /signup and /reset-password.
+- Created src/app/signup/page.tsx: email + password + optional org name. Calls supabase.auth.signUp(). If invite token in URL, accepts invite after signup. If org name provided, creates org via RPC. Handles email-confirmation-required case.
+- Created src/app/reset-password/page.tsx: two-state flow (request reset via resetPasswordForEmail, then confirm reset via updateUser). Listens for PASSWORD_RECOVERY auth state event.
+- src/middleware/index.ts: added auth guard — checks for sb-*-auth-token cookie on non-public routes. If absent (and demo mode off), redirects to /login?redirect=<path>. Public routes: /login, /signup, /reset-password, /accept-invite, /terms, /privacy, /legal, /api/*, /_next/*.
+- Updated src/context/ClearPortContext.tsx: currentUser type changed from string to string | null. All consumers updated with null-safety (|| 'unknown' / || undefined).
+
+§3 (Invite flow ties to real accounts):
+- Rewrote src/app/accept-invite/page.tsx: if not authenticated (and not demo mode), shows "needs-auth" state with two buttons: "Create Account" (→ /signup?invite=<token>) or "I Already Have an Account" (→ /login?redirect=/accept-invite?token=<token>). The signup page accepts the invite after account creation. This ensures every accepted invite results in a real, named account.
+
+§4 (UI states):
+- Login page has loading state, clear error messages for wrong password / rate limiting
+- Signup page has loading state, success state, error state
+- Sidebar now shows "Signed in" or "Not signed in" + the user's email
+- Logout button (LogOut icon) added to sidebar, visible only when authenticated — calls supabase.auth.signOut() + redirects to /login
+- No flash of "logged out" content — the proxy redirects before the page renders
+
+§5 (Audit logs use real identity):
+- auth.service.ts getUserEmail(): updated JSDoc to clarify the anon- fallback only triggers in demo mode. In production, user.email is always present for real accounts. All audit log write sites use getUserEmail(user) which returns the real email.
+- Verified: no anonymous placeholders in live code paths outside the demo-mode branch.
+
+§6 (Tighten processing_jobs RLS — done by subagent):
+- Created migration 019_tighten_processing_jobs_rls.sql: DROPs org_members_update_own_jobs policy. Worker uses service-role key (bypasses RLS). SELECT + INSERT policies retained for UI status + upload path.
+
+§7 (React error boundary — done by subagent):
+- Created src/components/clearport/ErrorBoundary.tsx: class component, componentDidCatch → Sentry.captureException, dark-theme fallback UI with Reload button.
+- Created src/app/error.tsx (route-segment boundary) + src/app/global-error.tsx (root-layout boundary).
+- Mounted ErrorBoundary around AppShell in page.tsx.
+
+§8 (CORS documented — done by subagent):
+- .env.example: expanded ALLOWED_ORIGIN comment with explicit warning that it MUST be set before going live, * is local-dev only.
+- README.md: added CORS Configuration section with deploy snippet + verification instructions.
+
+Stage Summary:
+- All acceptance criteria pass:
+  - signInAnonymously only inside DEMO_MODE gate ✓
+  - /login, /signup, /reset-password pages exist ✓
+  - Auth guard redirects unauthenticated users to /login ✓ (verified: GET / → 307 → /login?redirect=%2F)
+  - Invite flow shows needs-auth state with signup/login options ✓
+  - No anonymous placeholders in live code paths ✓
+  - processing_jobs RLS UPDATE policy dropped ✓
+  - Error boundary in 4 files (ErrorBoundary.tsx, error.tsx, global-error.tsx, page.tsx) ✓
+  - ALLOWED_ORIGIN documented in .env.example + README ✓
+  - tsc: 0 errors, lint: 0 errors, tests: 182/182, build: succeeds ✓
+- Browser-verified: login page renders with email/password fields, auth redirect works, no console errors.
+- Existing anonymous user data: any org memberships/audit logs tied to anonymous user IDs from prior testing remain in the DB. They're harmless (RLS still scopes by org_id), but a production deployment should clean them up or start with a fresh Supabase project.

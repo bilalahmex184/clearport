@@ -1,15 +1,26 @@
+// ============================================================================
+// /accept-invite — Accept an org invite (tied to real accounts)
+// ============================================================================
+// Flow:
+//   1. If already logged in → accept the invite immediately
+//   2. If not logged in → show login/signup options, then accept after auth
+//
+// This ensures every accepted invite results in a real, named account being
+// added to organization_members — not an anonymous session.
+// ============================================================================
+
 'use client';
 
 import * as React from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { supabase, ensureAuthenticated } from '@/lib/supabase';
-import { CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
+import { supabase, isDemoMode } from '@/lib/supabase';
+import { CheckCircle2, AlertCircle, Loader2, LogIn, UserPlus, Mail } from 'lucide-react';
 
 function AcceptInviteContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const token = searchParams.get('token');
-  const [status, setStatus] = React.useState<'loading' | 'success' | 'error'>('loading');
+  const [status, setStatus] = React.useState<'checking' | 'accepting' | 'success' | 'error' | 'needs-auth'>('checking');
   const [message, setMessage] = React.useState('');
 
   React.useEffect(() => {
@@ -21,14 +32,19 @@ function AcceptInviteContent() {
 
     (async () => {
       try {
-        await ensureAuthenticated();
-        const session = await supabase?.auth.getSession();
-        if (!session?.data?.session) {
-          setStatus('error');
-          setMessage('Please sign in first, then click the invite link again.');
+        // Check if already authenticated
+        const { data: { session } } = await supabase?.auth.getSession() ?? { data: { session: null } };
+
+        if (!session && !isDemoMode()) {
+          // Not authenticated — redirect to signup with the invite token
+          // so they can create a real account, then the signup page will
+          // accept the invite after account creation.
+          setStatus('needs-auth');
           return;
         }
 
+        // Authenticated (or demo mode) — accept the invite
+        setStatus('accepting');
         const response = await fetch('/api/invites/accept', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -52,14 +68,55 @@ function AcceptInviteContent() {
     })();
   }, [token, router]);
 
+  // Needs-auth state: show login/signup options
+  if (status === 'needs-auth') {
+    return (
+      <div className="min-h-screen bg-[#06070a] flex items-center justify-center p-4 font-sans">
+        <div className="max-w-md w-full bg-[#0c0d12] border border-gray-900 rounded-xl p-8 text-center">
+          <div className="w-14 h-14 bg-amber-500 rounded-2xl flex items-center justify-center font-bold text-black text-2xl tracking-tighter mx-auto mb-4 shadow-xl">
+            CP
+          </div>
+          <Mail className="w-10 h-10 text-amber-500 mx-auto mb-4" />
+          <h2 className="text-sm font-bold text-gray-200 uppercase tracking-wider mb-2">You&apos;ve Been Invited!</h2>
+          <p className="text-xs text-gray-500 mt-2 mb-6">
+            Create an account or sign in to accept your invitation and join the organization.
+          </p>
+          <div className="space-y-3">
+            <button
+              onClick={() => router.push(`/signup?invite=${token}`)}
+              className="w-full bg-amber-500 hover:bg-amber-600 text-black font-bold py-2.5 rounded-lg text-sm uppercase tracking-wider transition-all flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <UserPlus className="w-4 h-4" />
+              Create Account
+            </button>
+            <button
+              onClick={() => router.push(`/login?redirect=/accept-invite?token=${token}`)}
+              className="w-full bg-transparent border border-gray-700 hover:border-gray-600 text-gray-300 font-bold py-2.5 rounded-lg text-sm uppercase tracking-wider transition-all flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <LogIn className="w-4 h-4" />
+              I Already Have an Account
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="min-h-screen bg-[#06070a] flex items-center justify-center p-6">
+    <div className="min-h-screen bg-[#06070a] flex items-center justify-center p-4 font-sans">
       <div className="max-w-md w-full bg-[#0c0d12] border border-gray-900 rounded-xl p-8 text-center">
-        {status === 'loading' && (
+        {status === 'checking' && (
+          <>
+            <Loader2 className="w-12 h-12 text-amber-500 animate-spin mx-auto mb-4" />
+            <h2 className="text-sm font-bold text-gray-200 uppercase tracking-wider">Checking Invite...</h2>
+            <p className="text-xs text-gray-500 mt-2">Please wait while we verify your invitation.</p>
+          </>
+        )}
+        {status === 'accepting' && (
           <>
             <Loader2 className="w-12 h-12 text-amber-500 animate-spin mx-auto mb-4" />
             <h2 className="text-sm font-bold text-gray-200 uppercase tracking-wider">Accepting Invite...</h2>
-            <p className="text-xs text-gray-500 mt-2">Please wait while we process your invitation.</p>
+            <p className="text-xs text-gray-500 mt-2">Adding you to the organization.</p>
           </>
         )}
         {status === 'success' && (
@@ -75,8 +132,8 @@ function AcceptInviteContent() {
             <AlertCircle className="w-12 h-12 text-red-400 mx-auto mb-4" />
             <h2 className="text-sm font-bold text-red-400 uppercase tracking-wider">Invite Error</h2>
             <p className="text-xs text-gray-400 mt-2">{message}</p>
-            <button onClick={() => router.push('/')} className="mt-6 text-xs bg-amber-500 hover:bg-amber-600 text-black font-bold px-4 py-2 rounded-lg transition-all">
-              Go to Dashboard
+            <button onClick={() => router.push('/login')} className="mt-6 text-xs bg-amber-500 hover:bg-amber-600 text-black font-bold px-4 py-2 rounded-lg transition-all cursor-pointer">
+              Go to Login
             </button>
           </>
         )}

@@ -84,6 +84,11 @@ export async function requireUserClient(
 
 /**
  * Best-effort user email for audit logging.
+ *
+ * In production (real auth), user.email is always present — the `anon-` fallback
+ * only triggers for anonymous sessions (demo mode) or edge cases where the auth
+ * provider didn't set an email. The fallback makes it clear in audit logs that
+ * the actor was anonymous, not a real named user.
  */
 export function getUserEmail(user: User): string {
   if (user.email) return user.email;
