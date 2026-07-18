@@ -60,8 +60,9 @@ interface HealthResponse {
 const TIER_LABELS: Record<number, string> = {
   1: 'Gemini Vision',
   2: 'PDF Text Layer',
-  3: 'Tesseract OCR',
-  4: 'Manual Review',
+  3: 'Cloud Vision OCR',
+  4: 'Tesseract OCR',
+  5: 'Manual Review',
 };
 
 function formatRelativeTime(iso: string): string {

@@ -12,8 +12,9 @@
 //   Doc: invoice.pdf (Commercial Invoice)
 //     Tier 1  gemini_vision        SUCCESS   823ms   model:gemini-2.5-pro   8 fields
 //     Tier 2  pdf_text_layer       SKIPPED   —       Not needed — Tier 1 succeeded
-//     Tier 3  tesseract_ocr        SKIPPED   —       Not needed — earlier tier succeeded
-//     Tier 4  needs_manual_review  —         —       (not reached)
+//     Tier 3  cloud_vision         SKIPPED   —       Not needed — earlier tier succeeded
+//     Tier 4  tesseract_ocr        SKIPPED   —       Not needed — earlier tier succeeded
+//     Tier 5  needs_manual_review  —         —       (not reached)
 //
 // Documents with zero extraction_attempts rows are hidden entirely (per the
 // task spec: "Only shows for documents that have extraction_attempts rows").

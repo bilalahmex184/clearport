@@ -688,6 +688,82 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     });
   }, [rules.invoiceThreshold, currentUser, addAuditLog, apiFetchOrg]);
 
+  // --- Inline pipeline fallback (§3) ---
+  // Used ONLY when the processing_jobs table doesn't exist (migration 018 not
+  // run yet) or the queue insert fails. This is the old synchronous path that
+  // calls the edge function directly from the browser. The primary path is the
+  // queue + worker — this is the safety net so extraction still works during
+  // the migration period.
+  const runInlinePipeline = React.useCallback(async (shipmentId: string, _detectedDocType: string) => {
+    try {
+      // Extraction
+      try {
+        await invokeEdgeFunction<any>('extract-document', { shipmentId });
+      } catch (err) {
+        console.warn('[inline-pipeline] extraction failed:', err);
+      }
+
+      // Validation chain
+      const traceId = typeof crypto !== 'undefined' ? crypto.randomUUID() : `trace-${Date.now()}`;
+      try {
+        await apiFetchOrg('/api/shipments/' + shipmentId, {
+          method: 'PATCH',
+          body: JSON.stringify({ validation_status: 'running', pipeline_trace_id: traceId }),
+        });
+      } catch (e) {
+        console.error('[inline-pipeline] failed to set validation_status=running:', e);
+      }
+
+      const invokeWithRetry = async (fnName: string, reqBody: Record<string, any>): Promise<void> => {
+        const delays = [500, 1500];
+        let lastErr: unknown;
+        for (let attempt = 0; attempt <= delays.length; attempt++) {
+          try {
+            await invokeEdgeFunction(fnName, reqBody);
+            return;
+          } catch (err) {
+            lastErr = err;
+            if (attempt < delays.length) {
+              await new Promise(r => setTimeout(r, delays[attempt]));
+            }
+          }
+        }
+        throw lastErr;
+      };
+
+      const results = await Promise.allSettled([
+        invokeWithRetry('schema-validate', { shipmentId, trace_id: traceId }),
+        invokeWithRetry('math-validate', { shipmentId, trace_id: traceId }),
+        invokeWithRetry('cross-validate', { shipmentId, trace_id: traceId }),
+      ]);
+      const failures = results.filter(r => r.status === 'rejected');
+
+      if (failures.length > 0) {
+        await apiFetchOrg('/api/shipments/' + shipmentId, {
+          method: 'PATCH',
+          body: JSON.stringify({ validation_status: 'failed' }),
+        }).catch(() => {});
+      } else {
+        try {
+          await invokeWithRetry('flag-exceptions', { shipmentId, trace_id: traceId });
+        } catch {
+          // flag-exceptions failed → degraded
+        }
+        await apiFetchOrg('/api/shipments/' + shipmentId, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            validation_status: 'completed',
+            last_validated_at: new Date().toISOString(),
+          }),
+        }).catch(() => {});
+      }
+
+      await refreshShipment(shipmentId);
+    } catch (err) {
+      console.error('[inline-pipeline] unexpected error:', err);
+    }
+  }, [apiFetchOrg, refreshShipment]);
+
   // --- Upload documents ---
   const uploadDocuments = React.useCallback(async (files: File[]): Promise<{ shipmentId: string; success: boolean; error?: string }> => {
     const shipmentId = `SHIP-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
@@ -822,230 +898,49 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       setSelectedExceptionId('');
       addAuditLog(`Shipment ${shipmentId} received — processing started.`, 'info', shipmentId);
 
-      // ── BACKGROUND PIPELINE ──
-      // Run extraction + validation WITHOUT blocking the return. The polling
-      // effect (every 4s) refreshes the selected shipment's status + fields +
-      // exceptions from the DB as the chain progresses. All needed helpers are
-      // captured in the closure so this runs to completion even if the user
-      // navigates away. We do a final refreshShipment() at the end so the
-      // terminal state is visible immediately (no 4s wait for the next poll).
-      const runPipeline = async () => {
-        let extractedFields: ExtractedField[] = [];
-
-        // Step 3: Extract fields via Gemini edge function (18s wall-clock budget)
-        try {
-          const extractResponse = await invokeEdgeFunction<any>('extract-document', { shipmentId });
-          if (extractResponse?.success && extractResponse.fields && extractResponse.fields.length > 0) {
-            extractedFields = extractResponse.fields.map((f: any) => ({
-              id: typeof crypto !== 'undefined' ? crypto.randomUUID() : `f-${Date.now()}`,
-              key: f.field_key,
-              label: f.field_label,
-              value: f.extracted_value,
-              sourceDoc: detectedDocType,
-              isFlagged: false,
-              confidence: f.confidence,
-              boundingBox: f.bounding_box,
-            }));
-          }
-          // Surface wall-clock budget exhaustion to the user via audit log so
-          // they understand WHY a document landed in manual review.
-          if (extractResponse?.budgetExhausted) {
-            const failedCount = extractResponse.partialFailure?.failedDocuments ?? 0;
-            addAuditLog(
-              `[extraction] Wall-clock budget exhausted for ${shipmentId} — ${failedCount} document(s) routed to manual review.`,
-              'warning',
-              shipmentId,
-            );
-          }
-        } catch (err) {
-          console.warn('[extract] edge function failed:', err);
-          addAuditLog(
-            `[extraction] failed for ${shipmentId}: ${err instanceof Error ? err.message : String(err)}`,
-            'warning',
-            shipmentId,
-          );
-        }
-
-        // Step 4: Validation chain — AWAITED, failure-tracked, no silent catches.
-        // (§3) Full state machine: running → completed/failed/degraded
-        // (§5) Retry with exponential backoff before recording a failure.
+      // ── QUEUE-BASED PIPELINE (§3) ──
+      // Instead of running extraction inline from the request path, write a
+      // 'queued' processing_jobs row. The standalone worker process
+      // (mini-services/worker/) polls this table, claims the job via
+      // SELECT ... FOR UPDATE SKIP LOCKED, and runs the extraction + validation
+      // pipeline with a time budget that isn't constrained by the edge
+      // function's request-scoped CPU limit.
+      //
+      // The polling effect (every 4s) refreshes the selected shipment's status
+      // from the DB as the worker progresses: pending → running →
+      // completed/failed/degraded. This is the durable async processing layer
+      // — the upload returns immediately, the worker handles the rest.
+      try {
         const traceId = typeof crypto !== 'undefined' ? crypto.randomUUID() : `trace-${Date.now()}`;
-
-        // (§3) Set validation_status = 'running' + pipeline_trace_id before starting
-        try {
-          await apiFetchOrg('/api/shipments/' + shipmentId, {
-            method: 'PATCH',
-            body: JSON.stringify({
-              validation_status: 'running',
-              pipeline_trace_id: traceId,
-            }),
+        if (!supabase) throw new Error('Supabase client not initialized');
+        const { error: jobErr } = await supabase.from('processing_jobs').insert({
+          shipment_id: shipmentId,
+          org_id: currentOrgIdRef.current,
+          job_type: 'extraction',
+          status: 'queued',
+          trace_id: traceId,
+        });
+        if (jobErr) {
+          console.warn('[queue] failed to write processing_jobs row:', jobErr.message);
+          // Fallback: if the processing_jobs table doesn't exist yet (migration
+          // not run), fall back to the old inline pipeline so extraction still
+          // works. This is a safety net, not the primary path.
+          addAuditLog('[queue] processing_jobs table not available — falling back to inline extraction', 'warning', shipmentId);
+          void runInlinePipeline(shipmentId, detectedDocType).catch(err => {
+            console.error('[pipeline] inline fallback failed:', err);
           });
-        } catch (e) {
-          console.error('[validation-chain] failed to set validation_status=running:', e);
+        } else {
+          addAuditLog(`[queue] Extraction job queued for ${shipmentId} (trace: ${traceId.slice(0, 8)})`, 'info', shipmentId);
         }
-
-        // (§5) Helper: invoke with retry (2 retries, 500ms then 1500ms backoff)
-        const invokeWithRetry = async (fnName: string, reqBody: Record<string, any>): Promise<void> => {
-          const delays = [500, 1500];
-          let lastErr: unknown;
-          for (let attempt = 0; attempt <= delays.length; attempt++) {
-            try {
-              await invokeEdgeFunction(fnName, reqBody);
-              if (attempt > 0) {
-                console.log(`[validation-chain] ${fnName} succeeded on attempt ${attempt + 1}`);
-                addAuditLog(`[retry] ${fnName} succeeded on attempt ${attempt + 1} for ${shipmentId}`, 'info', shipmentId);
-              }
-              return;
-            } catch (err) {
-              lastErr = err;
-              if (attempt < delays.length) {
-                console.warn(`[validation-chain] ${fnName} attempt ${attempt + 1} failed, retrying in ${delays[attempt]}ms:`, err instanceof Error ? err.message : err);
-                await new Promise(r => setTimeout(r, delays[attempt]));
-              }
-            }
-          }
-          throw lastErr;
-        };
-
-        try {
-          // Run the 3 independent validators in parallel, but INSPECT results
-          const validatorResults = await Promise.allSettled([
-            invokeWithRetry('schema-validate', { shipmentId, trace_id: traceId }),
-            invokeWithRetry('math-validate', { shipmentId, trace_id: traceId }),
-            invokeWithRetry('cross-validate', { shipmentId, trace_id: traceId }),
-          ]);
-
-          // Check for rejected promises — these are validation chain failures
-          const failures: string[] = [];
-          const validatorNames = ['schema-validate', 'math-validate', 'cross-validate'];
-          validatorResults.forEach((result, idx) => {
-            if (result.status === 'rejected') {
-              const errMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
-              failures.push(`${validatorNames[idx]}: ${errMsg}`);
-              console.error(`[validation-chain] ${validatorNames[idx]} REJECTED after retries:`, errMsg);
-            }
-          });
-
-          if (failures.length > 0) {
-            // (§3) Validation chain failed — set status to 'failed'
-            try {
-              await apiFetchOrg('/api/shipments/' + shipmentId, {
-                method: 'PATCH',
-                body: JSON.stringify({ validation_status: 'failed' }),
-              });
-            } catch (e) {
-              console.error('[validation-chain] failed to update shipment status:', e);
-            }
-            addAuditLog(
-              `[pipeline_error] Validation chain failed for ${shipmentId} (after retries). Failures: ${failures.join('; ')}`,
-              'warning',
-              shipmentId,
-            );
-            // Surface a pipeline_error exception so it's visible in the UI (§2).
-            // NOTE: user_id is null here — the user-scoped supabase client
-            // attributes the row to the authenticated user via RLS/auth.uid(),
-            // so we don't need to pass it explicitly (and `user` is not in
-            // scope in this background closure).
-            if (supabase) {
-              await supabase.from('exceptions').insert({
-                shipment_id: shipmentId,
-                field_key: '_pipeline',
-                field_name: 'Validation Pipeline Error',
-                extracted_value: '',
-                confidence: 0,
-                reason: `Validation chain failed (after retries): ${failures.join('; ')}`,
-                exception_type: 'missing_field',
-                doc_type: 'System',
-                status: 'Unresolved',
-                history: [],
-              });
-            }
-          } else {
-            // All validators succeeded — run flag-exceptions (no bare catch)
-            let flagExceptionsFailed = false;
-            try {
-              await invokeWithRetry('flag-exceptions', { shipmentId, trace_id: traceId });
-            } catch (flagErr) {
-              flagExceptionsFailed = true;
-              const errMsg = flagErr instanceof Error ? flagErr.message : String(flagErr);
-              console.error('[validation-chain] flag-exceptions FAILED after retries:', errMsg);
-              addAuditLog(
-                `[pipeline_error] flag-exceptions failed for ${shipmentId} (after retries): ${errMsg}`,
-                'warning',
-                shipmentId,
-              );
-              if (supabase) {
-                await supabase.from('exceptions').insert({
-                  shipment_id: shipmentId,
-                  field_key: '_pipeline',
-                  field_name: 'Flag Exceptions Error',
-                  extracted_value: '',
-                  confidence: 0,
-                  reason: `flag-exceptions failed (after retries): ${errMsg}`,
-                  exception_type: 'missing_field',
-                  doc_type: 'System',
-                  status: 'Unresolved',
-                  history: [],
-                });
-              }
-            }
-
-            // (§3) Set final validation status: 'completed' on full success, 'degraded' if flag-exceptions failed
-            const finalStatus = flagExceptionsFailed ? 'degraded' : 'completed';
-            try {
-              await apiFetchOrg('/api/shipments/' + shipmentId, {
-                method: 'PATCH',
-                body: JSON.stringify({
-                  validation_status: finalStatus,
-                  last_validated_at: new Date().toISOString(),
-                }),
-              });
-            } catch (e) {
-              console.error(`[validation-chain] failed to set validation_status=${finalStatus}:`, e);
-            }
-          }
-        } catch (err) {
-          // Outer catch — should never reach here since allSettled doesn't throw,
-          // but if it does, persist the failure (§2: no silent catches)
-          const errMsg = err instanceof Error ? err.message : String(err);
-          console.error('[validation-chain] unexpected error:', errMsg);
-          addAuditLog(`[pipeline_error] Unexpected validation error for ${shipmentId}: ${errMsg}`, 'error', shipmentId);
-          try {
-            await apiFetchOrg('/api/shipments/' + shipmentId, {
-              method: 'PATCH',
-              body: JSON.stringify({ validation_status: 'failed' }),
-            });
-          } catch (e) {
-            console.error('[validation-chain] failed to set validation_status=failed:', e);
-          }
-        }
-
-        // Step 5: Final refresh from DB so the entry reflects the real terminal
-        // state (fields, exceptions, validation_status). Polling may have
-        // already done this, but an explicit final refresh guarantees the user
-        // sees the completed/failed/degraded state without waiting for the next
-        // 4s poll tick.
-        await refreshShipment(shipmentId);
-
-        addAuditLog(
-          `New entry ${shipmentId} ingestion completed: ${files.length} files, ${extractedFields.length} fields extracted.`,
-          extractedFields.length > 0 ? 'success' : 'warning',
-          shipmentId,
-        );
-      };
-
-      // Fire-and-forget — the user already has their "received, processing" UI.
-      // Errors are handled inside runPipeline (no unhandled rejection).
-      void runPipeline().catch(err => {
-        console.error('[pipeline] unhandled error in background pipeline for', shipmentId, err);
-        addAuditLog(
-          `[pipeline] unexpected background error for ${shipmentId}: ${err instanceof Error ? err.message : String(err)}`,
-          'error',
-          shipmentId,
-        );
-      });
+      } catch (err) {
+        console.error('[queue] unexpected error writing job:', err);
+        // Same fallback — don't let a queue failure prevent extraction
+        void runInlinePipeline(shipmentId, detectedDocType).catch(() => {});
+      }
 
       // Return immediately — the user has already seen "received, processing".
+      // The worker process will pick up the job and run the extraction + validation
+      // pipeline. The polling effect (every 4s) keeps the UI in sync with the DB.
       return { shipmentId, success: true };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : 'Upload pipeline failed';

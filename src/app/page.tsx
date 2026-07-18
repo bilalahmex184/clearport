@@ -13,6 +13,7 @@ import EntryDetailView from '@/components/clearport/EntryDetailView';
 import BrokerTemplates from '@/components/clearport/BrokerTemplates';
 import TeamManagement from '@/components/clearport/TeamManagement';
 import SupabaseSyncPanel from '@/components/clearport/SupabaseSyncPanel';
+import AlertBanner from '@/components/clearport/AlertBanner';
 import {
   Shield,
   Cpu,
@@ -436,6 +437,12 @@ function AppShell() {
               </div>
             </div>
           </header>
+
+          {/* S6: Alert banner — polls /api/health/alerts every 60s, shows a
+              red banner if there are dead-letter jobs or low extraction
+              success rates. Renders null when there are no alerts, when the
+              user is a viewer (admin/operator only), or when the fetch fails. */}
+          <AlertBanner />
 
           {/* Interactive View Panel */}
           <div className="flex-1 overflow-hidden relative">

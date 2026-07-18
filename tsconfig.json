@@ -41,6 +41,7 @@
     "audit",
     "examples",
     "skills",
-    "supabase/functions"
+    "supabase/functions",
+    "mini-services"
   ]
 }

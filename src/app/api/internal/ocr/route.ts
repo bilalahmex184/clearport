@@ -38,6 +38,7 @@
 import { NextResponse } from 'next/server';
 import sharp from 'sharp';
 import { createWorker } from 'tesseract.js';
+import * as Sentry from '@sentry/nextjs';
 import { logger } from '@/lib/utils/logger';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -330,9 +331,19 @@ export async function POST(req: Request): Promise<Response> {
       });
       // If pdftoppm is missing, that's a configuration issue → 415
       if (msg.includes('pdftoppm binary not found')) {
+        // Expected misconfiguration — not a runtime failure, do not page Sentry.
         return unsupportedType('PDF rasterization unavailable — pdftoppm not installed. Install poppler-utils.');
       }
-      // Corrupt PDF or rasterization failure → 422 (processable entity but failed)
+      // Corrupt PDF or rasterization failure → 422 (processable entity but failed).
+      // This is a real, unhandled OCR failure — forward to Sentry so ops gets paged.
+      try {
+        Sentry.captureException(err, {
+          tags: { route: 'internal-ocr', stage: 'pdf-rasterize', statusCode: '422' },
+          extra: { mimeType, inputBytes: rawBuffer.length, message: msg },
+        });
+      } catch {
+        // Never let Sentry instrumentation break the response path.
+      }
       return ocrFailed(`PDF rasterization failed: ${msg}`, 422);
     }
   } else if (IMAGE_MIME_TYPES.has(mimeType.toLowerCase())) {
@@ -356,6 +367,15 @@ export async function POST(req: Request): Promise<Response> {
       byteLength: imageBuffer.length,
       error: String((err as Error)?.message || err),
     });
+    // Real preprocessing failure — forward to Sentry.
+    try {
+      Sentry.captureException(err, {
+        tags: { route: 'internal-ocr', stage: 'sharp-normalize', statusCode: '422' },
+        extra: { mimeType, byteLength: imageBuffer.length },
+      });
+    } catch {
+      // Never let Sentry instrumentation break the response path.
+    }
     if (pdfCleanup) await pdfCleanup();
     return ocrFailed(`Image preprocessing failed: ${(err as Error)?.message || String(err)}`, 422);
   }
@@ -431,6 +451,20 @@ export async function POST(req: Request): Promise<Response> {
       isTimeout,
       error: message,
     });
+    // Real OCR failure (timeout or 502) — forward to Sentry so ops gets paged.
+    try {
+      Sentry.captureException(err, {
+        tags: {
+          route: 'internal-ocr',
+          stage: 'tesseract',
+          isTimeout: String(isTimeout),
+          statusCode: isTimeout ? '408' : '502',
+        },
+        extra: { mimeType, elapsedMs, message },
+      });
+    } catch {
+      // Never let Sentry instrumentation break the response path.
+    }
     if (isTimeout) return ocrTimeout();
     return ocrFailed(message, 502);
   } finally {

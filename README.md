@@ -5,7 +5,7 @@ Production-grade customs document extraction, validation, and exception manageme
 ## Tech Stack
 - **Frontend**: Next.js 16 + React 19 + TypeScript + Tailwind CSS
 - **Backend**: Supabase (Postgres + RLS + Edge Functions + Storage + Auth)
-- **AI/OCR**: Google Gemini (4-stage fallback chain) + self-hosted Tesseract.js
+- **AI/OCR**: Google Gemini + Cloud Vision (5-stage fallback chain) + self-hosted Tesseract.js
 - **Testing**: Vitest (54 integration + 175 pure unit tests) + Playwright
 
 ## Quick Start
@@ -47,14 +47,16 @@ Upload (bulk, 3-concurrent, deduped, validated)
     ↓
 Document stored, status = 'queued'
     ↓
-┌──── 4-STAGE EXTRACTION FALLBACK CHAIN ────┐
+┌──── 5-STAGE EXTRACTION FALLBACK CHAIN ────┐
 │ 1. Gemini Vision (primary)                │
 │    ↓ fails / quota exhausted / timeout    │
 │ 2. PDF text-layer extraction              │
 │    ↓ no embedded text (genuine scan)      │
-│ 3. Tesseract OCR (self-hosted, free)      │
-│    ↓ all three failed                     │
-│ 4. Mark 'needs_manual_review'             │
+│ 3. Cloud Vision OCR (hosted, free quota)  │
+│    ↓ no text (or PDF — skipped)           │
+│ 4. Tesseract OCR (self-hosted, free)      │
+│    ↓ all four failed                      │
+│ 5. Mark 'needs_manual_review'             │
 │    NEVER silent zero extraction           │
 │    18s wall-clock budget across all tiers │
 └───────────────────────────────────────────┘
@@ -72,7 +74,7 @@ Exception Desk (human review)
 - Multi-tenant with RBAC (admin/operator/viewer)
 - Org-scoped RLS on all tables
 - Invite-by-email with token validation
-- 4-stage extraction fallback (never silent zero, 18s wall-clock budget)
+- 5-stage extraction fallback (never silent zero, 18s wall-clock budget)
 - Configurable validation rules (no redeploy to change)
 - Broker template system (import/export CSV mapping)
 - Audit logs with type + date range filters
@@ -113,7 +115,7 @@ Next.js 16 runs middleware on the Edge runtime by default. The observability log
 
 ## Extraction Audit Ledger
 
-Every extraction attempt — success, failure, or skip — is permanently recorded in the `extraction_attempts` table (migration 017). Each row captures: document_id, org_id, pipeline_trace_id, tier (1-4), tier_name, status (success/failure/skipped), fields_extracted, error_code, error_message, and latency_ms.
+Every extraction attempt — success, failure, or skip — is permanently recorded in the `extraction_attempts` table (migration 017). Each row captures: document_id, org_id, pipeline_trace_id, tier (1-5), tier_name, status (success/failure/skipped), fields_extracted, error_code, error_message, and latency_ms.
 
 A single `pipeline_trace_id` threads through every tier for one document, so you can reconstruct the full story end-to-end:
 
@@ -137,7 +139,8 @@ ORDER BY created_at;
 This pipeline runs at **$0/month** at the current 10-user MVP scale:
 
 - **Gemini Vision** (Tier 1): Google's free tier provides 1,000+ requests/day (refreshed daily), far more than 10 users will generate. No credit card required. If volume ever exceeds the free tier, Gemini Flash is one of the cheapest paid options on the market — verify current pricing at [ai.google.dev/pricing](https://ai.google.dev/pricing) before committing.
-- **Tesseract OCR** (Tier 3): self-hosted via `tesseract.js` (pure WASM, no GPU, no native binary). Runs as a Node.js API route within the existing Next.js app — no additional infrastructure cost.
+- **Cloud Vision OCR** (Tier 3): Google Cloud Vision `DOCUMENT_TEXT_DETECTION` — independent hosted OCR vendor called as a plain HTTPS POST (no SDK, no local compute, no Deno-side rasterizer). Uses the free monthly quota (1,000 requests/month). Handles images only (PNG/JPEG/TIFF); PDFs fall through to Tier 4 (Tesseract + pdftoppm). Gated behind `GOOGLE_CLOUD_VISION_API_KEY` — if unset, this tier is skipped silently and the cascade falls through to Tier 4. 15s per-call timeout, fits within the 18s wall-clock budget.
+- **Tesseract OCR** (Tier 4): self-hosted via `tesseract.js` (pure WASM, no GPU, no native binary). Runs as a Node.js API route within the existing Next.js app — no additional infrastructure cost. The Node route rasterizes PDFs via `pdftoppm` before OCR, so it handles both images and PDFs.
 - **Postgres + Storage + Auth + Edge Functions**: Supabase free tier (500MB DB, 1GB storage, 50K monthly active users). No paid dependencies.
 - **Process management**: pm2 (open source, free). No external monitoring SaaS required.
 

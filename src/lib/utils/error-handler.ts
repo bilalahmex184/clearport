@@ -5,6 +5,8 @@
 // emit a Next.js-compatible JSON Response.
 // ============================================================================
 
+import * as Sentry from '@sentry/nextjs';
+
 export interface HandledError {
   message: string;
   code?: string;
@@ -48,9 +50,25 @@ export function handleError(error: unknown): HandledError {
 /**
  * Convert any thrown value into a JSON Response suitable for returning
  * directly from a Next.js route handler or edge function.
+ *
+ * S6: Forwards the error to Sentry before returning so every API failure
+ * (not just unhandled throws) is captured. AppError instances with a code
+ * are still captured — Sentry dedupes by stack+message, and the code adds
+ * a useful tag for grouping. Sentry.init() is a no-op without a DSN, so
+ * captureException is a safe no-op in local dev.
  */
 export function errorResponse(error: unknown): Response {
   const { message, code, statusCode, details } = handleError(error);
+  // Forward to Sentry. Safe to call without Sentry initialized (no-op).
+  // We capture the original thrown value so Sentry sees the real stack.
+  try {
+    Sentry.captureException(error, {
+      tags: { code: code ?? 'UNCATEGORIZED', statusCode: String(statusCode) },
+      extra: { message, details },
+    });
+  } catch {
+    // Never let Sentry instrumentation break the response path.
+  }
   return Response.json(
     { error: message, code, details },
     { status: statusCode },

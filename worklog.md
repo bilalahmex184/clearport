@@ -1404,3 +1404,183 @@ Stage Summary:
 - Extraction ledger now records accurate, distinct error reasons per failure mode
 - 7 more dead deps removed, Prisma scaffold deleted
 - CI gates (tsc + eslint + test:pure) will now pass on every push
+
+---
+Task ID: S4-CLOUD-VISION
+Agent: general-purpose
+Task: Add Google Cloud Vision as real OCR tier (Tier 3)
+
+Work Log:
+- Read worklog (last 3 entries: P1-P13 hardening, RESPONSIVE-FIX, P14-P17 OCR + CI gates) to confirm the 4-tier chain state established in P3 (Tesseract replaced the original Cloud Vision stub as Tier 3).
+- Read supabase/functions/extract-document/index.ts (1705 lines) end-to-end to map the existing tier structure: Tier 1 Gemini (callGeminiExtraction), Tier 2 PDF text-layer (extractPdfTextLayer), Tier 3 Tesseract (tesseractOCR with structured TesseractResult from P15), Tier 4 needs_manual_review. Identified all tier-number touch points: extractionTier assignments, recordAttempt calls, tiersTried array, extractionSource string, audit log message, two "4-tier" comment headers.
+- Implemented callCloudVisionOCR(arrayBuffer, mimeType) function with new CloudVisionResult interface (mirrors TesseractResult's { text, errorCode, reason } pattern from P15). Inserted between extractPdfTextLayer and tesseractOCR. Behavior:
+  - Returns NOT_CONFIGURED if GOOGLE_CLOUD_VISION_API_KEY env var missing.
+  - Returns SKIPPED_PDF for application/pdf mime (Cloud Vision images:annotate doesn't accept PDFs directly — async batch is heavier than this tier warrants).
+  - POSTs to https://vision.googleapis.com/v1/images:annotate?key=<key> with DOCUMENT_TEXT_DETECTION feature, 15s AbortSignal.timeout (fits 18s wall-clock budget).
+  - Distinct error codes: HTTP_<status>, API_ERROR (response.responses[0].error), EMPTY_TEXT (no fullTextAnnotation.text), FETCH_TIMEOUT, FETCH_FAILED.
+  - Parses fullTextAnnotation.text from response.responses[0], trims, returns.
+  - Uses global fetch() (Deno-compatible), NOT node:https. Uses existing bufToBase64() helper. NEVER throws.
+- Inserted new Tier 3 block (Cloud Vision) in the main handler between the Tier 2 PDF text-layer block and the (now renumbered) Tesseract block. Skip conditions: extracted.length > 0 (earlier tier succeeded), docBudgetExhausted, rawText already set (Tier 2 succeeded), budgetRemaining() <= 500, OR mimeType === 'application/pdf'. Each branch records a skipped ledger entry with the actual reason.
+- Renumbered Tesseract tier block from Tier 3 → Tier 4: comment headers ("TIER 3: Tesseract" → "TIER 4: Tesseract"; "Tier 3 not reached" → "Tier 4 not reached"; "Tier 4 is the safety net" → "Tier 5 is the safety net"; "Tier 4 manual-review is the safety net" inside tesseractOCR catch block → "Tier 5 manual-review is the safety net"). Renamed local var tier3NotReached → tier4NotReached, t3Start/t3Latency → t4Start/t4Latency. Updated recordAttempt tier: 3 → tier: 4 and console.log "Tier 3: trying Tesseract OCR" → "Tier 4: trying Tesseract OCR".
+- Renumbered manual review tier from Tier 4 → Tier 5: comment header ("TIER 4: Mark as 'needs_manual_review'" → "TIER 5: Mark as 'needs_manual_review'"; "Tier 4 is always a failure" → "Tier 5 is always a failure"), extractionTier = 4 → 5, tier: 4 → 5 in recordAttempt, tiersTried: [1, 2, 3] → [1, 2, 3, 4], extractionTier: 4 in perDocResults → 5, audit log message "all 4 tiers failed" → "all 5 tiers failed".
+- Updated regex extraction fallback source string: `extractionTier === 2 ? "pdf_text_layer" : extractionTier === 3 ? "tesseract" : "regex_fallback"` → 3-way chain `=== 2 ? "pdf_text_layer" : === 3 ? "cloud_vision" : === 4 ? "tesseract" : "regex_fallback"`. Regex parsing logic itself NOT duplicated — regexExtract() is reused across tiers 2/3/4.
+- Updated two "4-tier" comments to "5-tier": `// --- Main handler with 4-tier extraction fallback chain ---` and `// 4. Process each document through the 4-tier extraction fallback chain`.
+- Updated Tesseract section header comment: `// --- Tesseract OCR (Tier 3) ---` → `// --- Tesseract OCR (Tier 4) ---` and "falls through to Tier 4 (needs_manual_review)" → "falls through to Tier 5 (needs_manual_review)".
+- Updated .env.example: added GOOGLE_CLOUD_VISION_API_KEY entry with full comments (Supabase secret instructions, free quota note, image-only / PDF-falls-through-to-Tesseract caveat, link to credentials console).
+- Updated README.md: 4-stage chain diagram → 5-stage (added Cloud Vision OCR as Tier 3, pushed Tesseract to Tier 4, pushed manual review to Tier 5); "4-stage extraction fallback" feature bullet → "5-stage extraction fallback"; "tier (1-4)" in extraction_attempts ledger description → "tier (1-5)"; Tech Stack AI/OCR line updated; Cost section got a new Cloud Vision (Tier 3) bullet and the Tesseract bullet was renumbered to Tier 4 with a note about pdftoppm handling PDFs.
+- Side-fix: src/components/clearport/ExtractionHealthPanel.tsx had hardcoded TIER_LABELS map (1=Gemini, 2=PDF Text Layer, 3=Tesseract, 4=Manual Review) — updated to 1=Gemini, 2=PDF Text Layer, 3=Cloud Vision OCR, 4=Tesseract OCR, 5=Manual Review.
+- Side-fix: src/components/clearport/ExtractionTracePanel.tsx had an example timeline comment showing Tier 3 = tesseract_ocr — updated to show Tier 3 = cloud_vision, Tier 4 = tesseract_ocr, Tier 5 = needs_manual_review.
+
+Verification:
+- `grep -ic "cloud.*vision\|CLOUD_VISION" supabase/functions/extract-document/index.ts` → 33 matches (function definition, comment block, tier block, error messages, env var reference).
+- `grep -n "tier_name: 'cloud_vision'" supabase/functions/extract-document/index.ts` → 2 matches (lines 1481, 1502) — both skipped and success/failure branches of the ledger write are wired.
+- Tier numbering consistency verified across all 11 recordAttempt call sites: Tier 1=gemini_vision (3×), Tier 2=pdf_text_layer (2×), Tier 3=cloud_vision (2×), Tier 4=tesseract_ocr (2×), Tier 5=needs_manual_review (1×).
+- No leftover "4-tier", "4-stage", "Tier 3: tesseract", or "tiersTried: [1, 2, 3]" references anywhere in the edge function.
+- `npx tsc --noEmit` (src/) → 0 errors. The edge function itself is excluded from tsc per tsconfig.json (`"exclude": [..., "supabase/functions"]`), so I also ran a standalone tsc against just the edge function — the only errors are the expected `Cannot find name 'Deno'` (Deno global) and `Cannot find module 'npm:@supabase/supabase-js@2'` (Deno npm: specifier) errors that exist throughout the file regardless of my changes; zero new type/syntax errors introduced by callCloudVisionOCR or the new tier block.
+- `bun run lint` → 0 errors. `bun run test:pure` → 175/175 passed in 2.3s.
+
+Stage Summary:
+- Extract-document edge function is now a 5-tier chain: Tier 1 Gemini → Tier 2 PDF text-layer → Tier 3 Cloud Vision (NEW) → Tier 4 Tesseract (renumbered from 3) → Tier 5 needs_manual_review (renumbered from 4).
+- Cloud Vision is a real, independent hosted OCR vendor — plain HTTPS POST to vision.googleapis.com, no SDK, no local compute, no Deno-side rasterizer. Gated behind GOOGLE_CLOUD_VISION_API_KEY (skipped silently if unset, never crashes). 15s per-call timeout via AbortSignal.timeout.
+- Architecture-correct mime-type routing: Cloud Vision handles images only (PNG/JPEG/TIFF/etc.); PDFs are skipped at this tier (Cloud Vision images:annotate doesn't take PDFs) and fall through to Tesseract (Tier 4), which calls the Node route that has pdftoppm to rasterize PDFs first.
+- Regex parsing logic NOT duplicated — Cloud Vision's raw text feeds through the same regexExtract() already used for PDF text-layer (Tier 2) and Tesseract (Tier 4).
+- Extraction attempts ledger fully instrumented for the new tier: every Cloud Vision attempt — success, failure, or skipped — is recorded with tier=3, tier_name='cloud_vision', and the structured { errorCode, reason } from P15 so reviewers can distinguish "key not configured" vs "PDF not supported" vs "API error" vs "OCR ran but couldn't read the image".
+- Wall-clock budget code, extraction_attempts table schema, and recordAttempt() helper all untouched — only the call sites were updated.
+- README + .env.example + ExtractionHealthPanel TIER_LABELS + ExtractionTracePanel example comment all updated to reflect the 5-tier chain.
+- Pending deploy (requires Supabase CLI, not available in sandbox):
+  - extract-document edge function needs redeployment to pick up the new Tier 3 + renumbered Tiers 4/5.
+  - GOOGLE_CLOUD_VISION_API_KEY needs to be set as a Supabase secret: `npx supabase secrets set GOOGLE_CLOUD_VISION_API_KEY=<key>`.
+  - Until the secret is set, Cloud Vision is auto-skipped (NOT_CONFIGURED) and the cascade falls through to Tesseract exactly as before — no behavior change for deployments that haven't configured the key.
+
+---
+Task ID: S6-SENTRY
+Agent: general-purpose
+Task: Wire Sentry error tracking + dead_letter alert
+
+Work Log:
+- Read prior worklog (P14-P17) to understand context: app uses src/lib/utils/logger.ts for structured JSON logging, no error tracking service. extraction_attempts ledger exists (migration 017). processing_jobs table is being created by parallel §3 task and may not exist yet.
+- Installed `@sentry/nextjs@10.66.0` via `bun add @sentry/nextjs` (one new runtime dep).
+- Created three Sentry config files at project root, all following the same no-op-if-no-DSN pattern:
+  - `sentry.client.config.ts` — browser SDK, tracesSampleRate: 0.1
+  - `sentry.server.config.ts` — Node.js runtime (route handlers w/ `runtime='nodejs'`, server components, server actions)
+  - `sentry.edge.config.ts` — edge runtime (middleware, `runtime='edge'` route handlers)
+  All three read `process.env.NEXT_PUBLIC_SENTRY_DSN || process.env.SENTRY_DSN` and only call Sentry.init() when a DSN is set. App works perfectly without a DSN (verified — dev server runs clean with empty DSN).
+- Wrapped `next.config.ts` with `withSentryConfig`, preserving existing `output: "standalone"` + `reactStrictMode: true`. Options: silent: true (no webpack noise in dev), org/project from env (only used for source map uploads which we don't enable), widenClientFileUpload: false. No SENTRY_AUTH_TOKEN set, so no source map uploading.
+- Updated `src/lib/utils/error-handler.ts`:
+  - Added `import * as Sentry from '@sentry/nextjs'`
+  - In `errorResponse()`, added `Sentry.captureException(error, { tags: { code, statusCode }, extra: { message, details } })` before returning the JSON response. Wrapped in try/catch so Sentry instrumentation never breaks the response path. This means EVERY API route error (which all flow through errorResponse) is now captured by Sentry — no per-route wiring needed.
+- Updated `src/app/api/internal/ocr/route.ts`:
+  - Added `import * as Sentry from '@sentry/nextjs'`
+  - Added Sentry.captureException in 3 catch blocks for unhandled OCR failures:
+    1. PDF rasterization failure (422 branch only — the 415 "pdftoppm missing" branch is a config issue, not a runtime failure, so it's excluded per spec)
+    2. Sharp normalize failure (422)
+    3. Tesseract failure (both 408 timeout and 502 branches)
+  - Did NOT add Sentry to: JSON parse failure (400 — caller error), base64 decode failure (400 — caller error), unsupported mime type (415 — explicit exclusion per spec)
+  - Each captureException includes tags (route, stage, statusCode) and extras (mimeType, byteLength, elapsedMs) for grouping + debugging in the Sentry UI.
+- Updated `.env.example`:
+  - Replaced the existing bare `SENTRY_DSN=your-sentry-dsn` with a fuller block explaining both vars are optional, the app works without them, and which config file uses which DSN.
+  - Added `NEXT_PUBLIC_SENTRY_DSN=` (empty, so it's a no-op by default) alongside the existing `SENTRY_DSN=`.
+  - Added commented-out `SENTRY_ORG` and `SENTRY_PROJECT` (only used for source map uploads which we don't enable).
+- Created `src/app/api/health/alerts/route.ts` — the "one real, working alert" endpoint:
+  - GET /api/health/alerts, RBAC: `requireOrgRole(req, 'viewer')` (any org member can see alerts; the AlertBanner client further gates display to admin/operator).
+  - Two alert conditions:
+    1. `dead_letter_job` (severity: critical) — queries `processing_jobs` for status='dead_letter' rows in the caller's org. Returns a count + oldest timestamp.
+    2. `low_extraction_success_rate` (severity: high) — aggregates `extraction_attempts` per tier over the last 1h. Fires when success_rate (success / (success + failure), excluding skipped) drops below 50% with a minimum of 5 attempts in the window (so a single bad luck failure doesn't trigger the alert).
+  - Graceful degradation: both queries are wrapped in try/catch. If `processing_jobs` doesn't exist yet (parallel §3 task not finished) or `extraction_attempts` schema drifts, the route logs a warning and returns `{ alerts: [] }` with 200 — never crashes, never 500s. The dashboard simply shows no banner until the tables are ready.
+  - Always returns 200 (even with zero alerts). The AlertBanner polls every 60s and only shows a banner when alerts.length > 0.
+- Created `src/components/clearport/AlertBanner.tsx`:
+  - 'use client' component, polls /api/health/alerts every 60s via setInterval.
+  - Renders null when: userRole is 'viewer' (admin/operator only — per spec), alerts array is empty, or fetch fails (silent retry on next poll).
+  - Red banner with severity badges (critical/high/medium), summary line ("N active alerts • X critical • Y high"), manual refresh button (RefreshCw icon, spin animation while refreshing), per-alert dismiss button (X icon — dismissed alerts come back on next poll that re-fires them).
+  - Theme-aware: red-950/40 bg in dark mode, red-50 bg in light mode (matches the existing dark theme pattern from page.tsx).
+  - Stable polling pattern: refs hold the latest `shouldShow` + `apiFetchOrg` so the setInterval effect (empty deps) isn't torn down + re-created on every ClearPortContext re-render (the context value isn't memoized, so consumers re-render frequently). Initial mount does a one-shot fetch; the interval handles subsequent polls.
+- Mounted AlertBanner in `src/app/page.tsx`:
+  - Imported the component.
+  - Placed it between `</header>` and the "Interactive View Panel" div (above the AnimatePresence view panel, per spec). This keeps the header at the top of <main>, the alert banner below the header (shrink-0 so it doesn't get squeezed), and the view panel takes the remaining flex-1 space.
+  - Added a comment explaining the polling cadence and the admin/operator gating.
+- VERIFICATION (all 4 gates green):
+  1. `npx tsc --noEmit` → exit 0 (0 errors in src/)
+  2. `bun run lint` → exit 0 (no eslint errors)
+  3. `bun run build` → exit 0 — "Compiled successfully in 32.1s", 19 static pages generated, all 27 routes present including the new `/api/health/alerts`. Sentry wrapper didn't break the build.
+  4. Foreground `bun run dev` → "Ready in 1.3s", GET / → 200, GET /api/health/alerts → 401 (unauthenticated — requireOrgRole rejects before reaching the queries, exactly as designed), GET /api/organizations → 401 (auth working). Zero Sentry errors in dev.log (because no DSN set — Sentry.init() no-ops, captureException is a no-op).
+  - Polling verified: AlertBanner mounts and polls /api/health/alerts every ~60s (with a brief burst on mount due to React Strict Mode in dev — production mode has no such burst).
+- CONSTRAINTS all satisfied:
+  - App works without a Sentry DSN set — verified (dev server runs clean with empty DSN env vars; all Sentry calls are no-ops).
+  - Did NOT add Sentry to Supabase edge functions (Deno runtime, different SDK — out of scope per spec).
+  - Did NOT break the existing build — all 4 gates pass.
+  - Did NOT add source map uploading (no SENTRY_AUTH_TOKEN, widenClientFileUpload: false).
+
+Stage Summary:
+- 1 new runtime dep: @sentry/nextjs@10.66.0
+- 3 new root config files: sentry.{client,server,edge}.config.ts (all no-op without DSN)
+- 1 next.config.ts wrapped with withSentryConfig (preserved standalone + reactStrictMode)
+- 2 existing files instrumented with Sentry.captureException:
+  - src/lib/utils/error-handler.ts (errorResponse — covers ALL API route errors)
+  - src/app/api/internal/ocr/route.ts (3 catch blocks: PDF rasterize, sharp normalize, tesseract — 415/400 paths intentionally excluded per spec)
+- 1 new alert endpoint: src/app/api/health/alerts/route.ts
+  - Two alert conditions: dead_letter jobs + low extraction success rate per tier (<50% over 1h, min 5 attempts)
+  - Graceful degradation: returns { alerts: [] } with 200 if processing_jobs table doesn't exist yet (parallel §3 task)
+- 1 new UI component: src/components/clearport/AlertBanner.tsx
+  - Polls /api/health/alerts every 60s
+  - Red banner with severity badges, summary, manual refresh, per-alert dismiss
+  - Theme-aware (red-950/40 dark / red-50 light)
+  - Only renders for admin/operator roles (viewer → null)
+- 1 existing file mounted the banner: src/app/page.tsx (between header and view panel)
+- .env.example updated with both NEXT_PUBLIC_SENTRY_DSN + SENTRY_DSN (both optional, app works without them)
+- All 4 verification gates pass: tsc 0 errors, lint 0 errors, build succeeds (19 pages, /api/health/alerts route registered), dev server starts and serves pages normally with no DSN set.
+
+---
+Task ID: S2-S6-QUEUE-OCR-TEST-OBSERVABILITY
+Agent: main
+Task: §2 repo cleanup, §3 queue-based pipeline, §4 Cloud Vision OCR, §5 real regression test, §6 Sentry observability
+
+Work Log:
+
+§2 (Repo cleanup):
+- git rm -r --cached tool-results/ upload/ tsconfig.tsbuildinfo .zscripts/dev.pid (56 files removed from tracking)
+- Added to .gitignore: tool-results/, upload/, *.tsbuildinfo, .zscripts/*.pid
+- Created Dockerfile: multi-stage build (deps → builder → runner), installs poppler-utils for pdftoppm, non-root user, healthcheck, standalone output
+
+§3 (Queue-based pipeline):
+- Created supabase/migrations/018_processing_jobs.sql: processing_jobs table (id, shipment_id, document_id, org_id, job_type, status, attempts, max_attempts, trace_id, content_hash, error_history JSONB) + 4 indexes + RLS (org-scoped) + claim_next_job() SECURITY DEFINER function (SELECT ... FOR UPDATE SKIP LOCKED) + complete_job() function (retry/dead-letter logic)
+- Created mini-services/worker/index.ts: standalone Node/Bun process that polls processing_jobs every 3s, claims jobs via claim_next_job() RPC, calls the extract-document edge function (reusing all existing tier logic + wall-clock budget), updates job status via complete_job(). Handles extraction + validation job types. Dead-letter path: after max_attempts (3), job moves to dead_letter with full error_history JSONB.
+- Updated src/context/ClearPortContext.tsx upload path: instead of calling extract-document inline from the browser, writes a 'queued' processing_jobs row. Falls back to inline pipeline (runInlinePipeline) if the table doesn't exist (migration not run yet).
+- Updated ecosystem.config.js: added clearport-worker as a second pm2 app (bun interpreter, 800M max memory, 1s backoff)
+- Excluded mini-services/ from tsconfig.json and Next.js build (Bun-specific import.meta.dir API)
+
+§4 (Cloud Vision OCR — done by subagent):
+- Added callCloudVisionOCR() to extract-document edge function: plain HTTPS POST to vision.googleapis.com/v1/images:annotate, DOCUMENT_TEXT_DETECTION, 15s timeout
+- New 5-tier chain: Tier 1 Gemini → Tier 2 PDF text-layer → Tier 3 Cloud Vision → Tier 4 Tesseract → Tier 5 manual review
+- Cloud Vision skipped for PDFs (images:annotate doesn't take PDFs — Tesseract Node route handles those via pdftoppm) and when GOOGLE_CLOUD_VISION_API_KEY not set
+- All Cloud Vision attempts logged to extraction_attempts ledger via recordAttempt() (tier 3, tier_name 'cloud_vision')
+- Feed Cloud Vision OCR text through the SAME regexExtract() function — no duplicated parsing logic
+- Updated README diagram from 4-stage to 5-stage
+
+§5 (Real regression test):
+- Created tests/unit-pure/06-validation-status-service-layer.test.ts (7 tests, 182 total now)
+- Calls the REAL updateShipment() function with a mocked Supabase client that records the patch object passed to .update()
+- Asserts the patch object ACTUALLY CONTAINS validation_status, last_validated_at, pipeline_trace_id — this is the service-layer allowlist where the bug lived, NOT the Zod schema layer
+- Would fail if someone removes 'validation_status' from the `allowed` array (the exact bug)
+- Approach: mocked Supabase client (not a real DB) so the test stays in tests/unit-pure/ (fast, no network) but still exercises the real updateShipment() function body including the allowlist filtering logic
+
+§6 (Sentry + alert — done by subagent):
+- Installed @sentry/nextjs, created sentry.{client,server,edge}.config.ts (no-op without DSN)
+- Wrapped next.config.ts with withSentryConfig
+- Added Sentry.captureException to error-handler.ts errorResponse() (covers every API route) + OCR route catch blocks
+- Created /api/health/alerts endpoint: 2 alert conditions (dead_letter_job critical, low_extraction_success_rate high)
+- Created AlertBanner.tsx: polls /api/health/alerts every 60s, shows red banner for admin/operator
+- Mounted AlertBanner in page.tsx
+
+Stage Summary:
+- All acceptance criteria pass:
+  - git ls-files artifacts: empty ✓
+  - .gitignore: tool-results/, upload/, *.tsbuildinfo, .zscripts/*.pid ✓
+  - Dockerfile: exists ✓
+  - processing_jobs: migration 018 + worker in mini-services/worker/ ✓
+  - Cloud Vision: in extract-document, ledger logging for cloud_vision ✓
+  - Regression test: calls updateShipment() directly (not safeParse) ✓
+  - Sentry: in src/lib/utils/error-handler.ts, src/app/api/internal/ocr/route.ts, src/app/api/health/alerts/route.ts ✓
+  - tsc: 0 real errors (src/) ✓
+  - lint: clean ✓
+  - build: succeeds ✓
+  - test:pure: 182/182 passed ✓

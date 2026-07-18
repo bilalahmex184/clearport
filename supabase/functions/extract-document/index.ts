@@ -888,7 +888,118 @@ function extractPdfTextLayer(arrayBuffer: ArrayBuffer): string | null {
   }
 }
 
-// --- Tesseract OCR (Tier 3) ------------------------------------------------
+// --- Cloud Vision OCR (Tier 3) ----------------------------------------------
+// Google Cloud Vision API — DOCUMENT_TEXT_DETECTION. Independent hosted OCR
+// vendor with a generous free monthly quota. Called as a plain HTTPS POST to
+// https://vision.googleapis.com/v1/images:annotate?key=<API_KEY> — no local
+// compute, no SDK, no Deno-side rasterizer required.
+//
+// Limitation: Cloud Vision's images:annotate endpoint only accepts images
+// (PNG/JPEG/TIFF/etc.). PDFs require async batch processing (files:annotate
+// with a GCS URI), which is heavier-weight than we need at this tier. For
+// PDFs, this function returns SKIPPED_PDF and the cascade falls through to
+// Tier 4 (Tesseract via the Node route, which has pdftoppm to rasterize the
+// PDF first).
+//
+// Gated behind GOOGLE_CLOUD_VISION_API_KEY — if missing, returns
+// NOT_CONFIGURED and the cascade falls through to Tier 4 without crashing.
+//
+// 15s per-call timeout via AbortSignal.timeout — fits within the 18s
+// wall-clock budget with margin for upstream tiers. Uses fetch() (available
+// globally in Deno) rather than node:https.
+//
+// (P15-style) Structured result so the extraction_attempts ledger records the
+// ACTUAL failure reason instead of a one-size-fits-all generic string.
+// A reviewer can tell "key not configured" apart from "PDF not supported"
+// apart from "API error" apart from "OCR ran but couldn't read the image."
+interface CloudVisionResult {
+  text: string | null;
+  /** Machine-readable error code for the ledger (e.g. "NOT_CONFIGURED", "SKIPPED_PDF", "API_ERROR", "FETCH_FAILED") */
+  errorCode?: string;
+  /** Human-readable reason explaining why OCR didn't produce text */
+  reason?: string;
+}
+
+async function callCloudVisionOCR(
+  arrayBuffer: ArrayBuffer,
+  mimeType: string,
+): Promise<CloudVisionResult> {
+  const apiKey = Deno.env.get("GOOGLE_CLOUD_VISION_API_KEY");
+  if (!apiKey) {
+    return {
+      text: null,
+      errorCode: "NOT_CONFIGURED",
+      reason: "Cloud Vision API key not set (GOOGLE_CLOUD_VISION_API_KEY missing) — falls through to Tesseract",
+    };
+  }
+  if (mimeType === "application/pdf") {
+    return {
+      text: null,
+      errorCode: "SKIPPED_PDF",
+      reason: "Cloud Vision images:annotate does not support PDFs directly (use async batch processing for PDFs) — falls through to Tesseract (Node route has pdftoppm)",
+    };
+  }
+  try {
+    const base64 = bufToBase64(arrayBuffer);
+    const url = `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        requests: [{
+          image: { content: base64 },
+          features: [{ type: "DOCUMENT_TEXT_DETECTION", maxResults: 1 }],
+        }],
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => res.statusText);
+      console.error(`[extract-document] Cloud Vision HTTP ${res.status}: ${errText}`);
+      return {
+        text: null,
+        errorCode: `HTTP_${res.status}`,
+        reason: `Cloud Vision returned HTTP ${res.status}: ${errText.substring(0, 200)}`,
+      };
+    }
+    const body = await res.json();
+    const firstResponse = body?.responses?.[0];
+    if (firstResponse?.error) {
+      const errMsg = firstResponse.error.message || JSON.stringify(firstResponse.error);
+      return {
+        text: null,
+        errorCode: "API_ERROR",
+        reason: `Cloud Vision API error: ${errMsg}`,
+      };
+    }
+    const text: string | null = firstResponse?.fullTextAnnotation?.text ?? null;
+    if (!text || text.trim().length === 0) {
+      return {
+        text: null,
+        errorCode: "EMPTY_TEXT",
+        reason: "Cloud Vision returned no text (blank or illegible image)",
+      };
+    }
+    return { text: text.trim() };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (/timed out|timeout|abort/i.test(errMsg)) {
+      return {
+        text: null,
+        errorCode: "FETCH_TIMEOUT",
+        reason: `Cloud Vision call timed out: ${errMsg}`,
+      };
+    }
+    return {
+      text: null,
+      errorCode: "FETCH_FAILED",
+      reason: `Cloud Vision call failed: ${errMsg}`,
+    };
+    // never throw — Tier 4 Tesseract is the safety net
+  }
+}
+
+// --- Tesseract OCR (Tier 4) ------------------------------------------------
 // Self-hosted tesseract.js running in a separate Node.js API route
 // (/api/internal/ocr) inside the Next.js app. The edge function (Deno) can't
 // host tesseract.js directly, so it base64-encodes the file and ships it over
@@ -896,7 +1007,7 @@ function extractPdfTextLayer(arrayBuffer: ArrayBuffer): string | null {
 //
 // Config: set OCR_SERVICE_URL + INTERNAL_OCR_SECRET as Supabase secrets. If
 // either is missing, this function returns null and the cascade falls through
-// to Tier 4 (needs_manual_review) — it NEVER throws.
+// to Tier 5 (needs_manual_review) — it NEVER throws.
 //
 // The 25s timeout here is longer than the edge function's 18s wall-clock
 // budget on purpose: the budget will kick in first if needed, which is the
@@ -985,7 +1096,7 @@ async function tesseractOCR(arrayBuffer: ArrayBuffer, mimeType: string): Promise
       errorCode: "FETCH_FAILED",
       reason: `OCR service call failed: ${errMsg}`,
     };
-    // never throw — Tier 4 manual-review is the safety net
+    // never throw — Tier 5 manual-review is the safety net
   }
 }
 
@@ -1036,7 +1147,7 @@ async function recordAttempt(
   }
 }
 
-// --- Main handler with 4-tier extraction fallback chain ----------------------
+// --- Main handler with 5-tier extraction fallback chain ----------------------
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -1175,7 +1286,7 @@ Deno.serve(async (req) => {
     let totalExtractionFailures = 0;
     const failureDetails: any[] = [];
 
-    // 4. Process each document through the 4-tier extraction fallback chain
+    // 4. Process each document through the 5-tier extraction fallback chain
     for (const doc of docs) {
       let extracted: any[] = [];
       let usedModel: string | null = null;
@@ -1340,14 +1451,18 @@ Deno.serve(async (req) => {
         }
       }
 
-      // ─── TIER 3: Tesseract OCR (self-hosted, free) ───
-      // Calls the /api/internal/ocr Node route which runs tesseract.js.
-      // Returns null silently when OCR_SERVICE_URL/INTERNAL_OCR_SECRET are
-      // unset or the service is unreachable — Tier 4 is the safety net.
-      const tier3NotReached = extracted.length > 0 || docBudgetExhausted || !!rawText || budgetRemaining() <= 500;
+      // ─── TIER 3: Cloud Vision OCR (hosted, free monthly quota) ───
+      // Independent OCR vendor — plain HTTPS POST to vision.googleapis.com,
+      // no local compute. Handles IMAGE mime types only (PNG/JPEG/TIFF/etc.);
+      // PDFs are skipped here (Cloud Vision images:annotate doesn't support
+      // PDFs — async batch is heavier than this tier warrants) and routed to
+      // Tier 4 (Tesseract via Node route which has pdftoppm to rasterize).
+      // Gated behind GOOGLE_CLOUD_VISION_API_KEY — if missing, skipped silently.
+      const tier3NotReached = extracted.length > 0 || docBudgetExhausted || !!rawText || budgetRemaining() <= 500 || mimeType === "application/pdf";
       if (tier3NotReached) {
-        // Tier 3 not reached — Tier 1/2 already produced text, budget is
-        // exhausted, or remaining budget is too small for OCR.
+        // Tier 3 not reached — earlier tier succeeded, budget exhausted,
+        // text already available from Tier 2, budget too low, or this is a
+        // PDF (Cloud Vision images:annotate doesn't support PDFs directly).
         if (docOrgId) {
           const skipReason = extracted.length > 0
             ? 'Not needed — earlier tier succeeded'
@@ -1355,23 +1470,80 @@ Deno.serve(async (req) => {
               ? 'Budget exhausted'
               : rawText
                 ? 'Not needed — text already available from Tier 2'
-                : 'Budget remaining too low for OCR';
+                : mimeType === 'application/pdf'
+                  ? 'PDF not supported by Cloud Vision images:annotate (use async batch for PDFs)'
+                  : 'Budget remaining too low for OCR';
           void recordAttempt(admin, {
             document_id: doc.id,
             org_id: docOrgId,
             pipeline_trace_id: pipelineTraceId,
             tier: 3,
-            tier_name: 'tesseract_ocr',
+            tier_name: 'cloud_vision',
             status: 'skipped',
             error_message: skipReason,
           });
         }
       } else {
         extractionTier = 3;
-        console.log("[extract-document] Tier 3: trying Tesseract OCR");
+        console.log("[extract-document] Tier 3: trying Cloud Vision OCR");
         const t3Start = Date.now();
-        const tesseractResult = await tesseractOCR(ab, mimeType);
+        const cloudVisionResult = await callCloudVisionOCR(ab, mimeType);
         const t3Latency = Date.now() - t3Start;
+        if (cloudVisionResult.text) {
+          rawText = cloudVisionResult.text;
+          console.log("[extract-document] Cloud Vision produced text, running regex on it");
+        }
+        if (docOrgId) {
+          void recordAttempt(admin, {
+            document_id: doc.id,
+            org_id: docOrgId,
+            pipeline_trace_id: pipelineTraceId,
+            tier: 3,
+            tier_name: 'cloud_vision',
+            status: cloudVisionResult.text ? 'success' : 'failure',
+            latency_ms: t3Latency,
+            error_code: cloudVisionResult.errorCode || null,
+            // (P15-style) Use the actual failure reason from callCloudVisionOCR,
+            // not a one-size-fits-all generic string. A reviewer can now tell
+            // "key not configured" apart from "PDF not supported" apart from
+            // "API error" apart from "OCR ran but couldn't read the image."
+            error_message: cloudVisionResult.text ? null : (cloudVisionResult.reason || 'Cloud Vision OCR returned no text'),
+          });
+        }
+      }
+
+      // ─── TIER 4: Tesseract OCR (self-hosted, free) ───
+      // Calls the /api/internal/ocr Node route which runs tesseract.js.
+      // Returns null silently when OCR_SERVICE_URL/INTERNAL_OCR_SECRET are
+      // unset or the service is unreachable — Tier 5 is the safety net.
+      const tier4NotReached = extracted.length > 0 || docBudgetExhausted || !!rawText || budgetRemaining() <= 500;
+      if (tier4NotReached) {
+        // Tier 4 not reached — Tier 1/2/3 already produced text, budget is
+        // exhausted, or remaining budget is too small for OCR.
+        if (docOrgId) {
+          const skipReason = extracted.length > 0
+            ? 'Not needed — earlier tier succeeded'
+            : docBudgetExhausted
+              ? 'Budget exhausted'
+              : rawText
+                ? 'Not needed — text already available from Tier 2/3'
+                : 'Budget remaining too low for OCR';
+          void recordAttempt(admin, {
+            document_id: doc.id,
+            org_id: docOrgId,
+            pipeline_trace_id: pipelineTraceId,
+            tier: 4,
+            tier_name: 'tesseract_ocr',
+            status: 'skipped',
+            error_message: skipReason,
+          });
+        }
+      } else {
+        extractionTier = 4;
+        console.log("[extract-document] Tier 4: trying Tesseract OCR");
+        const t4Start = Date.now();
+        const tesseractResult = await tesseractOCR(ab, mimeType);
+        const t4Latency = Date.now() - t4Start;
         if (tesseractResult.text) {
           rawText = tesseractResult.text;
           console.log("[extract-document] Tesseract produced text, running regex on it");
@@ -1381,10 +1553,10 @@ Deno.serve(async (req) => {
             document_id: doc.id,
             org_id: docOrgId,
             pipeline_trace_id: pipelineTraceId,
-            tier: 3,
+            tier: 4,
             tier_name: 'tesseract_ocr',
             status: tesseractResult.text ? 'success' : 'failure',
-            latency_ms: t3Latency,
+            latency_ms: t4Latency,
             error_code: tesseractResult.errorCode || null,
             // (P15) Use the actual failure reason from tesseractOCR, not a
             // one-size-fits-all generic string. A reviewer can now tell
@@ -1395,36 +1567,37 @@ Deno.serve(async (req) => {
         }
       }
 
-      // ─── Regex extraction on whatever text we have (works for Tiers 2, 3) ───
+      // ─── Regex extraction on whatever text we have (works for Tiers 2, 3, 4) ───
       if (extracted.length === 0 && !docBudgetExhausted && rawText) {
         console.log(`[extract-document] Running regex extraction (tier ${extractionTier})`);
         extracted = regexExtract(rawText);
         if (extracted.length > 0) {
           extractionSource = extractionTier === 2 ? "pdf_text_layer" :
-                             extractionTier === 3 ? "tesseract" : "regex_fallback";
+                             extractionTier === 3 ? "cloud_vision" :
+                             extractionTier === 4 ? "tesseract" : "regex_fallback";
         }
       }
 
-      // ─── TIER 4: Mark as 'needs_manual_review' — NEVER silent zero ───
+      // ─── TIER 5: Mark as 'needs_manual_review' — NEVER silent zero ───
       // This branch handles BOTH (a) all tiers genuinely failing and (b) the
       // wall-clock budget being exhausted. In the budget case we use a clear
       // "extraction timeout" reason so the user knows WHY it was dropped.
       if (extracted.length === 0 || docBudgetExhausted) {
-        extractionTier = 4;
+        extractionTier = 5;
         extractionSource = docBudgetExhausted ? "timeout_manual_review" : "needs_manual_review";
 
         const reviewReason = docBudgetExhausted
           ? `Extraction timed out after ${BUDGET_MS / 1000}s wall-clock budget — the document could not be processed within the time limit. Please review manually.`
           : `All extraction tiers failed for ${doc.file_name}. Document requires manual review.`;
 
-        // Ledger: Tier 4 is always a failure (reaching here means every
+        // Ledger: Tier 5 is always a failure (reaching here means every
         // upstream tier failed or the budget was exhausted).
         if (docOrgId) {
           void recordAttempt(admin, {
             document_id: doc.id,
             org_id: docOrgId,
             pipeline_trace_id: pipelineTraceId,
-            tier: 4,
+            tier: 5,
             tier_name: 'needs_manual_review',
             status: 'failure',
             error_code: docBudgetExhausted ? 'budget_exhausted' : 'all_tiers_failed',
@@ -1465,7 +1638,7 @@ Deno.serve(async (req) => {
           file_name: doc.file_name,
           reason: reviewReason,
           budgetExhausted: docBudgetExhausted,
-          tiersTried: [1, 2, 3],
+          tiersTried: [1, 2, 3, 4],
           modelsTried: geminiDebug?.modelsTried || [],
           errors: geminiDebug?.errors || [],
         });
@@ -1476,7 +1649,7 @@ Deno.serve(async (req) => {
           doc_type: doc.doc_type,
           status: docBudgetExhausted ? "timeout_manual_review" : "needs_manual_review",
           extractionSource,
-          extractionTier: 4,
+          extractionTier: 5,
           fieldsCount: 0,
           fields: [],
         });
@@ -1487,7 +1660,7 @@ Deno.serve(async (req) => {
           user_id: user.id,
           text: docBudgetExhausted
             ? `[extraction] Document ${doc.file_name} dropped to manual review — ${BUDGET_MS / 1000}s wall-clock budget exhausted`
-            : `[extraction] Document ${doc.file_name} marked for manual review — all 4 tiers failed`,
+            : `[extraction] Document ${doc.file_name} marked for manual review — all 5 tiers failed`,
           type: "warning",
         }).then(({ error }: any) => { if (error) console.warn("[extract-document] audit log failed:", error.message); });
 
