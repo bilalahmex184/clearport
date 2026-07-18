@@ -44,6 +44,28 @@ export function getSupabase(): SupabaseClient | null {
 
 export const supabase = getSupabase();
 
+// ── §2 fix: proactive session-expiry redirect ──
+// When Supabase's own token refresh fails (e.g. refresh token revoked, or the
+// session expired while the user was idle), the client fires a SIGNED_OUT
+// auth state event. Listen for it and redirect to /login so the user doesn't
+// see raw errors scattered across the UI on their next interaction.
+//
+// This catches the idle-expiry case that apiFetch's 401 handler can't — the
+// 401 only fires when an API call is actually made, but SIGNED_OUT fires
+// proactively as soon as the refresh fails.
+if (supabase && typeof window !== 'undefined') {
+  supabase.auth.onAuthStateChange((event) => {
+    if (event === 'SIGNED_OUT') {
+      // Only redirect if we're not already on a public route (login/signup/etc)
+      const path = window.location.pathname;
+      const publicRoutes = ['/login', '/signup', '/reset-password', '/accept-invite', '/terms', '/privacy', '/legal'];
+      if (!publicRoutes.includes(path)) {
+        redirectToLogin('SIGNED_OUT event — session expired or revoked');
+      }
+    }
+  });
+}
+
 export function isSupabaseConfigured(): boolean {
   return !!supabaseUrl && !!supabaseAnonKey && !!supabase;
 }
@@ -130,6 +152,49 @@ export function isDemoMode(): boolean {
 }
 
 // ============================================================================
+// INVITE-REDIRECT DECISION LOGIC (extracted for testability)
+// ============================================================================
+// Pure function that decides what to do when a user lands on /accept-invite
+// with a token. Extracted from the React component so it can be unit-tested
+// without rendering the page.
+// ============================================================================
+
+export type InviteRedirectDecision =
+  | { action: 'error'; reason: 'no_token' }
+  | { action: 'needs_auth'; signupUrl: string; loginUrl: string }
+  | { action: 'accept'; token: string };
+
+/**
+ * Given an invite token and whether the user has an active session, decide
+ * what the accept-invite page should do:
+ *   - no token → error
+ *   - token + no session + not demo mode → needs_auth (redirect to signup/login)
+ *   - token + session (or demo mode) → accept (call /api/invites/accept)
+ *
+ * This is the exact decision logic from AcceptInviteContent's useEffect,
+ * extracted so it can be tested without a live Supabase connection.
+ */
+export function decideInviteAction(
+  token: string | null,
+  hasSession: boolean,
+  demoMode: boolean,
+): InviteRedirectDecision {
+  if (!token) {
+    return { action: 'error', reason: 'no_token' };
+  }
+
+  if (!hasSession && !demoMode) {
+    return {
+      action: 'needs_auth',
+      signupUrl: `/signup?invite=${encodeURIComponent(token)}`,
+      loginUrl: `/login?redirect=${encodeURIComponent(`/accept-invite?token=${token}`)}`,
+    };
+  }
+
+  return { action: 'accept', token };
+}
+
+// ============================================================================
 // EDGE FUNCTION INVOCATION HELPER
 // ============================================================================
 
@@ -178,12 +243,34 @@ export async function getAuthToken(): Promise<string | null> {
 }
 
 /**
+ * Redirect the browser to /login when a session is expired or invalid.
+ *
+ * Reused by both apiFetch() (reactive — when an API call returns 401) and the
+ * SIGNED_OUT auth state listener (proactive — when Supabase's own token
+ * refresh fails while the user is idle).
+ *
+ * Server-side / non-browser callers (typeof window === 'undefined') are not
+ * redirected — they just get the thrown Error from the calling path.
+ *
+ * Exported so tests can mock/verify the redirect behavior.
+ */
+export function redirectToLogin(reason: string): void {
+  if (typeof window === 'undefined') return; // server-side — no redirect
+  const currentPath = window.location.pathname + window.location.search;
+  const loginUrl = new URL('/login', window.location.origin);
+  loginUrl.searchParams.set('redirect', currentPath);
+  console.warn(`[auth] redirecting to login (${reason})`);
+  window.location.href = loginUrl.href;
+}
+
+/**
  * Thin fetch() wrapper that:
- *  1. Ensures the anonymous session exists (so a JWT is available).
+ *  1. Ensures the session exists (so a JWT is available).
  *  2. Attaches `Authorization: Bearer <jwt>` to every request.
  *  3. Sets `Content-Type: application/json` for requests with a body.
- *  4. Throws an Error on non-2xx responses (with the response body text for
- *     debugging) so callers can try/catch and fall back to seed data.
+ *  4. On 401: redirects the browser to /login (session expired), then throws.
+ *  5. Throws an Error on other non-2xx responses (with the response body text
+ *     for debugging) so callers can try/catch and fall back to seed data.
  *
  * Returns the parsed JSON body. For non-JSON responses (e.g. CSV), pass
  * `raw: true` to get the Response object back instead.
@@ -212,6 +299,16 @@ export async function apiFetch<T = any>(
   }
 
   const res = await fetch(path, { ...options, headers });
+
+  // ── §2 fix: 401 → redirect to /login (session expired mid-use) ──
+  // The middleware cookie check only verifies cookie presence, not token
+  // validity. When a real session expires and an API call gets 401 back,
+  // redirect the browser to /login instead of showing a raw thrown error.
+  // Still throw so calling code with its own error handling isn't swallowed.
+  if (res.status === 401) {
+    redirectToLogin('API returned 401 — session expired');
+    throw new Error(`API ${path} failed (401): session expired`);
+  }
 
   if (!res.ok) {
     let detail = '';

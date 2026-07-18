@@ -1741,3 +1741,37 @@ Stage Summary:
   - tsc: 0 errors, lint: 0 errors, tests: 182/182, build: succeeds ✓
 - Browser-verified: login page renders with email/password fields, auth redirect works, no console errors.
 - Existing anonymous user data: any org memberships/audit logs tied to anonymous user IDs from prior testing remain in the DB. They're harmless (RLS still scopes by org_id), but a production deployment should clean them up or start with a fresh Supabase project.
+
+---
+Task ID: S2-S3-SESSION-EXPIRY-AND-AUTH-TESTS
+Agent: main
+Task: §2 expired session redirect to login + §3 auth system test coverage
+
+Work Log:
+
+§2 (expired session redirect):
+- src/lib/supabase.ts: extracted redirectToLogin() helper (exported for testability) that builds /login?redirect=<currentPath> URL and sets window.location.href. Guarded by typeof window !== 'undefined' so server-side callers aren't affected.
+- apiFetch(): on res.status === 401, calls redirectToLogin() then throws Error (so calling code with its own error handling isn't silently swallowed).
+- Added proactive SIGNED_OUT listener at module load: supabase.auth.onAuthStateChange fires SIGNED_OUT when the token refresh fails (idle expiry). The listener checks if the current path is a public route; if not, calls redirectToLogin(). This catches the idle-expiry case that apiFetch's 401 handler can't (401 only fires on an actual API call).
+
+§3 (auth system tests):
+- Created tests/unit-pure/07-auth-system.test.ts (17 tests, uses @vitest-environment jsdom for window/location mocking)
+- Installed jsdom as devDependency
+- Test coverage:
+  1. isDemoMode() — returns boolean, defaults to false when env unset (production behavior)
+  2. ensureAuthenticated() source-code gating guard — reads supabase.ts source and verifies DEMO_MODE check comes BEFORE signInAnonymously() call (static analysis test that doesn't need a live Supabase client)
+  3. decideInviteAction() — 7 tests covering: no token → error, empty token → error, token + no session + not demo → needs_auth (with encoded signup/login URLs), token + session → accept, token + demo mode → accept, token + all true → accept, proper URL encoding of special chars
+  4. apiFetch() 401 handling — 3 tests: redirects to /login on 401, still throws Error on 401, does NOT redirect on 500
+  5. redirectToLogin() — 2 tests: sets href correctly with redirect param, logs reason to console.warn
+  6. SIGNED_OUT public-route guard — 2 tests: doesn't redirect when already on /login, does redirect when on /dashboard
+
+Stage Summary:
+- All acceptance criteria pass:
+  - 401 handling: apiFetch redirects to /login on 401, throws Error either way ✓
+  - SIGNED_OUT listener: registered at module load, redirects on session expiry ✓
+  - New tests: 17 tests in 07-auth-system.test.ts, all pass ✓
+  - Total test count: 199 (was 182, +17) ✓
+  - git diff --stat: only src/lib/supabase.ts + tests/unit-pure/07-auth-system.test.ts + package.json (jsdom) + bun.lock ✓
+  - lint: 0 errors ✓
+  - build: succeeds ✓
+- Follow-up note: ensureAuthenticated() full runtime test (actually calling signInAnonymously and verifying it's skipped in production) requires a live Supabase client or a more complex mock of the Supabase auth module. The static-analysis source-code gating test guards against the regression without that complexity. A future improvement would be to mock the entire Supabase client and test ensureAuthenticated's runtime branching.
