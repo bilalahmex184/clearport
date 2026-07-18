@@ -214,9 +214,9 @@ export default function ExceptionDesk() {
     : selectedEntry.fields;
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 h-full overflow-hidden p-6 font-sans">
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 lg:gap-5 h-full overflow-y-auto lg:overflow-hidden p-3 sm:p-4 md:p-6 font-sans">
       {/* LEFT PANEL: EXCEPTION LIST */}
-      <div className="lg:col-span-3 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden">
+      <div className="lg:col-span-3 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden min-h-[400px] lg:min-h-0">
         <div className="p-4 border-b border-gray-900 bg-[#0e1017]">
           <div className="flex items-center justify-between mb-2">
             <span className="font-mono text-xs text-gray-500 tracking-wider">EXCEPTIONS DESK</span>
@@ -380,7 +380,7 @@ export default function ExceptionDesk() {
       </div>
 
       {/* CENTER PANEL: DOCUMENT VIEWER */}
-      <div className="lg:col-span-5 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden relative">
+      <div className="lg:col-span-5 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden relative min-h-[500px] lg:min-h-0">
         {/* Document Tabs (data-driven) */}
         <div className="px-4 py-2 bg-[#0e1017] border-b border-gray-900 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-1.5 overflow-x-auto">
@@ -429,7 +429,7 @@ export default function ExceptionDesk() {
         </div>
 
         {/* Document Board — shows real uploaded file or extracted data view */}
-        <div className="flex-1 overflow-auto bg-[#040406] p-6 flex items-start justify-center relative">
+        <div className="flex-1 overflow-auto bg-[#040406] p-3 sm:p-4 md:p-6 flex items-start justify-center relative">
           {documentUrl ? (
             /* Real file viewer — show the actual uploaded document based on MIME type */
             <div
@@ -444,7 +444,7 @@ export default function ExceptionDesk() {
                 /* Text file — show in iframe with monospace styling */
                 <iframe
                   src={documentUrl}
-                  className="w-[500px] h-[600px] bg-white"
+                  className="w-full max-w-[500px] h-[400px] sm:h-[500px] md:h-[600px] bg-white"
                   title="Document text"
                   style={{ fontFamily: 'monospace', fontSize: '12px' }}
                 />
@@ -452,7 +452,7 @@ export default function ExceptionDesk() {
                 /* PDF — show in iframe (browser's built-in PDF viewer) */
                 <iframe
                   src={documentUrl}
-                  className="w-[500px] h-[600px] bg-white"
+                  className="w-full max-w-[500px] h-[400px] sm:h-[500px] md:h-[600px] bg-white"
                   title="Document PDF"
                 />
               ) : documentMime.startsWith('image/') ? (
@@ -460,14 +460,14 @@ export default function ExceptionDesk() {
                 <img
                   src={documentUrl}
                   alt={`Document: ${activeDocTab}`}
-                  className="max-w-[500px] max-h-[600px] object-contain"
+                  className="max-w-full max-h-[400px] sm:max-h-[500px] md:max-h-[600px] object-contain mx-auto"
                   onError={(e) => {
                     console.warn('[doc-viewer] image failed to load:', documentUrl);
                   }}
                 />
               ) : (
                 /* Unknown type — provide download link */
-                <div className="w-[500px] h-[600px] flex flex-col items-center justify-center bg-gray-50 p-8 text-center">
+                <div className="w-full max-w-[500px] h-[400px] sm:h-[500px] md:h-[600px] flex flex-col items-center justify-center bg-gray-50 p-4 sm:p-8 text-center">
                   <FileText className="w-16 h-16 text-gray-400 mb-4" />
                   <p className="text-sm font-semibold text-gray-700 mb-2">
                     {activeDocTab || 'Document'}
@@ -517,7 +517,7 @@ export default function ExceptionDesk() {
                 transformOrigin: 'top center',
                 transition: 'transform 0.15s ease-out',
               }}
-              className="w-[500px] bg-[#0c0d12] border border-gray-800 rounded-xl shadow-2xl p-6 relative"
+              className="w-full max-w-[500px] bg-[#0c0d12] border border-gray-800 rounded-xl shadow-2xl p-4 sm:p-6 relative"
             >
               <div className="flex items-center justify-between mb-4 pb-3 border-b border-gray-800">
                 <div>
@@ -603,7 +603,7 @@ export default function ExceptionDesk() {
       </div>
 
       {/* RIGHT PANEL: RESOLUTION DESK */}
-      <div className="lg:col-span-4 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden">
+      <div className="lg:col-span-4 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden min-h-[400px] lg:min-h-0">
         {selectedException ? (
           <div className="flex-1 flex flex-col justify-between overflow-hidden">
             <div className="p-4 space-y-4 overflow-y-auto flex-1">

@@ -164,7 +164,7 @@ export default function BrokerTemplates() {
   };
 
   return (
-    <div className="space-y-6 overflow-y-auto h-full pb-8 pr-2 p-6 font-sans">
+    <div className="space-y-4 sm:space-y-6 overflow-y-auto h-full pb-6 sm:pb-8 pr-1 sm:pr-2 p-3 sm:p-4 md:p-6 font-sans">
       {/* Header */}
       <div className="bg-[#0c0d12] border border-gray-900 rounded-xl p-5">
         <span className="font-mono text-xs text-amber-500 tracking-wider">BROKER TEMPLATES</span>
@@ -276,7 +276,7 @@ export default function BrokerTemplates() {
               </div>
 
               {/* Mapping table */}
-              <div className="flex-1 overflow-y-auto">
+              <div className="flex-1 overflow-auto">
                 <table className="w-full text-left text-xs">
                   <thead className="sticky top-0 bg-black/30 border-b border-gray-900">
                     <tr className="text-[10px] font-mono text-gray-500 uppercase tracking-wider">

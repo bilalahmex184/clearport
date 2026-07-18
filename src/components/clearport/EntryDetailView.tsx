@@ -62,9 +62,9 @@ export default function EntryDetailView() {
   };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 h-full overflow-hidden p-6 font-sans">
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 lg:gap-5 h-full overflow-y-auto lg:overflow-hidden p-3 sm:p-4 md:p-6 font-sans">
       {/* LEFT COLUMN: SHIPMENT SELECTOR */}
-      <div className="lg:col-span-3 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden">
+      <div className="lg:col-span-3 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden min-h-[300px] lg:min-h-0">
         <div className="p-4 border-b border-gray-900 bg-[#0e1017]">
           <span className="font-mono text-xs text-gray-500 tracking-wider">ENTRY RECORDS REGISTER</span>
           <h2 className="text-sm font-semibold text-gray-200 mt-1">Select Shipment Archive</h2>
@@ -110,7 +110,7 @@ export default function EntryDetailView() {
       </div>
 
       {/* RIGHT COLUMN: TIMELINE + FIELDS TABLE */}
-      <div className="lg:col-span-9 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden">
+      <div className="lg:col-span-9 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden min-h-[400px] lg:min-h-0">
         {/* Timeline */}
         <div className="p-5 border-b border-gray-900 bg-[#0e1017]">
           <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6">
@@ -139,13 +139,13 @@ export default function EntryDetailView() {
           {/* Timeline Grid */}
           <div className="relative pt-1 max-w-4xl mx-auto">
             <div className="absolute top-[21px] left-4 right-4 h-0.5 bg-gray-900 -z-10"></div>
-            <div className="grid grid-cols-5 gap-2">
+            <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
               {['UPLOADED', 'OCR PARSED', 'UNDER REVIEW', 'APPROVED', 'EXPORTED'].map((label, idx) => (
                 <div key={label} className="text-center">
                   <div className={`w-8 h-8 rounded-full border-2 mx-auto flex items-center justify-center font-mono text-xs font-extrabold z-10 transition-all ${getStepClass(idx + 1)}`}>
                     {String(idx + 1).padStart(2, '0')}
                   </div>
-                  <span className="text-[10px] font-bold text-gray-400 font-mono tracking-wider block mt-2">{label}</span>
+                  <span className="text-[9px] sm:text-[10px] font-bold text-gray-400 font-mono tracking-wider block mt-2">{label}</span>
                 </div>
               ))}
             </div>
@@ -153,7 +153,7 @@ export default function EntryDetailView() {
         </div>
 
         {/* Fields Table */}
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-auto">
           <table className="w-full text-left border-collapse text-xs">
             <thead>
               <tr className="border-b border-gray-900 text-[10px] font-mono text-gray-500 uppercase tracking-wider bg-black/30 sticky top-0">

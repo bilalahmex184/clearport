@@ -1286,3 +1286,28 @@ Stage Summary:
   - extract-document edge function needs redeployment (4-tier renumber + tesseract + ledger writes)
   - Migration 017 needs to be run on live DB
   - OCR_SERVICE_URL + INTERNAL_OCR_SECRET need to be set as Supabase secrets
+
+---
+Task ID: RESPONSIVE-FIX
+Agent: main
+Task: Make all view components fully responsive — desktop-optimized with full feature accessibility on phones.
+
+Work Log:
+- ExceptionDesk.tsx: Changed container from `h-full overflow-hidden p-6` to `h-full overflow-y-auto lg:overflow-hidden p-3 sm:p-4 md:p-6` so stacked panes scroll on mobile. Added `min-h-[400px] lg:min-h-0` to all 3 panes (left list, center viewer, right detail) so they're usable when stacked. Fixed 4 fixed-width `w-[500px]` elements → `w-full max-w-[500px]` with responsive heights. Reduced document viewer padding from `p-6` to `p-3 sm:p-4 md:p-6`.
+- EntryDetailView.tsx: Same container fix. Changed timeline grid from `grid-cols-5` to `grid-cols-3 sm:grid-cols-5` so it doesn't squish on phone. Added min-height to both columns. Changed fields table wrapper to `overflow-auto` for horizontal scroll. Reduced timeline label font from `text-[10px]` to `text-[9px] sm:text-[10px]`.
+- IngestUpload.tsx: Same container fix. Reduced upload zone padding from `p-12` to `p-6 sm:p-10 md:p-12`. Added min-heights to both columns.
+- Dashboard.tsx, CrossDocAuditor.tsx, OperationalRules.tsx, BrokerAnalytics.tsx, BrokerTemplates.tsx, TeamManagement.tsx: Batch-fixed scrollable layout padding from `space-y-6 p-6 pb-8 pr-2` to `space-y-4 sm:space-y-6 p-3 sm:p-4 md:p-6 pb-6 sm:pb-8 pr-1 sm:pr-2`.
+- BrokerTemplates.tsx: Changed mapping table wrapper to `overflow-auto` for horizontal scroll on mobile.
+
+Browser verification (agent-browser):
+- Mobile (390x844 iPhone 14): All 9 tabs accessible via hamburger drawer. Exception Desk shows all 3 panes stacked + scrollable. Ingest Desk upload zone visible. Command Center stats render. Team Management renders. Footer pushes down naturally (scrollHeight 2187 > viewport 844). No console errors.
+- Desktop (1440x900): Full sidebar visible. Exception Desk 3-pane layout intact. Footer sticky at bottom (footer.bottom=900=innerHeight). No console errors.
+
+Stage Summary:
+- All features accessible on phone (hamburger sidebar → all 9 tabs work)
+- Desktop layout preserved (multi-pane grids, dense information display)
+- tsc: 0 errors, lint: 0 errors
+- Key pattern: `overflow-y-auto lg:overflow-hidden` lets mobile scroll while desktop panes scroll independently
+- Fixed-width elements (`w-[500px]`) replaced with `w-full max-w-[500px]` + responsive heights
+- Tables get horizontal scroll via `overflow-auto` wrappers
+- Padding scales: `p-3 sm:p-4 md:p-6` (mobile → tablet → desktop)

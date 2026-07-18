@@ -66,7 +66,7 @@ export default function Dashboard() {
   const totalDocs = entries.reduce((acc, curr) => acc + curr.docsCount, 0);
 
   return (
-    <div className="space-y-6 overflow-y-auto h-full pb-8 pr-2 p-6 font-sans">
+    <div className="space-y-4 sm:space-y-6 overflow-y-auto h-full pb-6 sm:pb-8 pr-1 sm:pr-2 p-3 sm:p-4 md:p-6 font-sans">
       {/* HEADER + THEME SWITCH */}
       <div className={`flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pb-4 border-b ${
         theme === 'light' ? 'border-gray-200' : 'border-gray-900/40'

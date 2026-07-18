@@ -1,0 +1,851 @@
+     1→'use client';
+     2→
+     3→import * as React from 'react';
+     4→import { useClearPort } from '@/context/ClearPortContext';
+     5→import {
+     6→  AlertCircle, CheckCircle2, ChevronRight, Eye, RefreshCw, XCircle, FileText,
+     7→  ZoomIn, ZoomOut, RotateCw, Sparkles, Undo2, Loader2, FileSpreadsheet,
+     8→} from 'lucide-react';
+     9→import { motion, AnimatePresence } from 'framer-motion';
+    10→import { supabase, invokeEdgeFunction } from '@/lib/supabase';
+    11→import { canResolve, roleLabel } from '@/lib/services/rbac.service';
+    12→
+    13→export default function ExceptionDesk() {
+    14→  const {
+    15→    entries,
+    16→    selectedEntry,
+    17→    selectedExceptionId,
+    18→    selectedException,
+    19→    selectException,
+    20→    updateException,
+    21→    undoLastAction,
+    22→    acceptAllHighConfidence,
+    23→    rules,
+    24→    userRole,
+    25→    exportToCSV,
+    26→  } = useClearPort();
+    27→
+    28→  // RBAC: viewer role cannot resolve exceptions. They can still browse the
+    29→  // document viewer + exception list (read-only), but the Accept / Modify /
+    30→  // Reject buttons are hidden and the keyboard shortcuts that mutate state
+    31→  // are disabled below.
+    32→  const canResolveExceptions = canResolve(userRole);
+    33→
+    34→  const [severityFilter, setSeverityFilter] = React.useState<'All' | 'High' | 'Medium' | 'Low'>('All');
+    35→  const [sortBy, setSortBy] = React.useState<'severity' | 'confidence' | 'fieldName'>('severity');
+    36→  const [isEditing, setIsEditing] = React.useState(false);
+    37→  const [editValue, setEditValue] = React.useState('');
+    38→  const [activeDocTab, setActiveDocTab] = React.useState('');
+    39→  const [zoomLevel, setZoomLevel] = React.useState(100);
+    40→  const [rotation, setRotation] = React.useState(0);
+    41→  const [showHistory, setShowHistory] = React.useState(false);
+    42→  const [documentUrl, setDocumentUrl] = React.useState<string | null>(null);
+    43→  const [documentMime, setDocumentMime] = React.useState<string>('');
+    44→  const [isLoadingUrl, setIsLoadingUrl] = React.useState(false);
+    45→  const inputRef = React.useRef<HTMLInputElement>(null);
+    46→
+    47→  // Fetch signed URL for the active document when tab changes
+    48→  React.useEffect(() => {
+    49→    if (!selectedEntry || !activeDocTab) {
+    50→      setDocumentUrl(null);
+    51→      setDocumentMime('');
+    52→      return;
+    53→    }
+    54→
+    55→    // Find the document matching the active tab
+    56→    const doc = selectedEntry.documents.find(d => d.docType === activeDocTab);
+    57→    if (!doc) {
+    58→      setDocumentUrl(null);
+    59→      setDocumentMime('');
+    60→      return;
+    61→    }
+    62→
+    63→    let cancelled = false;
+    64→    setIsLoadingUrl(true);
+    65→    setDocumentUrl(null);
+    66→    setDocumentMime(doc.mimeType || '');
+    67→
+    68→    (async () => {
+    69→      try {
+    70→        // Try the get-document-url edge function first
+    71→        const response = await invokeEdgeFunction<any>('get-document-url', {
+    72→          storagePath: doc.storagePath,
+    73→        });
+    74→        if (!cancelled && response?.success && response.signedUrl) {
+    75→          setDocumentUrl(response.signedUrl);
+    76→        }
+    77→      } catch (err) {
+    78→        // Fallback: try direct Supabase storage signed URL
+    79→        if (supabase && !cancelled) {
+    80→          try {
+    81→            const { data } = await supabase.storage
+    82→              .from('documents')
+    83→              .createSignedUrl(doc.storagePath, 3600);
+    84→            if (data?.signedUrl) {
+    85→              setDocumentUrl(data.signedUrl);
+    86→            }
+    87→          } catch (e) {
+    88→            console.warn('[doc-url] failed to get signed URL:', e);
+    89→          }
+    90→        }
+    91→      } finally {
+    92→        if (!cancelled) setIsLoadingUrl(false);
+    93→      }
+    94→    })();
+    95→
+    96→    return () => { cancelled = true; };
+    97→  }, [selectedEntry?.id, activeDocTab]);
+    98→
+    99→  // Fix: use useEffect instead of setState-during-render
+   100→  React.useEffect(() => {
+   101→    if (selectedException) {
+   102→      setEditValue(selectedException.correctedValue ?? selectedException.extractedValue);
+   103→      setActiveDocTab(selectedException.docType);
+   104→      setIsEditing(false);
+   105→    }
+   106→  }, [selectedException?.id]);
+   107→
+   108→  // Keyboard shortcuts (scoped — only when not typing in input)
+   109→  React.useEffect(() => {
+   110→    const handleKeyDown = (e: KeyboardEvent) => {
+   111→      const activeEl = document.activeElement;
+   112→      if (activeEl?.tagName === 'INPUT' || activeEl?.tagName === 'TEXTAREA') {
+   113→        if (e.key === 'Escape') {
+   114→          inputRef.current?.blur();
+   115→          setIsEditing(false);
+   116→        }
+   117→        return;
+   118→      }
+   119→
+   120→      if (!selectedException || !selectedEntry) return;
+   121→
+   122→      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+   123→        // Undo is a resolve-adjacent action — gated by the same RBAC check.
+   124→        if (!canResolveExceptions) return;
+   125→        e.preventDefault();
+   126→        undoLastAction();
+   127→        return;
+   128→      }
+   129→
+   130→      // Accept / Modify / Reject shortcuts are no-ops for viewer role.
+   131→      if (!canResolveExceptions) return;
+   132→
+   133→      if (e.key === ' ') {
+   134→        e.preventDefault();
+   135→        updateException(selectedEntry.id, selectedException.id, 'Accepted');
+   136→      }
+   137→
+   138→      if (e.key.toLowerCase() === 'e') {
+   139→        e.preventDefault();
+   140→        setIsEditing(true);
+   141→        setTimeout(() => inputRef.current?.focus(), 50);
+   142→      }
+   143→
+   144→      if (e.key.toLowerCase() === 'r') {
+   145→        e.preventDefault();
+   146→        updateException(selectedEntry.id, selectedException.id, 'Rejected');
+   147→      }
+   148→    };
+   149→
+   150→    window.addEventListener('keydown', handleKeyDown);
+   151→    return () => window.removeEventListener('keydown', handleKeyDown);
+   152→  }, [selectedException, selectedEntry, updateException, undoLastAction, canResolveExceptions]);
+   153→
+   154→  if (!selectedEntry) {
+   155→    return (
+   156→      <div className="h-full flex flex-col items-center justify-center text-gray-500 p-6">
+   157→        <AlertCircle className="w-12 h-12 mb-4 text-gray-600 animate-pulse" />
+   158→        <p className="text-sm font-medium">No shipment selected</p>
+   159→        <p className="text-xs text-gray-600 mt-1">Please select an active batch from the Dashboard or sidebar.</p>
+   160→      </div>
+   161→    );
+   162→  }
+   163→
+   164→  const exceptions = selectedEntry.exceptions;
+   165→
+   166→  // Filter & Sort
+   167→  const filteredExceptions = exceptions.filter(ex => {
+   168→    if (severityFilter === 'All') return true;
+   169→    if (severityFilter === 'High') return ex.confidence < 60;
+   170→    if (severityFilter === 'Medium') return ex.confidence >= 60 && ex.confidence < 85;
+   171→    if (severityFilter === 'Low') return ex.confidence >= 85;
+   172→    return true;
+   173→  });
+   174→
+   175→  const sortedExceptions = [...filteredExceptions].sort((a, b) => {
+   176→    if (sortBy === 'severity') return a.confidence - b.confidence;
+   177→    if (sortBy === 'confidence') return b.confidence - a.confidence;
+   178→    return a.fieldName.localeCompare(b.fieldName);
+   179→  });
+   180→
+   181→  const totalExceptions = exceptions.length;
+   182→  const resolvedExceptions = exceptions.filter(ex => ex.status !== 'Unresolved').length;
+   183→  const highConfidenceCount = exceptions.filter(ex => ex.status === 'Unresolved' && ex.confidence >= rules.invoiceThreshold).length;
+   184→
+   185→  const getConfidenceColor = (conf: number) => {
+   186→    if (conf < 60) return 'text-red-400 bg-red-950/40 border-red-900/50';
+   187→    if (conf < 85) return 'text-amber-400 bg-amber-950/40 border-amber-900/50';
+   188→    return 'text-green-400 bg-green-950/40 border-green-900/50';
+   189→  };
+   190→
+   191→  const getConfidenceBadge = (conf: number) => {
+   192→    if (conf < 60) return 'RED / CRITICAL';
+   193→    if (conf < 85) return 'AMBER / WARNING';
+   194→    return 'GREEN / COMPLIANT';
+   195→  };
+   196→
+   197→  const handleSaveEdit = () => {
+   198→    if (selectedException && selectedEntry) {
+   199→      updateException(selectedEntry.id, selectedException.id, 'Corrected', editValue);
+   200→      setIsEditing(false);
+   201→    }
+   202→  };
+   203→
+   204→  // Data-driven document tabs (derive from shipment fields, not hardcoded IDs)
+   205→  // Derive available doc types from BOTH fields' sourceDoc AND uploaded documents
+   206→  const availableDocTypes = Array.from(new Set([
+   207→    ...selectedEntry.fields.map(f => f.sourceDoc).filter(Boolean),
+   208→    ...selectedEntry.documents.map(d => d.docType).filter(Boolean),
+   209→  ]));
+   210→
+   211→  // Filter fields by the active doc tab (if multiple doc types exist)
+   212→  const fieldsForActiveTab = availableDocTypes.length > 1
+   213→    ? selectedEntry.fields.filter(f => f.sourceDoc === activeDocTab || !activeDocTab)
+   214→    : selectedEntry.fields;
+   215→
+   216→  return (
+   217→    <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 h-full overflow-hidden p-6 font-sans">
+   218→      {/* LEFT PANEL: EXCEPTION LIST */}
+   219→      <div className="lg:col-span-3 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden">
+   220→        <div className="p-4 border-b border-gray-900 bg-[#0e1017]">
+   221→          <div className="flex items-center justify-between mb-2">
+   222→            <span className="font-mono text-xs text-gray-500 tracking-wider">EXCEPTIONS DESK</span>
+   223→            <span className="font-mono text-xs text-emerald-400 bg-emerald-950/30 px-2 py-0.5 rounded border border-emerald-900/40">
+   224→              {resolvedExceptions} / {totalExceptions} RESOLVED
+   225→            </span>
+   226→          </div>
+   227→          <h2 className="text-sm font-medium text-gray-200 tracking-tight flex items-center gap-1.5">
+   228→            <FileText className="w-4 h-4 text-gray-400" />
+   229→            {selectedEntry.id}
+   230→          </h2>
+   231→          <p className="text-xs text-gray-500 mt-1 truncate">{selectedEntry.shipper}</p>
+   232→
+   233→          {/* CSV Export Button */}
+   234→          <button
+   235→            onClick={() => exportToCSV(selectedEntry.id)}
+   236→            className="mt-3 w-full flex items-center justify-center gap-1.5 text-[10px] bg-emerald-600 hover:bg-emerald-500 text-black font-bold px-2 py-1.5 rounded-lg transition-all cursor-pointer uppercase tracking-wider"
+   237→          >
+   238→            <FileSpreadsheet className="w-3 h-3" />
+   239→            Export CSV
+   240→          </button>
+   241→
+   242→          {/* (§4) Validation status banner — reads validation_status, not just totalExceptions */}
+   243→          {selectedEntry.validationStatus === 'completed' && totalExceptions === 0 && (
+   244→            <div className="mt-2 p-2 rounded-lg border text-[10px] font-mono flex items-center gap-1.5 bg-emerald-950/30 border-emerald-900/40 text-emerald-400">
+   245→              <CheckCircle2 className="w-3 h-3 shrink-0" />
+   246→              <span>VALIDATED — zero exceptions found. Shipment is clean.</span>
+   247→            </div>
+   248→          )}
+   249→          {selectedEntry.validationStatus === 'completed' && totalExceptions > 0 && (
+   250→            <div className="mt-2 p-2 rounded-lg border text-[10px] font-mono flex items-center gap-1.5 bg-amber-950/30 border-amber-900/40 text-amber-400">
+   251→              <AlertCircle className="w-3 h-3 shrink-0" />
+   252→              <span>VALIDATED — {totalExceptions} exceptions require review.</span>
+   253→            </div>
+   254→          )}
+   255→          {(selectedEntry.validationStatus === 'failed' || selectedEntry.validationStatus === 'degraded') && (
+   256→            <div className="mt-2 p-2 rounded-lg border text-[10px] font-mono flex items-center gap-1.5 bg-red-950/30 border-red-900/40 text-red-400">
+   257→              <AlertCircle className="w-3 h-3 shrink-0" />
+   258→              <span>VALIDATION INCOMPLETE — pipeline error, retry required.</span>
+   259→            </div>
+   260→          )}
+   261→          {(selectedEntry.validationStatus === 'pending' || selectedEntry.validationStatus === 'running' || !selectedEntry.validationStatus) && (
+   262→            <div className="mt-2 p-2 rounded-lg border text-[10px] font-mono flex items-center gap-1.5 bg-blue-950/30 border-blue-900/40 text-blue-400">
+   263→              <Loader2 className="w-3 h-3 shrink-0 animate-spin" />
+   264→              <span>VALIDATION IN PROGRESS — not yet validated.</span>
+   265→            </div>
+   266→          )}
+   267→        </div>
+   268→
+   269→        {/* Filters */}
+   270→        <div className="p-3 border-b border-gray-900 bg-[#090a0f] space-y-2.5">
+   271→          <div className="flex items-center gap-1">
+   272→            {(['All', 'High', 'Medium', 'Low'] as const).map(filter => (
+   273→              <button
+   274→                key={filter}
+   275→                onClick={() => setSeverityFilter(filter)}
+   276→                className={`text-[11px] px-2.5 py-1 rounded-md font-medium transition-all ${
+   277→                  severityFilter === filter
+   278→                    ? 'bg-gray-800 text-white'
+   279→                    : 'text-gray-500 hover:text-gray-300 hover:bg-gray-950'
+   280→                }`}
+   281→              >
+   282→                {filter}
+   283→              </button>
+   284→            ))}
+   285→          </div>
+   286→
+   287→          <div className="flex items-center justify-between gap-2 pt-1">
+   288→            <span className="text-[10px] font-mono text-gray-500 uppercase tracking-widest">SORT BY</span>
+   289→            <select
+   290→              value={sortBy}
+   291→              onChange={e => setSortBy(e.target.value as any)}
+   292→              className="bg-black border border-gray-800 text-gray-300 rounded px-1.5 py-0.5 text-xs focus:outline-none focus:border-gray-700 font-medium"
+   293→            >
+   294→              <option value="severity">Severity (Low Conf)</option>
+   295→              <option value="confidence">Confidence (High)</option>
+   296→              <option value="fieldName">Field Name</option>
+   297→            </select>
+   298→          </div>
+   299→
+   300→          {highConfidenceCount > 0 && canResolveExceptions && (
+   301→            <button
+   302→              onClick={() => acceptAllHighConfidence(selectedEntry.id)}
+   303→              className="w-full flex items-center justify-center gap-1.5 text-xs bg-emerald-950/30 text-emerald-400 border border-emerald-900/50 hover:bg-emerald-900/20 py-2 rounded-md transition-all cursor-pointer font-medium mt-1"
+   304→            >
+   305→              <Sparkles className="w-3.5 h-3.5" />
+   306→              Accept {highConfidenceCount} Fields ≥ {rules.invoiceThreshold}% Conf
+   307→            </button>
+   308→          )}
+   309→
+   310→          {!canResolveExceptions && (
+   311→            <div className="mt-1 flex items-start gap-1.5 text-[10px] text-amber-500/90 bg-amber-950/20 border border-amber-900/40 rounded-md p-2 font-mono leading-relaxed">
+   312→              <AlertCircle className="w-3 h-3 shrink-0 mt-0.5" />
+   313→              <span>
+   314→                READ-ONLY ({roleLabel(userRole)}) — Accept / Modify / Reject are
+   315→                disabled. Switch to an operator / admin session to resolve exceptions.
+   316→              </span>
+   317→            </div>
+   318→          )}
+   319→        </div>
+   320→
+   321→        {/* Exceptions list */}
+   322→        <div className="flex-1 overflow-y-auto divide-y divide-gray-950 p-2 space-y-1.5">
+   323→          <AnimatePresence mode="popLayout">
+   324→            {sortedExceptions.map(ex => {
+   325→              const isSelected = ex.id === selectedExceptionId;
+   326→              const severityClass = getConfidenceColor(ex.confidence);
+   327→              const isDone = ex.status !== 'Unresolved';
+   328→
+   329→              return (
+   330→                <motion.div
+   331→                  key={ex.id}
+   332→                  layout
+   333→                  initial={{ opacity: 0, y: 10 }}
+   334→                  animate={{ opacity: 1, y: 0 }}
+   335→                  exit={{ opacity: 0, scale: 0.95 }}
+   336→                  transition={{ duration: 0.15 }}
+   337→                  onClick={() => selectException(ex.id)}
+   338→                  className={`p-3 rounded-lg cursor-pointer transition-all border ${
+   339→                    isSelected
+   340→                      ? 'bg-gray-950 border-gray-700 shadow-lg shadow-black/40'
+   341→                      : 'bg-transparent border-transparent hover:bg-gray-950/40 hover:border-gray-900'
+   342→                  }`}
+   343→                >
+   344→                  <div className="flex items-start justify-between gap-1.5 mb-1.5">
+   345→                    <span className="text-xs font-semibold text-gray-200 tracking-tight leading-tight">
+   346→                      {ex.fieldName}
+   347→                    </span>
+   348→                    {isDone ? (
+   349→                      <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded flex items-center gap-1 shrink-0 ${
+   350→                        ex.status === 'Accepted' ? 'bg-emerald-950 text-emerald-400 border border-emerald-900/30' :
+   351→                        ex.status === 'Rejected' ? 'bg-red-950 text-red-400 border border-red-900/30' :
+   352→                        'bg-blue-950 text-blue-400 border border-blue-900/30'
+   353→                      }`}>
+   354→                        {ex.status.toUpperCase()}
+   355→                      </span>
+   356→                    ) : (
+   357→                      <span className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border shrink-0 ${severityClass}`}>
+   358→                        {ex.confidence}%
+   359→                      </span>
+   360→                    )}
+   361→                  </div>
+   362→
+   363→                  <p className="text-[11px] text-gray-400 leading-normal line-clamp-2">{ex.reason}</p>
+   364→
+   365→                  <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-900/30 text-[10px] text-gray-500 font-mono">
+   366→                    <span>{ex.docType}</span>
+   367→                    <span className="text-gray-600 uppercase">{ex.exceptionType.replace(/_/g, ' ')}</span>
+   368→                  </div>
+   369→                </motion.div>
+   370→              );
+   371→            })}
+   372→          </AnimatePresence>
+   373→
+   374→          {sortedExceptions.length === 0 && (
+   375→            <div className="p-8 text-center text-gray-500 text-xs">
+   376→              No exceptions match the selected filter.
+   377→            </div>
+   378→          )}
+   379→        </div>
+   380→      </div>
+   381→
+   382→      {/* CENTER PANEL: DOCUMENT VIEWER */}
+   383→      <div className="lg:col-span-5 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden relative">
+   384→        {/* Document Tabs (data-driven) */}
+   385→        <div className="px-4 py-2 bg-[#0e1017] border-b border-gray-900 flex items-center justify-between shrink-0">
+   386→          <div className="flex items-center gap-1.5 overflow-x-auto">
+   387→            {availableDocTypes.map(doc => (
+   388→              <button
+   389→                key={doc}
+   390→                onClick={() => setActiveDocTab(doc)}
+   391→                className={`text-xs px-3 py-1.5 rounded-md font-medium transition-all whitespace-nowrap ${
+   392→                  activeDocTab === doc
+   393→                    ? 'bg-gray-800 text-gray-100'
+   394→                    : 'text-gray-500 hover:text-gray-300'
+   395→                }`}
+   396→              >
+   397→                {doc === 'Commercial Invoice' ? 'Invoice' : doc === 'Bill of Lading' ? 'BOL' : doc}
+   398→              </button>
+   399→            ))}
+   400→            {availableDocTypes.length === 0 && (
+   401→              <span className="text-xs text-gray-600">No documents available</span>
+   402→            )}
+   403→          </div>
+   404→
+   405→          <div className="flex items-center gap-1 shrink-0">
+   406→            <button
+   407→              onClick={() => setZoomLevel(prev => Math.max(50, prev - 10))}
+   408→              title="Zoom Out"
+   409→              className="p-1 rounded text-gray-500 hover:text-gray-300 hover:bg-gray-950 transition-all cursor-pointer"
+   410→            >
+   411→              <ZoomOut className="w-4 h-4" />
+   412→            </button>
+   413→            <span className="text-xs font-mono text-gray-500 w-10 text-center">{zoomLevel}%</span>
+   414→            <button
+   415→              onClick={() => setZoomLevel(prev => Math.min(200, prev + 10))}
+   416→              title="Zoom In"
+   417→              className="p-1 rounded text-gray-500 hover:text-gray-300 hover:bg-gray-950 transition-all cursor-pointer"
+   418→            >
+   419→              <ZoomIn className="w-4 h-4" />
+   420→            </button>
+   421→            <button
+   422→              onClick={() => setRotation(prev => (prev + 90) % 360)}
+   423→              title="Rotate 90°"
+   424→              className="p-1 rounded text-gray-500 hover:text-gray-300 hover:bg-gray-950 transition-all cursor-pointer"
+   425→            >
+   426→              <RotateCw className="w-4 h-4" />
+   427→            </button>
+   428→          </div>
+   429→        </div>
+   430→
+   431→        {/* Document Board — shows real uploaded file or extracted data view */}
+   432→        <div className="flex-1 overflow-auto bg-[#040406] p-6 flex items-start justify-center relative">
+   433→          {documentUrl ? (
+   434→            /* Real file viewer — show the actual uploaded document based on MIME type */
+   435→            <div
+   436→              style={{
+   437→                transform: `scale(${zoomLevel / 100}) rotate(${rotation}deg)`,
+   438→                transformOrigin: 'top center',
+   439→                transition: 'transform 0.15s ease-out',
+   440→              }}
+   441→              className="rounded border border-gray-700 shadow-2xl overflow-hidden bg-white relative"
+   442→            >
+   443→              {documentMime.startsWith('text/') ? (
+   444→                /* Text file — show in iframe with monospace styling */
+   445→                <iframe
+   446→                  src={documentUrl}
+   447→                  className="w-[500px] h-[600px] bg-white"
+   448→                  title="Document text"
+   449→                  style={{ fontFamily: 'monospace', fontSize: '12px' }}
+   450→                />
+   451→              ) : documentMime === 'application/pdf' ? (
+   452→                /* PDF — show in iframe (browser's built-in PDF viewer) */
+   453→                <iframe
+   454→                  src={documentUrl}
+   455→                  className="w-[500px] h-[600px] bg-white"
+   456→                  title="Document PDF"
+   457→                />
+   458→              ) : documentMime.startsWith('image/') ? (
+   459→                /* Image (PNG, JPEG, TIFF) — show directly with zoom/rotate */
+   460→                <img
+   461→                  src={documentUrl}
+   462→                  alt={`Document: ${activeDocTab}`}
+   463→                  className="max-w-[500px] max-h-[600px] object-contain"
+   464→                  onError={(e) => {
+   465→                    console.warn('[doc-viewer] image failed to load:', documentUrl);
+   466→                  }}
+   467→                />
+   468→              ) : (
+   469→                /* Unknown type — provide download link */
+   470→                <div className="w-[500px] h-[600px] flex flex-col items-center justify-center bg-gray-50 p-8 text-center">
+   471→                  <FileText className="w-16 h-16 text-gray-400 mb-4" />
+   472→                  <p className="text-sm font-semibold text-gray-700 mb-2">
+   473→                    {activeDocTab || 'Document'}
+   474→                  </p>
+   475→                  <p className="text-xs text-gray-500 mb-4">
+   476→                    Preview not available for this file type ({documentMime || 'unknown'})
+   477→                  </p>
+   478→                  <a
+   479→                    href={documentUrl}
+   480→                    target="_blank"
+   481→                    rel="noreferrer"
+   482→                    className="text-xs bg-amber-500 hover:bg-amber-600 text-black font-bold px-4 py-2 rounded-lg transition-all"
+   483→                  >
+   484→                    Download File
+   485→                  </a>
+   486→                </div>
+   487→              )}
+   488→
+   489→              {/* Highlighted bounding box overlay */}
+   490→              {selectedException && activeDocTab === selectedException.docType && (
+   491→                <motion.div
+   492→                  initial={{ opacity: 0, scale: 0.95 }}
+   493→                  animate={{ opacity: 1, scale: 1 }}
+   494→                  className="absolute border-[2px] border-amber-500 bg-amber-500/10 rounded pointer-events-none shadow-[0_0_12px_rgba(245,158,11,0.4)]"
+   495→                  style={{
+   496→                    left: `${selectedException.boundingBox.x}%`,
+   497→                    top: `${selectedException.boundingBox.y}%`,
+   498→                    width: `${selectedException.boundingBox.w}%`,
+   499→                    height: `${selectedException.boundingBox.h}%`,
+   500→                  }}
+   501→                >
+   502→                  <div className="absolute -top-3.5 left-0 text-[7px] font-mono text-white bg-amber-600 px-1 py-0.5 rounded shadow whitespace-nowrap uppercase tracking-wider font-bold">
+   503→                    FLAGGED: {selectedException.fieldName.toUpperCase()}
+   504→                  </div>
+   505→                </motion.div>
+   506→              )}
+   507→            </div>
+   508→          ) : isLoadingUrl ? (
+   509→            <div className="flex items-center justify-center h-full">
+   510→              <Loader2 className="w-8 h-8 text-amber-500 animate-spin" />
+   511→            </div>
+   512→          ) : (
+   513→            /* Fallback: show extracted data as a structured view (not a fake document) */
+   514→            <div
+   515→              style={{
+   516→                transform: `scale(${zoomLevel / 100}) rotate(${rotation}deg)`,
+   517→                transformOrigin: 'top center',
+   518→                transition: 'transform 0.15s ease-out',
+   519→              }}
+   520→              className="w-[500px] bg-[#0c0d12] border border-gray-800 rounded-xl shadow-2xl p-6 relative"
+   521→            >
+   522→              <div className="flex items-center justify-between mb-4 pb-3 border-b border-gray-800">
+   523→                <div>
+   524→                  <h3 className="text-sm font-bold text-gray-100 uppercase tracking-wider">
+   525→                    {activeDocTab || 'Extracted Data'}
+   526→                  </h3>
+   527→                  <p className="text-[10px] text-gray-500 font-mono mt-0.5">
+   528→                    {selectedEntry.id} • {selectedEntry.documents.length} file(s) uploaded
+   529→                  </p>
+   530→                </div>
+   531→                <div className="flex items-center gap-2">
+   532→                  {selectedEntry.documents.length > 0 && (
+   533→                    <button
+   534→                      onClick={() => {
+   535→                        const doc = selectedEntry.documents.find(d => d.docType === activeDocTab) || selectedEntry.documents[0];
+   536→                        if (doc) {
+   537→                          setActiveDocTab(doc.docType);
+   538→                          // Trigger re-fetch by changing tab
+   539→                          setDocumentUrl(null);
+   540→                          // Re-run the effect by toggling
+   541→                          setTimeout(() => setActiveDocTab(doc.docType), 10);
+   542→                        }
+   543→                      }}
+   544→                      className="flex items-center gap-1 text-[9px] font-mono text-amber-400 border border-amber-900/40 px-2 py-1 rounded hover:bg-amber-950/30 transition-all"
+   545→                      title="Load original file"
+   546→                    >
+   547→                      <Eye className="w-3 h-3" />
+   548→                      VIEW FILE
+   549→                    </button>
+   550→                  )}
+   551→                  <span className="text-[9px] font-mono bg-amber-950/40 text-amber-400 border border-amber-900/40 px-2 py-0.5 rounded uppercase">
+   552→                    Structured Extract
+   553→                  </span>
+   554→                </div>
+   555→              </div>
+   556→
+   557→              <div className="space-y-2">
+   558→                {fieldsForActiveTab.map((f, idx) => (
+   559→                  <div key={f.id || idx} className={`flex justify-between items-start p-2 rounded border ${
+   560→                    f.isFlagged ? 'bg-red-950/20 border-red-900/40' : 'bg-black/30 border-gray-900'
+   561→                  }`}>
+   562→                    <div className="flex-1">
+   563→                      <span className="text-[10px] font-mono text-gray-500 uppercase tracking-wider block">{f.label}</span>
+   564→                      <span className={`text-xs font-mono ${f.isFlagged ? 'text-amber-400' : 'text-gray-200'}`}>
+   565→                        {f.value}
+   566→                      </span>
+   567→                      {f.crossDocValue && (
+   568→                        <span className="text-[9px] text-red-400 block mt-0.5">↔ {f.crossDocValue}</span>
+   569→                      )}
+   570→                    </div>
+   571→                    <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${
+   572→                      f.confidence < 60 ? 'bg-red-950 text-red-400' :
+   573→                      f.confidence < 85 ? 'bg-amber-950 text-amber-400' :
+   574→                      'bg-emerald-950 text-emerald-400'
+   575→                    }`}>
+   576→                      {f.confidence}%
+   577→                    </span>
+   578→                  </div>
+   579→                ))}
+   580→              </div>
+   581→
+   582→              {fieldsForActiveTab.length === 0 && (
+   583→                <div className="text-center py-8 text-gray-600 text-xs">
+   584→                  No fields for {activeDocTab || 'this document'}. Upload a {activeDocTab || 'document'} or check another tab.
+   585→                </div>
+   586→              )}
+   587→
+   588→              {selectedException && activeDocTab === selectedException.docType && (
+   589→                <motion.div
+   590→                  initial={{ opacity: 0 }}
+   591→                  animate={{ opacity: 1 }}
+   592→                  className="mt-4 p-3 bg-amber-950/20 border border-amber-900/40 rounded-lg"
+   593→                >
+   594→                  <div className="text-[10px] font-mono text-amber-400 uppercase tracking-wider mb-1">
+   595→                    ⚠ FLAGGED: {selectedException.fieldName}
+   596→                  </div>
+   597→                  <p className="text-[11px] text-gray-300">{selectedException.reason}</p>
+   598→                </motion.div>
+   599→              )}
+   600→            </div>
+   601→          )}
+   602→        </div>
+   603→      </div>
+   604→
+   605→      {/* RIGHT PANEL: RESOLUTION DESK */}
+   606→      <div className="lg:col-span-4 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden">
+   607→        {selectedException ? (
+   608→          <div className="flex-1 flex flex-col justify-between overflow-hidden">
+   609→            <div className="p-4 space-y-4 overflow-y-auto flex-1">
+   610→              {/* Header */}
+   611→              <div className="border-b border-gray-900 pb-3">
+   612→                <div className="flex items-center justify-between mb-1.5">
+   613→                  <span className="text-[10px] font-mono text-gray-500 tracking-wider">EXCEPTION FIELD RESOLUTION</span>
+   614→                  <span className={`text-[9px] font-mono font-bold px-2 py-0.5 rounded border ${
+   615→                    selectedException.status === 'Unresolved'
+   616→                      ? getConfidenceColor(selectedException.confidence)
+   617→                      : 'bg-gray-950 text-gray-400 border-gray-900'
+   618→                  }`}>
+   619→                    {selectedException.status === 'Unresolved'
+   620→                      ? getConfidenceBadge(selectedException.confidence)
+   621→                      : selectedException.status.toUpperCase()}
+   622→                  </span>
+   623→                </div>
+   624→                <h3 className="text-base font-semibold text-gray-100 tracking-tight leading-tight">
+   625→                  {selectedException.fieldName}
+   626→                </h3>
+   627→                <span className="text-[10px] font-mono text-gray-600 uppercase mt-1 block">
+   628→                  Type: {selectedException.exceptionType.replace(/_/g, ' ')}
+   629→                </span>
+   630→              </div>
+   631→
+   632→              {/* Discrepancy reason + explanation */}
+   633→              <div className="bg-[#120f12] border border-red-950/40 p-3.5 rounded-lg">
+   634→                <h4 className="text-[11px] font-mono text-red-400 tracking-wider uppercase mb-1 flex items-center gap-1.5">
+   635→                  <AlertCircle className="w-3.5 h-3.5" />
+   636→                  DISCREPANCY WHY:
+   637→                </h4>
+   638→                <p className="text-xs text-gray-300 leading-normal">{selectedException.reason}</p>
+   639→                {selectedException.explanation && selectedException.explanation !== selectedException.reason && (
+   640→                  <div className="mt-2 pt-2 border-t border-red-950/30">
+   641→                    <span className="text-[9px] font-mono text-amber-400 uppercase tracking-wider block mb-0.5">EXPLANATION:</span>
+   642→                    <p className="text-[11px] text-amber-300/90 leading-relaxed">{selectedException.explanation}</p>
+   643→                  </div>
+   644→                )}
+   645→              </div>
+   646→
+   647→              {/* Data comparison */}
+   648→              <div className="grid grid-cols-2 gap-3">
+   649→                <div className="bg-black border border-gray-900 p-3 rounded-lg">
+   650→                  <span className="text-[10px] text-gray-500 block uppercase tracking-wider font-mono">EXTRACTED (OCR)</span>
+   651→                  <span className="text-sm font-mono font-bold text-gray-200 block mt-1">
+   652→                    {selectedException.extractedValue}
+   653→                  </span>
+   654→                  <span className="text-[9px] font-mono text-gray-600 block mt-0.5">
+   655→                    Confidence: {selectedException.confidence}%
+   656→                  </span>
+   657→                </div>
+   658→                <div className="bg-black border border-gray-900 p-3 rounded-lg">
+   659→                  <span className="text-[10px] text-gray-500 block uppercase tracking-wider font-mono">CROSS-DOC SOURCE</span>
+   660→                  <span className="text-sm font-mono font-bold text-gray-400 block mt-1">
+   661→                    {selectedException.crossDocValue || '—'}
+   662→                  </span>
+   663→                  <span className="text-[9px] font-mono text-gray-600 block mt-0.5">
+   664→                    Source: {selectedException.docType}
+   665→                  </span>
+   666→                </div>
+   667→              </div>
+   668→
+   669→              {/* Inline editor */}
+   670→              <div className="space-y-1.5">
+   671→                <label className="text-[11px] text-gray-400 font-mono tracking-wider block uppercase">
+   672→                  MANUAL / OVERRIDE VALUE:
+   673→                </label>
+   674→                {isEditing ? (
+   675→                  <div className="flex gap-2">
+   676→                    <input
+   677→                      ref={inputRef}
+   678→                      type="text"
+   679→                      value={editValue}
+   680→                      onChange={e => setEditValue(e.target.value)}
+   681→                      onKeyDown={e => {
+   682→                        if (e.key === 'Enter') handleSaveEdit();
+   683→                        if (e.key === 'Escape') setIsEditing(false);
+   684→                      }}
+   685→                      className="flex-1 bg-black text-gray-200 border border-gray-700 px-3 py-2 text-sm rounded-lg focus:outline-none focus:border-amber-500 font-mono tracking-tight"
+   686→                    />
+   687→                    <button
+   688→                      onClick={handleSaveEdit}
+   689→                      className="bg-amber-600 hover:bg-amber-500 text-black px-3 py-1.5 rounded-lg font-medium text-xs transition-all cursor-pointer"
+   690→                    >
+   691→                      Apply
+   692→                    </button>
+   693→                    <button
+   694→                      onClick={() => setIsEditing(false)}
+   695→                      className="text-gray-400 hover:text-white border border-gray-800 px-3 py-1.5 rounded-lg text-xs transition-all cursor-pointer"
+   696→                    >
+   697→                      Cancel
+   698→                    </button>
+   699→                  </div>
+   700→                ) : (
+   701→                  <div className="flex items-center justify-between bg-black border border-gray-900 rounded-lg p-2.5">
+   702→                    <span className="font-mono text-sm font-bold text-emerald-400">{editValue}</span>
+   703→                    {canResolveExceptions ? (
+   704→                      <button
+   705→                        onClick={() => {
+   706→                          setIsEditing(true);
+   707→                          setTimeout(() => inputRef.current?.focus(), 50);
+   708→                        }}
+   709→                        className="text-xs text-gray-400 hover:text-white bg-gray-900 hover:bg-gray-800 border border-gray-800 px-2 py-1 rounded transition-all cursor-pointer"
+   710→                      >
+   711→                        Edit Field
+   712→                      </button>
+   713→                    ) : (
+   714→                      <span className="text-[10px] font-mono uppercase text-gray-600 px-2 py-1">
+   715→                        Read-only
+   716→                      </span>
+   717→                    )}
+   718→                  </div>
+   719→                )}
+   720→              </div>
+   721→
+   722→              {/* Action buttons — gated by canResolve. Viewer role sees a
+   723→                  locked notice instead of the Accept / Modify / Reject row. */}
+   724→              {canResolveExceptions ? (
+   725→                <div className="pt-3 grid grid-cols-3 gap-2">
+   726→                  <button
+   727→                    onClick={() => updateException(selectedEntry.id, selectedException.id, 'Accepted')}
+   728→                    className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
+   729→                      selectedException.status === 'Accepted'
+   730→                        ? 'bg-emerald-950 text-emerald-400 border-emerald-800'
+   731→                        : 'bg-black border-gray-900 text-emerald-500 hover:bg-emerald-950/20'
+   732→                    }`}
+   733→                  >
+   734→                    <CheckCircle2 className="w-4 h-4" />
+   735→                    <span>Accept [Space]</span>
+   736→                  </button>
+   737→                  <button
+   738→                    onClick={() => {
+   739→                      setIsEditing(true);
+   740→                      setTimeout(() => inputRef.current?.focus(), 50);
+   741→                    }}
+   742→                    className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
+   743→                      selectedException.status === 'Corrected'
+   744→                        ? 'bg-blue-950 text-blue-400 border-blue-800'
+   745→                        : 'bg-black border-gray-900 text-blue-500 hover:bg-blue-950/20'
+   746→                    }`}
+   747→                  >
+   748→                    <RefreshCw className="w-4 h-4" />
+   749→                    <span>Modify [E]</span>
+   750→                  </button>
+   751→                  <button
+   752→                    onClick={() => updateException(selectedEntry.id, selectedException.id, 'Rejected')}
+   753→                    className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
+   754→                      selectedException.status === 'Rejected'
+   755→                        ? 'bg-red-950 text-red-400 border-red-800'
+   756→                        : 'bg-black border-gray-900 text-red-500 hover:bg-red-950/20'
+   757→                    }`}
+   758→                  >
+   759→                    <XCircle className="w-4 h-4" />
+   760→                    <span>Reject [R]</span>
+   761→                  </button>
+   762→                </div>
+   763→              ) : (
+   764→                <div className="pt-3 grid grid-cols-3 gap-2">
+   765→                  <div className="py-2 px-1 text-xs rounded-lg font-medium border bg-black/40 border-gray-900 text-gray-600 flex flex-col items-center justify-center gap-1 opacity-60 cursor-not-allowed">
+   766→                    <CheckCircle2 className="w-4 h-4" />
+   767→                    <span>Accept</span>
+   768→                  </div>
+   769→                  <div className="py-2 px-1 text-xs rounded-lg font-medium border bg-black/40 border-gray-900 text-gray-600 flex flex-col items-center justify-center gap-1 opacity-60 cursor-not-allowed">
+   770→                    <RefreshCw className="w-4 h-4" />
+   771→                    <span>Modify</span>
+   772→                  </div>
+   773→                  <div className="py-2 px-1 text-xs rounded-lg font-medium border bg-black/40 border-gray-900 text-gray-600 flex flex-col items-center justify-center gap-1 opacity-60 cursor-not-allowed">
+   774→                    <XCircle className="w-4 h-4" />
+   775→                    <span>Reject</span>
+   776→                  </div>
+   777→                </div>
+   778→              )}
+   779→
+   780→              {/* Audit trail */}
+   781→              <div className="pt-4 border-t border-gray-900">
+   782→                <button
+   783→                  onClick={() => setShowHistory(!showHistory)}
+   784→                  className="flex items-center justify-between w-full text-xs text-gray-500 font-mono tracking-wider hover:text-gray-300 py-1"
+   785→                >
+   786→                  <span>AUDIT TRAIL ({selectedException.history.length})</span>
+   787→                  <span>{showHistory ? '[-]' : '[+]'}</span>
+   788→                </button>
+   789→                {showHistory && (
+   790→                  <div className="mt-2 text-[11px] text-gray-400 bg-[#090a0f] p-3 rounded-lg border border-gray-900 space-y-2 max-h-32 overflow-y-auto">
+   791→                    {selectedException.history.length === 0 ? (
+   792→                      <p className="text-gray-600 italic">No previous reviews logged for this field.</p>
+   793→                    ) : (
+   794→                      selectedException.history.map((h, idx) => (
+   795→                        <div key={idx} className="border-b border-gray-900/40 pb-1.5 last:border-b-0">
+   796→                          <div className="flex justify-between items-center text-gray-500 font-mono text-[9px] mb-0.5">
+   797→                            <span>{h.user}</span>
+   798→                            <span suppressHydrationWarning>{new Date(h.timestamp).toLocaleTimeString()}</span>
+   799→                          </div>
+   800→                          <div className="flex items-center gap-1">
+   801→                            <span className="font-semibold text-gray-300">{h.action}:</span>
+   802→                            <span className="line-through text-gray-600 font-mono">{h.oldValue}</span>
+   803→                            <ChevronRight className="w-3 h-3 text-gray-700" />
+   804→                            <span className="text-emerald-400 font-mono font-semibold">{h.newValue}</span>
+   805→                          </div>
+   806→                        </div>
+   807→                      ))
+   808→                    )}
+   809→                  </div>
+   810→                )}
+   811→              </div>
+   812→            </div>
+   813→
+   814→            {/* Keyboard shortcuts footer */}
+   815→            <div className="p-3 bg-black/40 border-t border-gray-900 flex justify-between items-center text-[10px] text-gray-500 font-mono select-none">
+   816→              <div className="flex items-center gap-1">
+   817→                <kbd className={`bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 font-bold uppercase ${canResolveExceptions ? 'text-gray-300' : 'text-gray-700'}`}>Space</kbd>
+   818→                <span className={canResolveExceptions ? '' : 'text-gray-700'}>Accept</span>
+   819→                <kbd className={`bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 font-bold uppercase ml-2 ${canResolveExceptions ? 'text-gray-300' : 'text-gray-700'}`}>E</kbd>
+   820→                <span className={canResolveExceptions ? '' : 'text-gray-700'}>Edit</span>
+   821→                <kbd className={`bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 font-bold uppercase ml-2 ${canResolveExceptions ? 'text-gray-300' : 'text-gray-700'}`}>R</kbd>
+   822→                <span className={canResolveExceptions ? '' : 'text-gray-700'}>Reject</span>
+   823→              </div>
+   824→              <button
+   825→                onClick={canResolveExceptions ? undoLastAction : undefined}
+   826→                disabled={!canResolveExceptions}
+   827→                className={`flex items-center gap-1 text-[11px] border px-2 py-1 rounded font-bold uppercase transition-all ${
+   828→                  canResolveExceptions
+   829→                    ? 'text-gray-400 hover:text-white hover:bg-gray-900 border-gray-800 cursor-pointer'
+   830→                    : 'text-gray-700 border-gray-900 bg-gray-950/50 cursor-not-allowed'
+   831→                }`}
+   832→              >
+   833→                <Undo2 className="w-3.5 h-3.5 text-gray-500" />
+   834→                Undo [Ctrl+Z]
+   835→              </button>
+   836→            </div>
+   837→          </div>
+   838→        ) : (
+   839→          <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-gray-500">
+   840→            <CheckCircle2 className="w-12 h-12 text-gray-600 mb-2" />
+   841→            <p className="text-sm font-semibold text-gray-300">All exceptions cleared</p>
+   842→            <p className="text-xs text-gray-600 max-w-xs mt-1">
+   843→              Select another shipment or upload invoices to run compliance tests.
+   844→            </p>
+   845→          </div>
+   846→        )}
+   847→      </div>
+   848→    </div>
+   849→  );
+   850→}
+   851→

@@ -42,7 +42,7 @@ export default function BrokerAnalytics() {
   const chartY = Math.max(5, Math.min(95, 100 - (stats.unresolvedExceptions * 12)));
 
   return (
-    <div className="space-y-6 overflow-y-auto h-full pb-8 pr-2 p-6 font-sans">
+    <div className="space-y-4 sm:space-y-6 overflow-y-auto h-full pb-6 sm:pb-8 pr-1 sm:pr-2 p-3 sm:p-4 md:p-6 font-sans">
       {/* TOP: Chart + Readiness Score */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
         <div className="lg:col-span-7 bg-[#0c0d12] border border-gray-900 rounded-xl p-5 flex flex-col justify-between">

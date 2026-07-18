@@ -234,9 +234,9 @@ export default function IngestUpload() {
   };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 h-full overflow-hidden p-6 font-sans">
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 lg:gap-5 h-full overflow-y-auto lg:overflow-hidden p-3 sm:p-4 md:p-6 font-sans">
       {/* LEFT: Upload area + stepper */}
-      <div className="lg:col-span-8 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col justify-center p-8 relative overflow-hidden">
+      <div className="lg:col-span-8 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col justify-center p-4 sm:p-6 md:p-8 relative overflow-hidden min-h-[500px] lg:min-h-0">
         <div className="absolute top-4 left-4 flex items-center gap-1.5 font-mono text-[10px] text-gray-500 uppercase tracking-widest">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
           <span>ENTERPRISE INGEST CHANNEL</span>
@@ -286,7 +286,7 @@ export default function IngestUpload() {
               onDragOver={handleDragOver}
               onDragLeave={handleDragLeave}
               onDrop={handleDrop}
-              className={`border-2 border-dashed rounded-2xl p-12 text-center flex flex-col items-center justify-center cursor-pointer transition-all aspect-[16/9] max-w-2xl mx-auto w-full select-none ${
+              className={`border-2 border-dashed rounded-2xl p-6 sm:p-10 md:p-12 text-center flex flex-col items-center justify-center cursor-pointer transition-all aspect-[16/9] max-w-2xl mx-auto w-full select-none ${
                 isDragging
                   ? 'border-amber-500 bg-amber-950/10'
                   : 'border-gray-800 hover:border-gray-700 bg-black/20 hover:bg-black/40'
@@ -474,7 +474,7 @@ export default function IngestUpload() {
       </div>
 
       {/* RIGHT: Cluster feed */}
-      <div className="lg:col-span-4 bg-[#0c0d12] border border-gray-900 rounded-xl p-5 flex flex-col justify-between overflow-hidden">
+      <div className="lg:col-span-4 bg-[#0c0d12] border border-gray-900 rounded-xl p-4 sm:p-5 flex flex-col justify-between overflow-hidden min-h-[300px] lg:min-h-0">
         <div>
           <h3 className="text-xs font-bold font-mono tracking-widest text-gray-400 uppercase mb-3">Shipment Entry Clusters</h3>
           <p className="text-xs text-gray-500 leading-relaxed">

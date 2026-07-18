@@ -23,7 +23,7 @@ export default function CrossDocAuditor() {
 
   if (documentCount < 2 && selectedEntry.exceptions.length === 0) {
     return (
-      <div className="space-y-6 overflow-y-auto h-full pb-8 pr-2 p-6 font-sans">
+      <div className="space-y-4 sm:space-y-6 overflow-y-auto h-full pb-6 sm:pb-8 pr-1 sm:pr-2 p-3 sm:p-4 md:p-6 font-sans">
         <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-[#0c0d12] border border-gray-900 rounded-xl p-5">
           <div>
             <div className="flex items-center gap-2 mb-1.5">
@@ -77,7 +77,7 @@ export default function CrossDocAuditor() {
   };
 
   return (
-    <div className="space-y-6 overflow-y-auto h-full pb-8 pr-2 p-6 font-sans">
+    <div className="space-y-4 sm:space-y-6 overflow-y-auto h-full pb-6 sm:pb-8 pr-1 sm:pr-2 p-3 sm:p-4 md:p-6 font-sans">
       {/* Header */}
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-[#0c0d12] border border-gray-900 rounded-xl p-5">
         <div>

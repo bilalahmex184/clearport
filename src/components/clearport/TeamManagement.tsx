@@ -60,7 +60,7 @@ export default function TeamManagement() {
   };
 
   return (
-    <div className="space-y-6 overflow-y-auto h-full pb-8 pr-2 p-6 font-sans">
+    <div className="space-y-4 sm:space-y-6 overflow-y-auto h-full pb-6 sm:pb-8 pr-1 sm:pr-2 p-3 sm:p-4 md:p-6 font-sans">
       <div className="bg-[#0c0d12] border border-gray-900 rounded-xl p-5">
         <span className="font-mono text-xs text-amber-500 tracking-wider">TEAM MANAGEMENT</span>
         <h2 className="text-xl font-bold text-gray-100 tracking-tight mt-1">
