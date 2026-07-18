@@ -48,7 +48,7 @@ function createMockClient(capturedPatch: { patch: Record<string, unknown> | null
         pipeline_trace_id: 'trace-123',
         created_at: '2024-01-01T00:00:00Z',
         updated_at: '2024-01-01T00:00:00Z',
-      } as DbShipment,
+      } as unknown as DbShipment,
       error: null,
     }),
   };
@@ -133,8 +133,9 @@ describe('updateShipment() — validation_status allowlist regression (§5)', ()
 
     await updateShipment(client, 'SHIP-TEST-001', {
       validation_status: 'failed',
-      // @ts-expect-error — intentionally pass an unknown field
-      malicious_field: 'should be stripped',
+      // intentionally pass an unknown field — cast via unknown to bypass
+      // the Partial<DbShipment> type check (the allowlist must strip it)
+      ...({ malicious_field: 'should be stripped' } as Record<string, unknown>),
     } as Partial<DbShipment>);
 
     // validation_status should pass through...

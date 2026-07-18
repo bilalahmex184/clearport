@@ -41,6 +41,7 @@ export interface ExceptionHistoryEntry {
 export interface DbShipment {
   id: string;
   user_id: string | null;
+  org_id?: string | null;
   shipper: string;
   consignee: string;
   status: ShipmentStatus;
@@ -48,6 +49,9 @@ export interface DbShipment {
   urgency: string;
   initial_confidence: number;
   current_confidence: number;
+  validation_status?: ValidationStatus;
+  last_validated_at?: string | null;
+  pipeline_trace_id?: string | null;
   created_at: string;
   updated_at: string;
 }
