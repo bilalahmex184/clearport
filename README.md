@@ -6,7 +6,7 @@ Production-grade customs document extraction, validation, and exception manageme
 - **Frontend**: Next.js 16 + React 19 + TypeScript + Tailwind CSS
 - **Backend**: Supabase (Postgres + RLS + Edge Functions + Storage + Auth)
 - **AI/OCR**: Google Gemini + Cloud Vision (5-stage fallback chain) + self-hosted Tesseract.js
-- **Testing**: Vitest (54 integration + 175 pure unit tests) + Playwright
+- **Testing**: Vitest (integration + pure unit tests — see CI for current count) + Playwright
 
 ## Quick Start
 
@@ -81,8 +81,8 @@ Exception Desk (human review)
 - Rate limiting (50 extractions/hour/org)
 - Stuck document reconciliation (pg_cron every 10 min)
 - Bulk upload with concurrency limit + dedup
-- 54 integration tests (security, workflow, mapping, invite, performance)
-- 175 pure unit tests (no network required, run in ~2s)
+- Integration tests (security, workflow, mapping, invite, performance) — require live Supabase
+- Pure unit tests (no network required, run in ~2s) — see `bun run test:pure` for current count
 - 20 test fixtures covering messy real-world documents
 
 ## Observability & Error Handling
@@ -145,6 +145,12 @@ This pipeline runs at **$0/month** at the current 10-user MVP scale:
 - **Process management**: pm2 (open source, free). No external monitoring SaaS required.
 
 The only paid cost that could arise is if Gemini volume exceeds the free tier — at which point a paid Gemini plan is the sole incremental expense. No other part of the stack has a per-request or per-user cost.
+
+## Large Binary Assets
+
+The repo contains one large binary: `eng.traineddata` (~5MB, Tesseract English language model for the self-hosted OCR fallback tier). This is a genuine runtime dependency.
+
+Going forward, any new large binary assets (trained models, font files, images) should be managed via [git-lfs](https://git-lfs.com/) rather than committed directly, to keep the `.git` directory from growing unboundedly. The `.gitattributes` file should be updated to track new large file patterns.
 
 ## CORS Configuration
 

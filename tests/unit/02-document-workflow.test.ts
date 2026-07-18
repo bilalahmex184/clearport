@@ -9,8 +9,8 @@ import {
   createTestUser, createTestOrg, apiCall, cleanupOrg, type TestUser,
 } from '../helpers/test-utils';
 
-const SUPABASE_URL = 'https://apfsceomnnhefxkvjhkz.supabase.co';
-const ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFwZnNjZW9tbm5oZWZ4a3ZqaGt6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1MDI0ODQsImV4cCI6MjA5OTA3ODQ4NH0.TN_HXmJlNBw94ikW0zeTCgG7uEiZX1dpzVazau0pQ1s';
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 const FIXTURES_DIR = join(process.cwd(), 'test-fixtures');
 
 async function uploadAndProcess(user: TestUser, orgId: string, fileName: string, content: string) {

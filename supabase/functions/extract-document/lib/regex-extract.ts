@@ -1,0 +1,402 @@
+// ============================================================================
+// regex-extract.ts — Regex-based fallback field extraction
+// ============================================================================
+// Extracted from extract-document/index.ts (§4 refactor — behavior-preserving).
+// Exports: sanitizeCurrency, normalizeUtf8, parseTableRows, parseCSV, regexExtract
+// ============================================================================
+
+// Field definitions (must match the main file's FIELD_DEFINITIONS)
+export const FIELD_DEFINITIONS: Array<{ key: string; label: string }> = [
+  { key: "invoiceNo", label: "Commercial Invoice #" },
+  { key: "invoiceDate", label: "Invoice Date" },
+  { key: "shipper", label: "Shipper/Exporter" },
+  { key: "consignee", label: "Consignee/Importer" },
+  { key: "consigneeAddress", label: "Consignee Address" },
+  { key: "declaredValue", label: "Total Declared Value" },
+  { key: "htsCode", label: "HTS Code" },
+  { key: "netWeight", label: "Net Weight" },
+  { key: "grossWeight", label: "Gross Weight" },
+  { key: "portOfEntry", label: "Port of Entry" },
+  { key: "carrier", label: "Carrier" },
+  { key: "billOfLading", label: "Bill of Lading #" },
+  { key: "countryOfOrigin", label: "Country of Origin" },
+];
+
+// Sanitize a currency string: "$52,150.75" → "52150.75" (numeric only)
+export function sanitizeCurrency(val: string): { display: string; numeric: number | null } {
+  const display = val.trim();
+  const cleaned = display.replace(/[^0-9.]/g, "");
+  const numeric = cleaned ? parseFloat(cleaned) : null;
+  return { display, numeric: numeric && Number.isFinite(numeric) ? numeric : null };
+}
+
+// Normalize UTF-8 foreign characters for ASCII-only compliance systems.
+export function normalizeUtf8(val: string): { utf8: string; ascii: string } {
+  const utf8 = val.trim();
+  const ascii = utf8
+    .replace(/ä/g, "ae").replace(/ö/g, "oe").replace(/ü/g, "ue")
+    .replace(/Ä/g, "Ae").replace(/Ö/g, "Oe").replace(/Ü/g, "Ue")
+    .replace(/ß/g, "ss")
+    .replace(/é/g, "e").replace(/è/g, "e").replace(/ê/g, "e").replace(/ë/g, "e")
+    .replace(/á/g, "a").replace(/à/g, "a").replace(/â/g, "a")
+    .replace(/í/g, "i").replace(/ì/g, "i").replace(/î/g, "i")
+    .replace(/ó/g, "o").replace(/ò/g, "o").replace(/ô/g, "o")
+    .replace(/ú/g, "u").replace(/ù/g, "u").replace(/û/g, "u")
+    .replace(/ñ/g, "n").replace(/ç/g, "c")
+    .replace(/[^\x00-\x7F]/g, "")
+    .trim();
+  return { utf8, ascii };
+}
+
+// Parse multi-line table rows. Groups secondary lines with preceding line item.
+export function parseTableRows(text: string): { lineItems: any[]; totalValue: string | null } {
+  const lines = text.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
+  const lineItems: any[] = [];
+  let totalValue: string | null = null;
+
+  const itemPattern = /^(.+?)\s+(\d+)\s+(\d{4}\.\d{2}\.\d{4}|\d{8,})\s+([$€£¥]?[\d,]+\.?\d*)\s*$/i;
+  const totalPattern = /^(?:total|grand\s*total|invoice\s*total|total\s*value)\s*[:\-]?\s*([$€£¥][\d,]+\.?\d*)/i;
+
+  for (const line of lines) {
+    const totalMatch = line.match(totalPattern);
+    if (totalMatch && totalMatch[1]) {
+      totalValue = totalMatch[1].trim();
+      continue;
+    }
+    const itemMatch = line.match(itemPattern);
+    if (itemMatch) {
+      const [, desc, qty, hts, value] = itemMatch;
+      lineItems.push({ description: desc.trim(), qty: parseInt(qty), htsCode: hts.trim(), value: value.trim(), secondaryLines: [] as string[] });
+      continue;
+    }
+    const isSecondary = /^(shipping\s*(?:cost|fee)?|insurance(?:\s*cost)?|freight|handling|duty|tax|discount|subtotal|other)\s*[:\-]?\s*([$€£¥]?[\d,]+\.?\d*)?/i.test(line);
+    if (isSecondary && lineItems.length > 0) {
+      lineItems[lineItems.length - 1].secondaryLines.push(line);
+    }
+  }
+  return { lineItems, totalValue };
+}
+
+// Parse CSV content as structured fields.
+export function parseCSV(text: string): any[] {
+  const fields: any[] = [];
+  const lines = text.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
+  if (lines.length === 0) return fields;
+
+  const firstLine = lines[0];
+  const delimiter = firstLine.includes('\t') ? '\t' : firstLine.includes(';') ? ';' : ',';
+
+  const headers = firstLine.split(delimiter).map(h => h.trim().toLowerCase().replace(/[^a-z0-9]/g, ''));
+
+  const headerMap: Record<string, string> = {
+    invoice: 'invoiceNo', invoicenumber: 'invoiceNo', invoiceno: 'invoiceNo', invoicenum: 'invoiceNo',
+    date: 'invoiceDate', invoicedate: 'invoiceDate',
+    shipper: 'shipper', exporter: 'shipper', shipperexporter: 'shipper',
+    consignee: 'consignee', importer: 'consignee', consigneeimporter: 'consignee',
+    value: 'declaredValue', totalvalue: 'declaredValue', declaredvalue: 'declaredValue', total: 'declaredValue', amount: 'declaredValue',
+    hts: 'htsCode', htscode: 'htsCode', tariff: 'htsCode', hscode: 'htsCode',
+    weight: 'netWeight', netweight: 'netWeight', net: 'netWeight',
+    grossweight: 'grossWeight', gross: 'grossWeight',
+    origin: 'countryOfOrigin', countryoforigin: 'countryOfOrigin', country: 'countryOfOrigin',
+    carrier: 'carrier',
+    port: 'portOfEntry', portofentry: 'portOfEntry',
+    bol: 'billOfLading', billoflading: 'billOfLading',
+    address: 'consigneeAddress', consigneeaddress: 'consigneeAddress',
+  };
+
+  const hasHeaders = headers.some(h => headerMap[h]);
+
+  if (hasHeaders && lines.length >= 2) {
+    const values = lines[1].split(delimiter).map(v => v.trim().replace(/^["']|["']$/g, ''));
+    headers.forEach((header, idx) => {
+      const fieldKey = headerMap[header];
+      if (fieldKey && values[idx]) {
+        const def = FIELD_DEFINITIONS.find(d => d.key === fieldKey);
+        fields.push({
+          field_key: fieldKey,
+          field_label: def?.label || fieldKey,
+          extracted_value: values[idx],
+          confidence: 85,
+        });
+      }
+    });
+  } else {
+    for (const line of lines) {
+      const parts = line.split(delimiter).map(p => p.trim().replace(/^["']|["']$/g, ''));
+      if (parts.length >= 2) {
+        const key = parts[0].toLowerCase().replace(/[^a-z0-9]/g, '');
+        const value = parts[1];
+        const fieldKey = headerMap[key];
+        if (fieldKey && value) {
+          const def = FIELD_DEFINITIONS.find(d => d.key === fieldKey);
+          fields.push({
+            field_key: fieldKey,
+            field_label: def?.label || fieldKey,
+            extracted_value: value,
+            confidence: 80,
+          });
+        }
+      }
+    }
+  }
+
+  return fields;
+}
+
+// --- Regex-based fallback extractor ---
+export function regexExtract(text: string): any[] {
+  if (!text) return [];
+
+  const csvFields = parseCSV(text);
+  if (csvFields.length >= 3) {
+    return csvFields;
+  }
+
+  const fields: any[] = [];
+  const lines = text.split(/\n/).map(l => l.trim());
+  const fullText = text;
+
+  const patterns: Array<{ key: string; label: string; regexes: RegExp[]; conf: number }> = [
+    {
+      key: "invoiceNo",
+      label: "Commercial Invoice #",
+      conf: 85,
+      regexes: [
+        /(?:invoice\s*(?:number|no\.?|#|num)\s*[:\-]?\s*)([A-Z0-9][A-Z0-9\-]+)/i,
+        /(?:inv\.?\s*(?:no\.?|#|num)\s*[:\-]?\s*)([A-Z0-9][A-Z0-9\-]+)/i,
+        /(?:^|\n)(INV[\-\d]+)/i,
+        /(?:facture\s*(?:no\.?|n°|#)\s*[:\-]?\s*)([A-Z0-9][A-Z0-9\-]+)/i,
+        /(?:rechnung\s*(?:nr\.?|#)\s*[:\-]?\s*)([A-Z0-9][A-Z0-9\-]+)/i,
+      ],
+    },
+    {
+      key: "invoiceDate",
+      label: "Invoice Date",
+      conf: 82,
+      regexes: [
+        /(?:invoice\s*date\s*[:\-]?\s*)(\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{1,2}\.\d{1,2}\.\d{4})/i,
+        /(?:date\s*[:\-]\s*)(\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\d{1,2}\.\d{1,2}\.\d{4})/i,
+        /(?:datum\s*[:\-]\s*)(\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{4})/i,
+      ],
+    },
+    {
+      key: "shipper",
+      label: "Shipper/Exporter",
+      conf: 80,
+      regexes: [
+        /(?:shipper(?:\/exporter)?\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+        /(?:exporter\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+        /(?:from\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+        /(?:absender\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+        /(?:expéditeur\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+      ],
+    },
+    {
+      key: "consignee",
+      label: "Consignee/Importer",
+      conf: 80,
+      regexes: [
+        /(?:consignee(?:\/importer)?\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+        /(?:importer\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+        /(?:to\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+        /(?:empfänger\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+        /(?:destinataire\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+      ],
+    },
+    {
+      key: "declaredValue",
+      label: "Total Declared Value",
+      conf: 88,
+      regexes: [
+        /(?:total\s*(?:declared\s*)?value\s*[:\-]?\s*)([$€£¥]?[\d,]+\.?\d*)/i,
+        /(?:declared\s*value\s*[:\-]?\s*)([$€£¥]?[\d,]+\.?\d*)/i,
+        /(?:grand\s*total\s*[:\-]?\s*)([$€£¥]?[\d,]+\.?\d*)/i,
+        /(?:invoice\s*total\s*[:\-]?\s*)([$€£¥]?[\d,]+\.?\d*)/i,
+        /(?:total\s*[:\-]?\s*)([$€£¥][\d,]+\.?\d*)/i,
+        /(?:amount\s*[:\-]?\s*)([$€£¥]?[\d,]+\.?\d*)/i,
+        /(?:value\s*[:\-]?\s*)([$€£¥][\d,]+\.?\d*)/i,
+        /(?:^|\n)\s*([$€£¥][\d,]+\.?\d*)\s*(?:\n|$)/m,
+      ],
+    },
+    {
+      key: "htsCode",
+      label: "HTS Code",
+      conf: 90,
+      regexes: [
+        /(?:hts\s*(?:code)?\s*[:\-]?\s*)(\d{4}\.\d{2}\.\d{4})/i,
+        /(?:hts\s*[:\-]\s*)(\d{4}\.\d{2}\.\d{4})/i,
+        /(?:hs\s*code\s*[:\-]?\s*)(\d{4}\.\d{2}\.\d{4})/i,
+        /(?:tariff\s*[:\-]?\s*)(\d{4}\.\d{2}\.\d{4})/i,
+        /(?:hts\s*[:\-]?\s*)(\d{4}\.\d{2}\.\d{4})/i,
+        /\b(\d{4}\.\d{2}\.\d{4})\b/,
+      ],
+    },
+    {
+      key: "netWeight",
+      label: "Net Weight",
+      conf: 85,
+      regexes: [
+        /(?:net\s*weight\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?|kilograms?|g|grams?|oz|ounces?))/i,
+        /(?:net\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?|kilograms?))/i,
+        /(?:weight\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?|kilograms?))/i,
+        /(?:gewicht\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:kg|lbs?))/i,
+      ],
+    },
+    {
+      key: "grossWeight",
+      label: "Gross Weight",
+      conf: 85,
+      regexes: [
+        /(?:gross\s*weight\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?|kilograms?|g|grams?|oz|ounces?))/i,
+        /(?:gross\s*[:\-]?\s*)([\d,]+\.?\d*\s*(?:lbs?|kg|kgs|pounds?|kilograms?))/i,
+      ],
+    },
+    {
+      key: "countryOfOrigin",
+      label: "Country of Origin",
+      conf: 78,
+      regexes: [
+        /(?:country\s*of\s*origin\s*[:\-]?\s*)([A-Z]{2})/i,
+        /(?:origin\s*[:\-]?\s*)([A-Z]{2})\b/i,
+        /(?:country\s*[:\-]?\s*)([A-Z]{2})\b/i,
+        /(?:herkunft\s*[:\-]?\s*)([A-Z]{2})/i,
+      ],
+    },
+    {
+      key: "carrier",
+      label: "Carrier",
+      conf: 75,
+      regexes: [
+        /(?:carrier\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+        /(?:shipping\s*carrier\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+      ],
+    },
+    {
+      key: "portOfEntry",
+      label: "Port of Entry",
+      conf: 75,
+      regexes: [
+        /(?:port\s*of\s*entry\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+        /(?:port\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+      ],
+    },
+    {
+      key: "billOfLading",
+      label: "Bill of Lading #",
+      conf: 82,
+      regexes: [
+        /(?:bill\s*of\s*lading\s*(?:#|no\.?)?\s*[:\-]?\s*)([A-Z0-9\-]+)/i,
+        /(?:bol\s*(?:#|no\.?)?\s*[:\-]?\s*)([A-Z0-9\-]+)/i,
+      ],
+    },
+    {
+      key: "consigneeAddress",
+      label: "Consignee Address",
+      conf: 72,
+      regexes: [
+        /(?:consignee\s*address\s*[:\-]?\s*)(.+?)(?:\n|$)/i,
+        /(?:address\s*[:\-]?\s*)(\d+.+?(?:\n|$))/i,
+      ],
+    },
+  ];
+
+  for (const { key, label, regexes, conf } of patterns) {
+    let found = false;
+    for (const regex of regexes) {
+      const match = fullText.match(regex);
+      if (match && match[1]) {
+        let value = match[1].trim();
+
+        if (key === "shipper" || key === "consignee" || key === "consigneeAddress" || key === "carrier" || key === "portOfEntry") {
+          const normalized = normalizeUtf8(value);
+          value = normalized.utf8;
+        }
+
+        value = value.replace(/[,;]+$/, '').trim();
+
+        if (value.length > 0 && value.length < 200) {
+          fields.push({ field_key: key, field_label: label, extracted_value: value, confidence: conf });
+          found = true;
+          break;
+        }
+      }
+    }
+  }
+
+  const { lineItems, totalValue } = parseTableRows(fullText);
+
+  if (totalValue && !fields.find(f => f.field_key === "declaredValue")) {
+    fields.push({
+      field_key: "declaredValue",
+      field_label: "Total Declared Value",
+      extracted_value: totalValue,
+      confidence: 90,
+    });
+  }
+
+  if (lineItems.length > 0 && !fields.find(f => f.field_key === "htsCode")) {
+    const firstWithHts = lineItems.find(li => li.htsCode && /^\d{4}\.\d{2}\.\d{4}$/.test(li.htsCode));
+    if (firstWithHts) {
+      fields.push({
+        field_key: "htsCode",
+        field_label: "HTS Code",
+        extracted_value: firstWithHts.htsCode,
+        confidence: 88,
+      });
+    }
+  }
+
+  if (fields.length < 3) {
+    if (!fields.find(f => f.field_key === "invoiceNo")) {
+      const invMatch = fullText.match(/\b(INV[\-A-Z0-9]+)\b/i);
+      if (invMatch) {
+        fields.push({ field_key: "invoiceNo", field_label: "Commercial Invoice #", extracted_value: invMatch[1], confidence: 70 });
+      }
+    }
+
+    if (!fields.find(f => f.field_key === "declaredValue")) {
+      const valMatch = fullText.match(/([$€£¥][\d,]+\.?\d*)/);
+      if (valMatch) {
+        fields.push({ field_key: "declaredValue", field_label: "Total Declared Value", extracted_value: valMatch[1], confidence: 65 });
+      }
+    }
+
+    if (!fields.find(f => f.field_key === "htsCode")) {
+      const htsMatch = fullText.match(/\b(\d{4}\.\d{2}\.\d{4})\b/);
+      if (htsMatch) {
+        fields.push({ field_key: "htsCode", field_label: "HTS Code", extracted_value: htsMatch[1], confidence: 75 });
+      }
+    }
+
+    if (!fields.find(f => f.field_key === "countryOfOrigin")) {
+      const countryMatch = fullText.match(/(?:^|\n)\s*([A-Z]{2})\s*(?:\n|$)/m);
+      if (countryMatch) {
+        fields.push({ field_key: "countryOfOrigin", field_label: "Country of Origin", extracted_value: countryMatch[1], confidence: 60 });
+      }
+    }
+
+    if (!fields.find(f => f.field_key === "netWeight")) {
+      const weightMatch = fullText.match(/(\d[\d,]*\.?\d*\s*(?:lbs?|kg|kgs|pounds?))/i);
+      if (weightMatch) {
+        fields.push({ field_key: "netWeight", field_label: "Net Weight", extracted_value: weightMatch[1], confidence: 65 });
+      }
+    }
+
+    if (!fields.find(f => f.field_key === "shipper")) {
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.length < 3 || trimmed.length > 60) continue;
+        if (/^\d/.test(trimmed)) continue;
+        if (/[$€£¥]/.test(trimmed)) continue;
+        if (/^(invoice|inv|date|shipper|consignee|total|hts|net|gross|country|carrier|port|bill)/i.test(trimmed)) continue;
+        if (/^(INV|SHIP|DOC)/i.test(trimmed)) continue;
+        if (/^[A-Z][a-zA-Z\s&.,]+$/.test(trimmed)) {
+          fields.push({ field_key: "shipper", field_label: "Shipper/Exporter", extracted_value: trimmed, confidence: 55 });
+          break;
+        }
+      }
+    }
+  }
+
+  return fields;
+}

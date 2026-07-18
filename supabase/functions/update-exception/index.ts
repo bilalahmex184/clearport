@@ -5,8 +5,15 @@
 //          document_field (if any), the shipment status/confidence, and writes
 //          an audit log entry.
 // Input: JSON { exceptionId: string, status: 'Accepted'|'Corrected'|'Rejected',
-//                correctedValue?: string, resolvedBy: string }
+//                correctedValue?: string }
 // Output: { success: true, exception: {...}, shipmentStatus: string }
+//
+// NOTE: resolvedBy is NO LONGER accepted from the client body. The resolved_by
+// field and the history entry's user field are always derived from the
+// server-verified user.email || user.id. This prevents audit-trail identity
+// spoofing — previously any authenticated caller could set resolvedBy to an
+// arbitrary string and it became the permanent compliance record of who
+// resolved the exception.
 // ============================================================================
 
 import { createClient } from "npm:@supabase/supabase-js@2";
@@ -96,7 +103,12 @@ Deno.serve(async (req) => {
 
     // 2. Parse + validate body
     const body = await req.json().catch(() => ({}));
-    const { exceptionId, status, correctedValue, resolvedBy } = body || {};
+    const { exceptionId, status, correctedValue } = body || {};
+
+    // (§2 fix) resolvedBy is NO LONGER read from the client body. The resolver
+    // identity for the audit trail is always derived from the server-verified
+    // authenticated user — never from unauthenticated client input.
+    const resolver = user.email || user.id;
 
     if (!exceptionId || typeof exceptionId !== "string") {
       return jsonRes(
@@ -120,9 +132,6 @@ Deno.serve(async (req) => {
         400
       );
     }
-    const resolver = typeof resolvedBy === "string" && resolvedBy.trim()
-      ? resolvedBy.trim()
-      : user.email || user.id;
 
     // 3. Fetch the exception (RLS ensures user can only see their own)
     const { data: existing, error: fetchErr } = await userClient

@@ -4,9 +4,14 @@
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
-const SUPABASE_URL = 'https://apfsceomnnhefxkvjhkz.supabase.co';
-const ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFwZnNjZW9tbm5oZWZ4a3ZqaGt6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1MDI0ODQsImV4cCI6MjA5OTA3ODQ4NH0.TN_HXmJlNBw94ikW0zeTCgG7uEiZX1dpzVazau0pQ1s';
-const API_BASE = 'http://localhost:3000';
+// Read Supabase config from environment variables — no hardcoded project ref
+// or anon key. Tests will skip (not fail) if these aren't set.
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+const API_BASE = process.env.TEST_API_BASE || 'http://localhost:3000';
+
+// Project ref for the Management API (test cleanup) — derived from the URL
+const SUPABASE_PROJECT_REF = SUPABASE_URL.match(/https:\/\/([a-z0-9]+)\.supabase\.co/)?.[1] || '';
 
 // ============================================================================
 // Test User — creates an anonymous auth user + returns token + client
@@ -135,7 +140,7 @@ const MANAGEMENT_TOKEN = process.env.SUPABASE_MANAGEMENT_TOKEN || '';
 
 export async function cleanupOrg(orgId: string): Promise<void> {
   if (!MANAGEMENT_TOKEN) { console.warn('SUPABASE_MANAGEMENT_TOKEN not set — skipping cleanup'); return; }
-  await fetch(`https://api.supabase.com/v1/projects/apfsceomnnhefxkvjhkz/database/query`, {
+  await fetch(`https://api.supabase.com/v1/projects/${SUPABASE_PROJECT_REF}/database/query`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${MANAGEMENT_TOKEN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ query: `DELETE FROM organizations WHERE id = '${orgId}'` }),
@@ -145,7 +150,7 @@ export async function cleanupOrg(orgId: string): Promise<void> {
 // Cleanup orphaned auth.users created during tests
 export async function cleanupTestUser(userId: string): Promise<void> {
   if (!MANAGEMENT_TOKEN) return;
-  await fetch(`https://api.supabase.com/v1/projects/apfsceomnnhefxkvjhkz/database/query`, {
+  await fetch(`https://api.supabase.com/v1/projects/${SUPABASE_PROJECT_REF}/database/query`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${MANAGEMENT_TOKEN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ query: `DELETE FROM auth.users WHERE id = '${userId}'` }),

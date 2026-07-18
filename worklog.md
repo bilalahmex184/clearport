@@ -1775,3 +1775,51 @@ Stage Summary:
   - lint: 0 errors ✓
   - build: succeeds ✓
 - Follow-up note: ensureAuthenticated() full runtime test (actually calling signInAnonymously and verifying it's skipped in production) requires a live Supabase client or a more complex mock of the Supabase auth module. The static-analysis source-code gating test guards against the regression without that complexity. A future improvement would be to mock the entire Supabase client and test ensureAuthenticated's runtime branching.
+
+---
+Task ID: S2-S6-AUDIT-REFACTOR-PINNING
+Agent: main
+Task: §2 audit identity spoofing fix, §3 repo hygiene, §4 split oversized files, §5 dependency pinning, §6 commit convention
+
+Work Log:
+
+§2 (audit identity spoofing):
+- supabase/functions/update-exception/index.ts: removed `resolvedBy` from the body destructuring. The resolver is now always derived from `user.email || user.id` (server-verified). Removed the vulnerable `typeof resolvedBy === "string" && resolvedBy.trim()` pattern.
+- The API route (src/app/api/exceptions/[id]/route.ts) already passes `getUserEmail(user)` (server-verified) — no change needed there.
+- The validator (src/lib/validators/exception.validator.ts) already doesn't accept resolvedBy — no change needed there.
+- Created tests/unit-pure/08-audit-identity-spoofing.test.ts (9 tests): static source analysis verifying the edge function doesn't destructure resolvedBy, derives resolver from user.email||user.id, and the API route passes getUserEmail(user). Uses static analysis because the edge function is Deno (can't import) and the service layer imports @/lib/supabase which initializes a real client (hangs in tests).
+
+§3 (repo hygiene):
+- Deleted audit/ (stale duplicate of src/), download/ (leftover scaffolding), examples/websocket/ (unused example) from git tracking and disk
+- Added audit/, download/, examples/websocket/ to .gitignore
+- Fixed README test count: replaced hardcoded "54 integration + 175 pure unit tests" with "see CI for current count" + "see `bun run test:pure` for current count"
+- Added "Large Binary Assets" section to README documenting eng.traineddata + git-lfs policy
+
+§4 (split oversized files — behavior-preserving):
+- extract-document/index.ts: 1879 → 1103 lines. Extracted:
+  - lib/regex-extract.ts (regexExtract, parseCSV, parseTableRows, normalizeUtf8, sanitizeCurrency, FIELD_DEFINITIONS)
+  - lib/gemini.ts (getGeminiClient, bufToBase64, callGeminiExtraction, GEMINI_PROMPT, extractJsonArray)
+- ClearPortContext.tsx: 1089 → 1026 lines. Extracted:
+  - src/context/inline-pipeline.ts (runInlinePipeline — the fallback pipeline logic)
+- Tests run before, during, and after each extraction: 208 pass count identical throughout.
+
+§5 (dependency pinning):
+- Pinned next, react, react-dom, @supabase/supabase-js, sharp, tesseract.js, zod to exact versions (removed ^ caret)
+- Removed hardcoded Supabase anon key + project ref from tests/helpers/test-utils.ts, tests/unit/02-document-workflow.test.ts, tests/unit/05-performance.test.ts — now read from process.env.NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY
+
+§6 (commit convention):
+- Created .gitmessage template with conventional commit format (fix:/feat:/refactor:/etc.)
+- Set git config commit.template .gitmessage
+- All commits from this round forward use the convention
+
+Stage Summary:
+- All acceptance criteria pass:
+  - §2: resolvedBy no longer in body destructuring, resolver derived from user.email||user.id ✓
+  - §3: audit/, download/, examples/websocket/ all deleted + gitignored ✓
+  - §4: extract-document 1879→1103 lines (2 modules extracted), ClearPortContext 1089→1026 lines (1 module extracted), 208 tests identical ✓
+  - §5: next/react/react-dom/supabase-js/sharp/tesseract.js/zod pinned to exact versions, 0 hardcoded keys in tests ✓
+  - §6: .gitmessage template + git config set ✓
+  - lint: 0 errors ✓
+  - build: succeeds (42s) ✓
+  - tests: 208/208 passed ✓
+- §4 ExceptionDesk.tsx split noted as follow-up (not done in this pass — lower priority per the prompt)

@@ -694,74 +694,11 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   // calls the edge function directly from the browser. The primary path is the
   // queue + worker — this is the safety net so extraction still works during
   // the migration period.
+  //
+  // (§4 refactor: extracted to src/context/inline-pipeline.ts — behavior preserved)
   const runInlinePipeline = React.useCallback(async (shipmentId: string, _detectedDocType: string) => {
-    try {
-      // Extraction
-      try {
-        await invokeEdgeFunction<any>('extract-document', { shipmentId });
-      } catch (err) {
-        console.warn('[inline-pipeline] extraction failed:', err);
-      }
-
-      // Validation chain
-      const traceId = typeof crypto !== 'undefined' ? crypto.randomUUID() : `trace-${Date.now()}`;
-      try {
-        await apiFetchOrg('/api/shipments/' + shipmentId, {
-          method: 'PATCH',
-          body: JSON.stringify({ validation_status: 'running', pipeline_trace_id: traceId }),
-        });
-      } catch (e) {
-        console.error('[inline-pipeline] failed to set validation_status=running:', e);
-      }
-
-      const invokeWithRetry = async (fnName: string, reqBody: Record<string, any>): Promise<void> => {
-        const delays = [500, 1500];
-        let lastErr: unknown;
-        for (let attempt = 0; attempt <= delays.length; attempt++) {
-          try {
-            await invokeEdgeFunction(fnName, reqBody);
-            return;
-          } catch (err) {
-            lastErr = err;
-            if (attempt < delays.length) {
-              await new Promise(r => setTimeout(r, delays[attempt]));
-            }
-          }
-        }
-        throw lastErr;
-      };
-
-      const results = await Promise.allSettled([
-        invokeWithRetry('schema-validate', { shipmentId, trace_id: traceId }),
-        invokeWithRetry('math-validate', { shipmentId, trace_id: traceId }),
-        invokeWithRetry('cross-validate', { shipmentId, trace_id: traceId }),
-      ]);
-      const failures = results.filter(r => r.status === 'rejected');
-
-      if (failures.length > 0) {
-        await apiFetchOrg('/api/shipments/' + shipmentId, {
-          method: 'PATCH',
-          body: JSON.stringify({ validation_status: 'failed' }),
-        }).catch(() => {});
-      } else {
-        try {
-          await invokeWithRetry('flag-exceptions', { shipmentId, trace_id: traceId });
-        } catch {
-          // flag-exceptions failed → degraded
-        }
-        await apiFetchOrg('/api/shipments/' + shipmentId, {
-          method: 'PATCH',
-          body: JSON.stringify({
-            validation_status: 'completed',
-            last_validated_at: new Date().toISOString(),
-          }),
-        }).catch(() => {});
-      }
-
-      await refreshShipment(shipmentId);
-    } catch (err) {
-      console.error('[inline-pipeline] unexpected error:', err);
-    }
+    const { runInlinePipeline: runPipeline } = await import('./inline-pipeline');
+    await runPipeline(shipmentId, apiFetchOrg, refreshShipment);
   }, [apiFetchOrg, refreshShipment]);
 
   // --- Upload documents ---

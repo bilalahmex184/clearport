@@ -225,8 +225,8 @@ describe('Section 5: Performance + Observability', () => {
     it('regex fallback produces results when Gemini is unavailable', async () => {
       // This test verifies that the extraction pipeline doesn't crash
       // even when Gemini quota is exhausted (which it currently is)
-      const SUPABASE_URL = 'https://apfsceomnnhefxkvjhkz.supabase.co';
-      const ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFwZnNjZW9tbm5oZWZ4a3ZqaGt6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1MDI0ODQsImV4cCI6MjA5OTA3ODQ4NH0.TN_HXmJlNBw94ikW0zeTCgG7uEiZX1dpzVazau0pQ1s';
+      const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+      const ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
       const shipmentId = `SHIP-FALLBACK-${Date.now()}`;
       await apiCall(user, 'POST', '/api/shipments', {

@@ -1,0 +1,22 @@
+# ClearPort Commit Message Convention
+#
+# Format: <type>: <description in plain language>
+#
+# Types:
+#   fix:      bug fix
+#   feat:     new feature
+#   refactor: code restructuring (no behavior change)
+#   docs:     documentation only
+#   chore:    build, deps, config, tooling
+#   test:     adding/updating tests
+#   perf:     performance improvement
+#
+# The description must explain WHAT changed and WHY in plain language.
+# No UUIDs, no generic placeholders.
+#
+# Examples:
+#   fix: stop trusting client-supplied resolvedBy in update-exception audit trail
+#   refactor: extract regex extraction logic from extract-document into lib/regex-extract.ts
+#   chore: pin next/react to exact versions to prevent silent upgrades
+#   test: add regression test for audit identity spoofing fix
+#
