@@ -18,10 +18,15 @@
 
 import { createClient } from '@supabase/supabase-js';
 import { config as loadEnv } from 'dotenv';
-import { resolve } from 'path';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 
 // Load .env from the project root (parent of mini-services/worker/)
-loadEnv({ path: resolve(import.meta.dir, '..', '..', '.env') });
+// Works under both bun (import.meta.dir) and Node (import.meta.url + fileURLToPath)
+const __dirname = typeof import.meta.dir !== 'undefined'
+  ? import.meta.dir
+  : dirname(fileURLToPath(import.meta.url));
+loadEnv({ path: resolve(__dirname, '..', '..', '.env') });
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -93,12 +98,18 @@ async function pollOnce(): Promise<void> {
 // ---------------------------------------------------------------------------
 // Process a single job — calls the extract-document edge function
 // ---------------------------------------------------------------------------
+// Only 'extraction' jobs are enqueued today (the upload path creates
+// processing_jobs rows with job_type='extraction'). Validation runs inline
+// from the browser via ClearPortContext's inline-pipeline fallback after
+// extraction completes. If validation is later moved to the queue, add the
+// enqueue call in ClearPortContext and uncomment runValidation below.
+// ---------------------------------------------------------------------------
 async function processJob(job: any): Promise<boolean> {
   if (job.job_type === 'extraction') {
     return runExtraction(job);
-  } else if (job.job_type === 'validation') {
-    return runValidation(job);
   }
+  // Unknown job types are logged + treated as failures so they dead-letter
+  // rather than silently sitting in 'processing' forever.
   console.warn(`[worker] Unknown job_type: ${job.job_type}`);
   return false;
 }
@@ -149,59 +160,6 @@ async function runExtraction(job: any): Promise<boolean> {
     } else {
       console.error(`[worker] Extraction fetch failed for ${job.shipment_id}:`, msg);
     }
-    return false;
-  }
-}
-
-async function runValidation(job: any): Promise<boolean> {
-  // Validation jobs call the 3 validator edge functions + flag-exceptions
-  // Reuses the same logic as the frontend's runPipeline, but server-side
-  const validators = ['schema-validate', 'math-validate', 'cross-validate'];
-  const traceId = job.trace_id;
-
-  try {
-    // Run validators in parallel
-    const results = await Promise.allSettled(
-      validators.map(async (fn) => {
-        const res = await fetch(`${EDGE_FUNCTION_URL}/${fn}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${SERVICE_ROLE_KEY}`,
-          },
-          body: JSON.stringify({ shipmentId: job.shipment_id, trace_id: traceId }),
-          signal: AbortSignal.timeout(15000),
-        });
-        if (!res.ok) throw new Error(`${fn} returned ${res.status}`);
-      })
-    );
-
-    const failures = results.filter(r => r.status === 'rejected');
-    if (failures.length > 0) {
-      console.error(`[worker] Validation had ${failures.length} failures for ${job.shipment_id}`);
-      return false;
-    }
-
-    // Run flag-exceptions
-    const flagRes = await fetch(`${EDGE_FUNCTION_URL}/flag-exceptions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${SERVICE_ROLE_KEY}`,
-      },
-      body: JSON.stringify({ shipmentId: job.shipment_id, trace_id: traceId }),
-      signal: AbortSignal.timeout(15000),
-    });
-
-    if (!flagRes.ok) {
-      console.error(`[worker] flag-exceptions returned ${flagRes.status} for ${job.shipment_id}`);
-      return false;
-    }
-
-    console.log(`[worker] Validation complete for ${job.shipment_id}`);
-    return true;
-  } catch (err) {
-    console.error(`[worker] Validation failed for ${job.shipment_id}:`, err instanceof Error ? err.message : String(err));
     return false;
   }
 }

@@ -15,18 +15,18 @@
 //    AlertBanner.tsx client further gates display to admin/operator only
 //    so viewers don't see ops alerts in their UI.)
 //
-// ALERT CONDITIONS (the "one real, working alert"):
+// ALERT CONDITIONS:
 //   1. dead_letter_job — any row in `processing_jobs` with status='dead_letter'
-//      for the caller's org. These are jobs the queue (§3) permanently gave
-//      up on after exhausting retries; they need a human to investigate and
-//      re-queue or discard them.
+//      for the caller's org. These are jobs the queue permanently gave up on
+//      after exhausting retries; they need a human to investigate.
 //
 //   2. low_extraction_success_rate — any tier in `extraction_attempts` whose
-//      success rate (success / (success + failure)) over the last hour
-//      dropped below 50%, with a minimum of 5 attempts in the window (so we
-//      don't fire on a single bad luck failure). Per-tier, so the dashboard
-//      can show "Gemini Vision" vs "Tesseract" vs "PDF text-layer" health
-//      separately.
+//      success rate over the last hour dropped below 50% (min 5 attempts).
+//
+//   3. stuck_processing_job — any row in `processing_jobs` with status='processing'
+//      for >5 minutes (the reconciliation window from migration 021). This gives
+//      a live signal in the interval before the cron catches it, not just an
+//      eventual silent self-heal.
 //
 // GRACEFUL DEGRADATION:
 //   The `processing_jobs` table is created by a parallel task (§3) and may
@@ -155,6 +155,43 @@ export async function GET(req: Request) {
       }
     } catch (err) {
       logger.warn('health/alerts: extraction success-rate check threw', {
+        orgId,
+        error: String((err as Error)?.message || err),
+      });
+    }
+
+    // ── 3. stuck processing jobs (processing for >5 min) ───────────────
+    // The reconciliation cron (migration 021) runs every 5 minutes and resets
+    // stuck jobs — but this alert gives a live signal in the interval before
+    // the cron catches it, so an operator sees the problem immediately rather
+    // than waiting up to 5 minutes for the self-heal.
+    try {
+      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+      const { data: stuckRows, error: stuckErr } = await client
+        .from('processing_jobs')
+        .select('id, claimed_at, attempts, max_attempts')
+        .eq('org_id', orgId)
+        .eq('status', 'processing')
+        .lt('claimed_at', fiveMinutesAgo)
+        .order('claimed_at', { ascending: true })
+        .limit(50);
+
+      if (stuckErr) {
+        logger.warn('health/alerts: stuck-jobs query failed', {
+          orgId,
+          error: stuckErr.message,
+        });
+      } else if (stuckRows && stuckRows.length > 0) {
+        alerts.push({
+          type: 'stuck_processing_job',
+          severity: 'high',
+          message: `${stuckRows.length} processing job${stuckRows.length === 1 ? '' : 's'} stuck in 'processing' for >5 minutes — worker may be dead or unresponsive (reconciliation cron will auto-reset shortly)`,
+          createdAt: NOW_ISO(),
+        });
+      }
+    } catch (err) {
+      logger.warn('health/alerts: stuck-jobs check threw', {
         orgId,
         error: String((err as Error)?.message || err),
       });

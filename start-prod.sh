@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# ============================================================================
+# start-prod.sh — legacy start script for bare-metal pm2 deployment
+# ============================================================================
+# Canonical deployment is Docker (see Dockerfile + README "Deployment" section).
+# This script is for hosts that use pm2 instead of Docker. It starts both
+# the web server and the worker via ecosystem.config.js.
+# ============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
 

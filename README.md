@@ -19,10 +19,10 @@ cp .env.example .env
 # Fill in your Supabase URL, anon key, and management token
 
 # 3. Run database migrations
-# Go to Supabase SQL Editor and run migrations 000 through 016 in order
+# Go to Supabase SQL Editor and run migrations 000 through 021 in order
 # (every file in supabase/migrations/, sorted by filename).
 # 000_baseline_schema.sql creates the 6 core tables + users_profile + storage
-# bucket + helper functions that migrations 001-016 ALTER.
+# bucket + helper functions that migrations 001-021 ALTER.
 
 # 4. Deploy edge functions
 npx supabase login
@@ -33,12 +33,48 @@ for fn in upload-document extract-document cross-validate schema-validate math-v
   npx supabase functions deploy $fn --no-verify-jwt
 done
 
-# 5. Start the dev server
-bun run dev
-
-# 6. Run tests
-bun run test
+# 5. Start the app + worker
+bun run dev    # development (single process)
 ```
+
+## Deployment
+
+ClearPort runs as **two processes**: the Next.js web server and the queue worker.
+
+### Production (Docker — recommended)
+
+```bash
+docker build -t clearport .
+docker run -p 3000:3000 \
+  -e NEXT_PUBLIC_SUPABASE_URL=... \
+  -e NEXT_PUBLIC_SUPABASE_ANON_KEY=... \
+  -e INTERNAL_OCR_SECRET=... \
+  -e SUPABASE_SERVICE_ROLE_KEY=... \
+  clearport
+```
+
+The Dockerfile starts **both** the web server (`node server.js`) and the worker (`bun mini-services/worker/index.ts`) via `wait -n` — if either dies, the container exits so the orchestrator restarts it. No half-alive state.
+
+### Alternative (pm2 on a bare metal host)
+
+```bash
+npm install -g pm2
+pm2 start ecosystem.config.js    # starts both clearport + clearport-worker
+pm2 startup && pm2 save          # auto-restart on reboot
+```
+
+### Alternative (bash scripts — legacy, for dev only)
+
+`.zscripts/start.sh` starts the dev server. Does not start the worker. Use only for local development.
+
+### What runs where
+
+| Process | Role | Started by |
+|---------|------|------------|
+| Next.js web server | Serves the UI + API routes | Docker / pm2 |
+| Queue worker | Polls `processing_jobs` table, runs extraction pipeline | Docker / pm2 |
+| Supabase Edge Functions | OCR extraction, validation, flagging | Supabase (managed) |
+| pg_cron | Reconciles stuck jobs every 5 min | Supabase (managed) |
 
 ## Architecture
 

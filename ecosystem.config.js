@@ -1,3 +1,11 @@
+// ============================================================================
+// pm2 ecosystem config — alternative deployment path for bare-metal hosts
+// ============================================================================
+// Canonical deployment is Docker (see Dockerfile + README "Deployment" section).
+// This pm2 config is for hosts that don't use Docker — it starts both the
+// web server and the worker as separate pm2 processes.
+// ============================================================================
+
 module.exports = {
   apps: [
     {

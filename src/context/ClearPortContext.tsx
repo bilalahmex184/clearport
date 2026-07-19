@@ -95,7 +95,16 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [selectedEntryId, setSelectedEntryId] = React.useState<string>('SHIP-2026-8802');
   const [selectedExceptionId, setSelectedExceptionId] = React.useState<string>('8802-hts');
   const [activeTab, setActiveTab] = React.useState<string>('exception-desk');
-  const [theme, setTheme] = React.useState<'dark' | 'light'>('dark');
+  const [theme, setTheme] = React.useState<'dark' | 'light'>(() => {
+    // Lazy initializer — read localStorage at first render, not in a mount effect.
+    // This avoids a setState-in-effect (which causes a double render) and prevents
+    // a flash of the wrong theme on initial load.
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('clearport-theme');
+      if (saved === 'light' || saved === 'dark') return saved;
+    }
+    return 'dark';
+  });
   const [rules, setRules] = React.useState<OperationalRules>(seedRules);
   const [undoStack, setUndoStack] = React.useState<{ entryId: string; exceptionId: string; previousState: Exception }[]>([]);
   const [auditLogs, setAuditLogs] = React.useState<AuditLog[]>(seedLogs);
@@ -165,11 +174,9 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     getCurrentUserEmail().then(email => setCurrentUser(email));
   }, []);
 
-  // --- Persist theme ---
-  React.useEffect(() => {
-    const saved = typeof window !== 'undefined' ? localStorage.getItem('clearport-theme') : null;
-    if (saved === 'light' || saved === 'dark') setTheme(saved);
-  }, []);
+  // Theme is now initialized lazily via useState(() => ...) above — no
+  // mount effect needed. The toggleTheme callback persists changes to
+  // localStorage on user action.
 
   const toggleTheme = React.useCallback(() => {
     setTheme(prev => {
@@ -307,6 +314,9 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     loadData();
   }, [loadData]);
 
+  // loadData is async and needs live org context — a lazy useState initializer
+  // can't be used here. This is a deliberate one-time async load on mount,
+  // not a cascading render.
   React.useEffect(() => {
     loadData();
   }, [loadData]);
