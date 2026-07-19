@@ -1,0 +1,798 @@
+PROMPT 14 — Real PDF OCR support (closes the actual gap, still $0)
+
+CONTEXT: /api/internal/ocr correctly rejects application/pdf with a 415 because sharp in this
+environment isn't built with poppler/PDF rasterization support. This means the Tier 3 OCR
+fallback added in Prompt 3 only helps standalone image uploads, not scanned PDFs — likely the
+single most common real document type in this industry.
+
+FIX: rasterize PDF pages to images using poppler-utils' `pdftoppm` binary (free, open source,
+apt-installable, no GPU) rather than depending on sharp's built-in (and here, absent) PDF
+support.
+
+1. On the self-hosted box: `apt-get install -y poppler-utils` (provides `pdftoppm`). This is a
+   one-time OS-level install, not an npm dependency — document it in the deployment README
+   alongside the other prerequisites (Node, pm2).
+2. In /api/internal/ocr/route.ts, before the mime-type gate: if mimeType is application/pdf,
+   write the decoded buffer to a temp file, shell out to
+   `pdftoppm -png -r 300 -f 1 -l 1 <tmpfile>.pdf <tmpfile>-page` (rasterize just the first page
+   at 300 DPI — extend to multiple pages later if needed, but start simple), read the resulting
+   PNG back into a buffer, then feed that into the existing normalizeImage → tesseract path
+   unchanged. Clean up temp files in a finally block regardless of success or failure.
+3. Update the route's doc-comment and the 415 error path — PDFs should now attempt
+   rasterization first and only return an error if `pdftoppm` itself fails (missing binary,
+   corrupt PDF, etc.), not unconditionally.
+4. Update the extract-document edge function's Tier 3 skip/failure reasoning (see Prompt 15)
+   to reflect that PDFs are now attempted, not automatically skipped.
+
+VERIFICATION: upload a genuinely scanned PDF (photograph or scan saved as PDF, no text layer)
+through Ingest with Gemini deliberately disabled, and confirm it now produces real extracted
+text via Tier 3 instead of going straight to manual review.
+
+
+PROMPT 15 — Make the Tier 3 failure reason accurate, not generic
+
+In supabase/functions/extract-document/index.ts, the Tier 3 (Tesseract) failure path currently
+records the same generic error_message regardless of WHY it failed:
+"Tesseract OCR returned no text (service unavailable or no text recognized)"
+
+This is misleading for the (now-fixed-by-Prompt-14, but still worth doing defensively)
+mime-type-unsupported case, and for any other structural failure — a reviewer looking at the
+extraction_attempts ledger should be able to tell "this document type isn't supported" apart
+from "the OCR service was down" apart from "OCR ran but genuinely couldn't read this image."
+
+FIX: have tesseractOCR() return a structured result instead of `string | null`, e.g.
+`{ text: string | null, reason?: string }`, propagating the actual HTTP status/error detail
+from the /api/internal/ocr response (415 → "unsupported document type", 408 → "OCR timed out",
+502 → "OCR service error", etc.) into the ledger's error_message instead of the current
+one-size-fits-all string.
+
+VERIFICATION: force each failure mode (unsupported mime type, timeout, service down) and
+confirm the extraction_attempts row for each has a distinct, accurate error_message — not the
+same generic sentence every time.
+
+
+PROMPT 16 — Finish the dependency cleanup Prompt 12 started
+
+Remove these, verified zero references anywhere in the repo (not just src/), as of this audit:
+  @hookform/resolvers, @tanstack/react-query, @tanstack/react-table, date-fns, react-markdown
+
+Also remove the dead Prisma/SQLite scaffold entirely — it predates ClearPort and has nothing to
+do with it:
+  - Delete prisma/ (the whole directory — schema.prisma is a generic untouched User/Post
+    blog-starter schema pointed at SQLite, not ClearPort's data model)
+  - Delete src/lib/db.ts (a PrismaClient singleton, confirmed unused — grep for
+    "from '@/lib/db'" or "from \"@/lib/db\"" returns zero hits in src/)
+  - Remove @prisma/client and prisma from package.json
+  - Remove any DATABASE_URL reference tied to Prisma from .env.example if present (check it
+    isn't also used by something else first — it showed up in the CI workflow's build step as
+    `DATABASE_URL: file:/tmp/test.db`; if nothing but Prisma ever reads this env var, remove it
+    from the CI workflow too)
+
+Re-verify each is genuinely unused immediately before removing (things may have changed), then
+run the same 4-gate verification as Prompt 12: tsc --noEmit, eslint, build, dev-server smoke
+test (GET / → 200, an authenticated route → 401 without a token).
+
+
+PROMPT 17 — Fix the two new CI gates before you rely on them
+
+Prompt 6 added `npx tsc --noEmit` and `eslint .` as required CI steps that run before the
+build. As of this audit, BOTH currently fail if run — which means the very first push to CI
+after landing Prompt 6 would go red, on the CI infrastructure that's specifically meant to
+catch future regressions.
+
+1. Fix the 6 tsc errors in tests/unit-pure/ (exact locations and fixes are listed above in the
+   "Claimed done, but not actually true" section — they're small, mostly a stale
+   @ts-expect-error comment and two redundant object-literal keys).
+2. Fix the 14 eslint react-hooks/set-state-in-effect errors — same class of issue flagged in
+   the original Prompt 7, in ClearPortContext.tsx (theme-loader effect, data-loading effect),
+   use-mobile.ts, and carousel.tsx. For each: either restructure per the react.dev guidance the
+   lint error itself links to, or, where the pattern is a legitimate one-time sync-on-mount
+   that doesn't actually cause a problem, add a scoped eslint-disable with a one-line comment
+   explaining why — so this doesn't come up as a false "still broken" flag in the next audit.
+3. Actually run `npx tsc --noEmit && eslint .` locally and confirm both exit 0 before
+   considering this done — not "looks right," actually run it.
+
+VERIFICATION: push to a branch (or run the CI workflow locally via `act` or similar) and
+confirm the Type Check and Lint steps both pass, not just the steps after them.
+
+
+Total added monthly cost: $0, beyond whatever you're already paying Gemini (and you're
+probably on its free tier at 10-user volume — see the cost note in Prompt 3).
+
+
+Why this order
+
+1–2 are one-line crash fixes blocking core workflows today.
+3 replaces the two OCR tiers you can't afford with a free, self-hosted one — this is the real
+engineering work.
+4 makes the whole pipeline auditable so nothing is ever silently dropped.
+5 finishes wiring the ~2,500 lines of pipeline/error/observability code that's already written
+but not connected to anything.
+6–9 are the safety nets that stop these classes of bug from shipping again.
+
+
+PROMPT 1 — Fix the two crash bugs (P0, do first)
+
+You are fixing two confirmed-reproducible runtime crashes in the ClearPort Next.js app.
+
+BUG A: src/app/api/export/[id]/broker/route.ts, line ~108
+BUG B: src/app/api/invites/accept/route.ts, line ~63
+
+Both call `.catch(() => {})` directly on the return value of a Supabase query builder
+(`client.from('audit_logs').insert({...})`), e.g.:
+
+    await client.from('audit_logs').insert({...}).catch(() => {});
+
+This throws `TypeError: ...catch is not a function` at runtime, because the Supabase
+PostgrestFilterBuilder only implements `.then()` (PromiseLike), not `.catch()`, until it's
+awaited. This crash happens inside a try/catch at the route level, so:
+  - In broker export: the CSV is fully built in memory, then this line throws before the
+    response is sent. The endpoint returns 500 on every single call.
+  - In invite accept: the accept_invite() RPC has ALREADY committed the org membership by
+    the time this line runs, so the user is silently added to the org, then shown a 500
+    error. If they retry, the RPC now rejects with "Invalid or expired invite token"
+    because the invite was already marked accepted — a dead end for someone who is
+    actually already a member.
+
+FIX: In both files, replace the unsafe chained `.catch()` with a proper `try { await ... }
+catch { }` block, matching the pattern already used correctly elsewhere in this codebase
+(see src/lib/services/audit-log.service.ts's `logExport`, and the working `.catch()` calls
+in src/context/ClearPortContext.tsx which are safe because they call actual async
+functions, not raw query builders).
+
+Concretely:
+
+    // BEFORE (crashes):
+    await client.from('audit_logs').insert({ ... }).catch(() => {});
+
+    // AFTER (safe — audit log failure never blocks the primary action):
+    try {
+      await client.from('audit_logs').insert({ ... });
+    } catch (auditErr) {
+      logger.warn('Audit log insert failed', { error: (auditErr as Error).message });
+    }
+
+Do this for BOTH occurrences (export/broker/route.ts and invites/accept/route.ts).
+
+VERIFICATION (must all pass before you consider this done):
+1. `npx tsc --noEmit` — the two TS2551 "Property 'catch' does not exist" errors for these
+   two files must be gone.
+2. Grep the whole repo for the unsafe pattern and confirm zero remaining hits:
+   `grep -rn "})\.catch(() => {})" src/` — if this returns src/app/api/rules/validation/
+   route.ts or [id]/route.ts, leave those alone for now, they're a different bug (Prompt 2).
+3. Write (or extend, if it exists) an integration test that actually exercises the audit-log
+   line — i.e. a real broker export call and a real invite-accept call — not just a route
+   that returns 200 before reaching that line. This is important: the existing test suite
+   apparently didn't catch this bug, which means it wasn't hitting this exact code path.
+4. Manually trace: does the broker export endpoint now return a valid CSV with correct
+   Content-Disposition headers? Does invite-accept now return 200 with orgId/orgName/role
+   on a valid, unused token?
+
+
+PROMPT 2 — Fix the broken audit trail on rule changes
+
+Fix a data-integrity bug (not a crash, but wrong data being permanently logged) in:
+  - src/app/api/rules/validation/route.ts (line ~61)
+  - src/app/api/rules/validation/[id]/route.ts (lines ~50 and ~72)
+
+These call:
+    await logRulesUpdate(client, getUserEmail(user), { action: 'created', ruleName, ruleType }).catch(() => {});
+    await logRulesUpdate(client, getUserEmail(user), { action: 'updated', ruleId, changes }).catch(() => {});
+    await logRulesUpdate(client, getUserEmail(user), { action: 'deleted', ruleId }).catch(() => {});
+
+But logRulesUpdate's actual signature (src/lib/services/audit-log.service.ts, line ~244) is:
+
+    export async function logRulesUpdate(
+      client: SupabaseClient,
+      userId: string,
+      rules: { invoiceThreshold?: number; htsThreshold?: number; partiesThreshold?: number },
+    ): Promise<void>
+
+None of the fields being passed (`action`, `ruleName`, `ruleType`, `ruleId`, `changes`) match
+this shape, so every rule create/update/delete currently writes an audit log entry that
+reads: "[rules] User X updated thresholds ()" — empty and useless. For a customs-compliance
+product this is a real audit-trail integrity gap: rule changes are exactly the kind of action
+that needs to be reconstructable later.
+
+FIX: Do not patch the call sites to match the old signature — the old signature was written
+for a different, narrower feature (threshold-only updates) and no longer reflects what this
+function is actually used for. Instead, rewrite logRulesUpdate to accept and log the real
+shape of what's happening:
+
+    export async function logRulesUpdate(
+      client: SupabaseClient,
+      userId: string,
+      details: {
+        action: 'created' | 'updated' | 'deleted';
+        ruleId?: string;
+        ruleName?: string;
+        ruleType?: string;
+        changes?: Record<string, unknown>;
+      },
+    ): Promise<void> {
+      const parts: string[] = [];
+      if (details.ruleName) parts.push(`name=${details.ruleName}`);
+      if (details.ruleType) parts.push(`type=${details.ruleType}`);
+      if (details.ruleId) parts.push(`id=${details.ruleId}`);
+      if (details.changes) parts.push(`changes=${JSON.stringify(details.changes)}`);
+      const text = `[rules] User ${userId} ${details.action} a validation rule (${parts.join(', ')})`;
+      await insertAuditLog(client, { text, type: 'info' });
+    }
+
+Keep every call site using `.catch()` as-is here — that's fine, because logRulesUpdate is a
+real `async function` that returns a native Promise, unlike the raw query builder in Prompt 1.
+
+VERIFICATION:
+1. `npx tsc --noEmit` — the three TS2353 "Object literal may only specify known properties...
+   'action' does not exist" errors must be gone.
+2. Manually create, update, and delete a validation rule through the UI (or API) and confirm
+   the resulting audit_logs row has a human-readable, non-empty description that actually
+   names the rule and the action taken.
+3. Add a regression test asserting the audit log text for a rule action contains the rule name
+   and action verb — this is exactly the kind of thing that silently regresses again if it's
+   only checked by eyeballing output.
+
+
+PROMPT 3 — Replace the two unimplemented OCR tiers with one free, self-hosted tier
+
+CONTEXT: extract-document currently advertises a "5-tier extraction fallback" but two of the
+five tiers are stubs that always return null:
+  - Tier 3 "Cloud Vision OCR" (supabase/functions/extract-document/index.ts, ~line 1027) —
+    literal no-op, comment says "not implemented in this environment."
+  - Tier 4 "Tesseract OCR" (same file, ~line 864, function tesseractOCR) — also a no-op,
+    comment says it "requires a separate service."
+
+CONSTRAINT: no budget for Google Cloud Vision (paid per-image) and no GPU available.
+
+GOOD NEWS: neither of those constraints actually rules out real OCR. Tesseract does NOT need
+a GPU — it's a CPU-only engine, and tesseract.js is a pure-JS/WASM port that runs fine as a
+plain Node.js dependency with no native binary, no GPU, and no external paid API. The reason
+it's currently a stub is that Supabase Edge Functions run on Deno, and the tesseract.js npm
+package assumes a Node.js environment — it doesn't drop into a Deno edge function cleanly.
+
+ARCHITECTURE: since ClearPort's Next.js app is self-hosted (Caddy + `next start`, per the
+Caddyfile/start-prod.sh/watchdog.sh already in this repo) rather than deployed to a
+serverless platform with a hard execution-time ceiling, you have a full Node.js runtime
+available with no function-timeout constraint. Use it:
+
+  1. Add `tesseract.js` as a dependency of the main Next.js app (`npm install tesseract.js`).
+  2. Create a new internal API route: src/app/api/internal/ocr/route.ts
+     - POST only, Node.js runtime (default for API routes — do NOT mark this `runtime: "edge"`).
+     - Require a shared-secret header, e.g. `X-Internal-Secret`, checked against
+       `process.env.INTERNAL_OCR_SECRET`. Reject with 401 if missing/wrong. This endpoint
+       must NOT be reachable by end users — it's edge-function-to-Next.js-app only.
+     - Accept a base64-encoded file + mimeType in the JSON body (match whatever shape is
+       simplest given how extract-document already has the file bytes in memory).
+     - Run:
+         import { createWorker } from 'tesseract.js';
+         const worker = await createWorker('eng');
+         const { data: { text, confidence } } = await worker.recognize(imageBufferOrDataUrl);
+         await worker.terminate();
+     - For PDFs with no text layer (i.e. genuine scans), you'll need to rasterize each page
+       to an image first — use `sharp` (already a dependency) or a PDF-to-image step; check
+       what's already available in this repo before adding a new dependency for this.
+     - Return `{ text, confidence }` as JSON. On failure, return a structured error, never a
+       silent empty 200.
+     - Set a sane internal timeout (e.g. 25s) and return a clear timeout error rather than
+       hanging — this endpoint is called from within extract-document's own wall-clock
+       budget (see the WALL-CLOCK-BUDGET-AND-POLLING work already in worklog.md), so it must
+       fail fast and predictably.
+
+  3. Replace the tesseractOCR() stub in supabase/functions/extract-document/index.ts with a
+     real implementation that calls this new endpoint over HTTPS:
+
+        async function tesseractOCR(arrayBuffer: ArrayBuffer, mimeType: string): Promise<string | null> {
+          const ocrUrl = Deno.env.get("OCR_SERVICE_URL"); // e.g. https://your-app-domain/api/internal/ocr
+          const secret = Deno.env.get("INTERNAL_OCR_SECRET");
+          if (!ocrUrl || !secret) return null; // misconfigured — falls through to Tier 5, never crashes
+          try {
+            const res = await fetch(ocrUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "X-Internal-Secret": secret },
+              body: JSON.stringify({ data: bufToBase64(arrayBuffer), mimeType }),
+              signal: AbortSignal.timeout(25000),
+            });
+            if (!res.ok) {
+              console.error(`[extract-document] OCR service returned ${res.status}`);
+              return null;
+            }
+            const { text } = await res.json();
+            return text || null;
+          } catch (err) {
+            console.error("[extract-document] OCR service call failed", err);
+            return null; // never throw — Tier 5 manual-review is the safety net
+          }
+        }
+
+  4. DELETE the Tier 3 "Cloud Vision" block entirely (don't leave a dead stub) and renumber:
+     - Tier 1: Gemini Vision
+     - Tier 2: PDF text-layer extraction
+     - Tier 3: Tesseract OCR (self-hosted, real, free) — was Tier 4
+     - Tier 4: needs_manual_review — was Tier 5
+     Update every place that references tier numbers (extraction_source strings, comments,
+     the README diagram, and the extraction_attempts ledger from Prompt 4) to match.
+
+  5. Add two new required env vars and document them in .env.example:
+     - OCR_SERVICE_URL (set as a Supabase secret on the edge function: your Next.js app's
+       public URL + /api/internal/ocr)
+     - INTERNAL_OCR_SECRET (a long random string, set BOTH as a Supabase edge function
+       secret and as a Next.js environment variable — generate with
+       `openssl rand -hex 32` and never commit it)
+
+COST NOTE (for your own planning, not something to implement): at 10-user MVP volume, Gemini's
+free tier (Flash models, no credit card required) is very likely sufficient on its own — the
+free tier is generally in the range of 1,000+ requests/day, refreshed daily, which is far
+more than 10 people will generate in a day. Tesseract only needs to fire on the minority of
+documents where Gemini fails, times out, or is a genuine low-quality scan. Realistically this
+whole pipeline can run at $0/month at your current scale. If you ever outgrow the free tier,
+Gemini Flash is still one of the cheapest paid options on the market — verify current numbers
+at ai.google.dev/pricing before committing to a plan, since these change often.
+
+VERIFICATION:
+1. Upload a scanned (non-text-layer) image document through Ingest with Gemini deliberately
+   disabled (unset GEMINI_API_KEY temporarily in a test env) and confirm it still extracts
+   real text via the new Tier 3 path instead of going straight to manual review.
+2. Upload a garbage/corrupt file and confirm it still safely lands in Tier 4 manual review
+   with a clear reason, not a crash.
+3. Time a single-page OCR call — should be a few seconds on CPU, well within the wall-clock
+   budget. Log this in worklog.md.
+4. Confirm INTERNAL_OCR_SECRET actually rejects unauthenticated requests to /api/internal/ocr
+   (curl it without the header, expect 401).
+
+
+PROMPT 4 — Build the extraction audit ledger (never silently miss anything)
+
+GOAL: every single extraction attempt — success, failure, or skip — must be permanently
+recorded, queryable, and exportable. Right now only the FINAL outcome per document is
+visible (extraction_source, processing_status). There is no record of what was tried and
+failed along the way, which makes root-causing extraction quality issues impossible and
+means a compliance officer can't answer "what did the system actually try on this document."
+
+1. New migration: supabase/migrations/017_extraction_attempts_ledger.sql
+
+    CREATE TABLE extraction_attempts (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+      pipeline_trace_id TEXT NOT NULL,
+      tier INTEGER NOT NULL,
+      tier_name TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('success', 'failure', 'skipped')),
+      fields_extracted INTEGER,
+      error_code TEXT,
+      error_message TEXT,
+      latency_ms INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX idx_extraction_attempts_document ON extraction_attempts(document_id);
+    CREATE INDEX idx_extraction_attempts_org ON extraction_attempts(org_id);
+    CREATE INDEX idx_extraction_attempts_trace ON extraction_attempts(pipeline_trace_id);
+
+    ALTER TABLE extraction_attempts ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY "org_members_read_own_attempts" ON extraction_attempts
+      FOR SELECT TO authenticated
+      USING (is_org_member(org_id, auth.uid()));
+    -- Only written by the service-role edge function, never directly by end users.
+
+2. In supabase/functions/extract-document/index.ts, insert one row into this table at EVERY
+   tier boundary — including tiers that are skipped (e.g. "Tier 2 skipped: not a PDF") and
+   the final Tier 4 manual-review outcome. Use the existing `pipeline_trace_id` column
+   already added to `shipments` in migration 015 — generate it once per document at the top
+   of the handler and thread it through every tier and every log line, so a single ID lets
+   you reconstruct the full story of one document end-to-end.
+
+   Do this as fire-and-forget best-effort inserts (never let a ledger-write failure abort
+   the actual extraction) — reuse the safe try/catch pattern from Prompt 1, not the unsafe
+   chained `.catch()`.
+
+3. Add a new API route: src/app/api/documents/[id]/extraction-trace/route.ts
+   - GET, org-scoped (reuse requireOrgRole('viewer')), returns all extraction_attempts rows
+     for a document ordered by created_at, plus the parent document's final outcome.
+   - This is the "audit every error" surface — a support/compliance person should be able
+     to pull up any document and see exactly what happened, in order, with every error
+     message verbatim.
+
+4. Surface this in the UI: add an "Extraction Trace" expandable section to EntryDetailView
+   (or wherever a single shipment/document is viewed) showing the tier-by-tier timeline —
+   tier name, status badge (success/failure/skipped), latency, and error message if any.
+
+5. Add a lightweight health signal with zero new infrastructure: extend the existing
+   Analytics/Dashboard view with an "Extraction Health" panel — success rate by tier over
+   the last 24h/7d, and a list of documents currently sitting in needs_manual_review sorted
+   oldest-first (this doubles as the operational queue an admin works from). Compute this
+   with a straightforward query against extraction_attempts + documents, no new service
+   required.
+
+6. OPTIONAL, still $0: if you want proactive alerting rather than someone having to check the
+   dashboard, add a pg_cron job (you already use pg_cron for stuck-document reconciliation in
+   migration 013 — follow that exact pattern) that runs hourly, computes each org's
+   manual-review rate over the last hour, and if it crosses a threshold (e.g. >30%), inserts
+   a row into a new `system_alerts` table that the Dashboard displays as a banner. This
+   avoids needing any external notification service (Slack/email) while still surfacing
+   degraded extraction quality without anyone having to go looking for it.
+
+VERIFICATION:
+1. Upload a document that fails Tier 1 and Tier 2 and succeeds on Tier 3 — query
+   extraction_attempts for that document_id and confirm you see 3 rows (2 failures, 1
+   success) in the correct order, with real error messages, not nulls.
+2. Confirm the extraction-trace API route is blocked cross-org (a user from Org B gets 403
+   requesting Org A's document trace).
+3. Confirm the Extraction Health panel renders and updates after a batch upload.
+
+
+PROMPT 5 — Wire up the already-built pipeline/errors/observability layer (stop it being dead code)
+
+CONTEXT: this repo already contains ~2,500 lines of well-structured infrastructure code that
+is currently NOT connected to the running application:
+  - src/lib/pipeline/ (orchestrator.ts, cross-validator.ts, metrics.ts,
+    missing-field-detector.ts, types.ts) — only types.ts is actually imported anywhere
+    (by src/lib/rules/engine.ts), the orchestrator itself is never called.
+  - src/lib/errors/ (index.ts, ui-errors.ts) — imported only by the unused middleware and
+    the unused observability/reliability.ts.
+  - src/lib/observability/ (logger.ts, audit.ts, reliability.ts) — not imported by any live
+    route or component.
+  - src/middleware/index.ts — there is no root `src/middleware.ts` Next.js convention file,
+    so this middleware layer never actually runs. It's a fully inert file.
+
+There is also a real bug sitting in this dead code: src/lib/validation/index.ts, line ~230,
+calls `result.error.errors.map(...)` — but the installed Zod v4 renamed this to
+`result.error.issues`. `.errors` is undefined on a ZodError in this version, so the first time
+anything calls validateSchema() with invalid input, it throws `Cannot read properties of
+undefined (reading 'map')`. This currently has zero live impact because nothing calls it yet
+— fix it now, before it's wired in and becomes a live bug nobody notices until it fires.
+
+TASK:
+1. Fix the `.errors` → `.issues` bug in src/lib/validation/index.ts first, regardless of
+   what else you do with this code.
+
+2. Decide, deliberately, whether to finish wiring this layer in or delete it. Half-finished
+   infrastructure that looks live but isn't is worse than either extreme — it misleads
+   whoever reads the codebase next (including future audits) into thinking there's
+   validation/observability/error-handling where there isn't. Recommended: finish wiring it,
+   since the code quality is good and duplicating this work later is wasteful. Specifically:
+
+   a. Mount src/middleware/index.ts as real Next.js middleware: create src/middleware.ts at
+      the project root that imports and re-exports it (Next.js requires this exact file name
+      and location to activate). Confirm it actually runs by adding a log line and hitting
+      any route.
+
+   b. Route every API handler's error path through src/lib/errors instead of the ad-hoc
+      `errorResponse(err)` calls scattered across routes — check whether errors/index.ts
+      already provides what error-handler.ts's `errorResponse`/`AppError` do, and if so,
+      consolidate onto one error-handling module instead of having two.
+
+   c. Route the extract-document pipeline (or at minimum the new Prompt 4 ledger writes)
+      through src/lib/observability/logger.ts instead of raw console.log, so log output is
+      structured and consistent with whatever this module already does.
+
+   d. For src/lib/pipeline/orchestrator.ts specifically: read it fully before deciding — it
+      may already contain a more complete version of the tiered-extraction logic that
+      currently lives inline in the Supabase edge function. If so, the better fix is to make
+      the edge function thin (auth + fetch file + call into shared logic) and have both the
+      edge function and any future Node-side extraction path share this orchestrator, rather
+      than maintaining two parallel implementations. If it's not there yet, treat this as a
+      known follow-up and note it in worklog.md rather than silently duplicating logic.
+
+3. Whatever you decide, update this repo's README architecture diagram to reflect what's
+   ACTUALLY wired in, not what exists as files. A reader should not be able to tell from the
+   README that half of src/lib/ is currently inert.
+
+VERIFICATION:
+1. `npx tsc --noEmit` — zero errors in src/lib/pipeline, src/lib/errors,
+   src/lib/observability, src/lib/validation, src/middleware.
+2. Confirm src/middleware.ts (root) exists and a request log line proves it executes.
+3. Grep for `console.log` in the extraction path and confirm it's been reduced in favor of
+   the structured logger, or document why not.
+
+
+PROMPT 6 — Turn the compiler back on
+
+next.config.ts currently has:
+
+    typescript: { ignoreBuildErrors: true },
+    reactStrictMode: false,
+
+This is the root cause of Prompts 1–3's bugs shipping undetected across multiple work
+sessions — `npx tsc --noEmit` already knew about all of them; the build config was just
+told to ignore it.
+
+TASK:
+1. After Prompts 1, 2, and 5 are done, run `npx tsc --noEmit` again and fix any remaining
+   real errors (exclude legitimate Deno-runtime false-positives from supabase/functions/**
+   when tsc is run against the whole repo with a Node-targeted tsconfig — those are expected
+   and not real bugs, since Deno edge functions are checked separately by the Supabase CLI /
+   `deno check`, not by this repo's tsc).
+2. Once `npx tsc --noEmit` is clean for src/**, remove `ignoreBuildErrors: true` from
+   next.config.ts entirely.
+3. Add a CI step to .github/workflows/test-suite.yml (it already exists) that runs
+   `npx tsc --noEmit` and `npx eslint .` and fails the build on any error — not just on the
+   existing integration test suite. This closes the gap that let three real bugs merge
+   silently: the compiler and linter were never actually gating anything.
+
+VERIFICATION:
+1. `npm run build` succeeds with `ignoreBuildErrors` removed.
+2. Deliberately introduce a trivial type error, confirm CI fails on it, then revert.
+
+
+PROMPT 7 — Fix the React anti-patterns reactStrictMode was hiding
+
+ESLint (via eslint-plugin-react-hooks) currently reports 14-15 errors, concentrated in
+src/context/ClearPortContext.tsx:
+
+1. Refs mutated during render (not in an effect or event handler):
+     currentOrgIdRef.current = currentOrgId;
+     userOrgsRef.current = userOrgs;
+     selectedEntryIdRef.current = selectedEntryId;
+   This is technically unsafe under React's concurrent rendering model — a component can be
+   rendered more than once for a single commit, which would corrupt these refs. It has
+   likely gone unnoticed because reactStrictMode: false means React never double-invokes
+   renders in dev to surface this class of bug.
+
+   FIX: move each of these assignments into a `useEffect(() => { ref.current = value; },
+   [value])`, or replace the ref+state duplication pattern with a single source of truth if
+   the ref is only being used to avoid a stale closure — in that case consider whether
+   useCallback with the correct dependency array solves the same problem without a ref.
+
+2. Several `setState` calls directly in the body of a `useEffect` on mount (ClearPortContext
+   theme loader, TeamManagement's loadInvites, use-mobile.ts, carousel.tsx, ExceptionDesk,
+   IngestUpload). Most of these are legitimate "sync external state into React on mount"
+   patterns and are lower-risk than the ref issue, but fix what eslint flags — either
+   restructure per the react.dev guidance the lint error links to, or, if a case is a false
+   positive for a legitimately correct pattern, add a scoped eslint-disable with a one-line
+   comment explaining why, so the next audit doesn't have to re-derive that.
+
+3. Once all of the above are fixed, flip `reactStrictMode: false` back to `true` (or remove
+   the line — true is the default) in next.config.ts. This is your regression guard: if
+   these patterns creep back in, Strict Mode's double-render-in-dev behavior will surface
+   them immediately during normal development instead of silently shipping.
+
+VERIFICATION:
+1. `npx eslint .` returns 0 errors.
+2. With reactStrictMode re-enabled, click through Ingest, Exception Desk, and Team
+   Management in dev mode and confirm no console warnings about refs or duplicate
+   side-effects, and no visibly broken double-firing behavior (duplicate toasts, duplicate
+   API calls on mount, etc.).
+
+
+PROMPT 8 — Honesty pass on README / architecture docs
+
+Update README.md's architecture section and any other pipeline description to match what
+Prompts 3 and 5 actually shipped:
+
+1. Remove the "5-tier extraction fallback chain" diagram's references to Cloud Vision OCR —
+   it never existed as a real tier and Prompt 3 removed the stub. Replace with the real
+   4-stage chain: Gemini Vision → PDF text-layer → Tesseract (self-hosted) → manual review.
+2. Add a one-paragraph "Cost" section stating this pipeline runs on Gemini's free tier plus
+   self-hosted compute, with no other paid dependencies, so a reader (including a future
+   collaborator, investor, or auditor) isn't misled about what's actually paid vs free.
+3. Add a short "Observability" section describing the extraction_attempts ledger from
+   Prompt 4 and how to query a document's full trace — this is a real differentiator for a
+   compliance product and should be described accurately, not oversold.
+
+This is a documentation-only change — no code. The point is that the previous README
+described capability that didn't exist; don't let the new one do the same.
+
+
+PROMPT 9 — Deployment hardening (still $0)
+
+CONTEXT: this app currently deploys via start-prod.sh / watchdog.sh, both of which are a
+bare `while true; do npx next start; sleep N; done` bash loop behind Caddy. This works for
+a 10-user MVP but has no real health checking (it only restarts after the process has
+already died), no graceful shutdown, and no visibility into restart frequency.
+
+TASK: replace the bash restart loop with a real Node process manager — this is free and a
+much smaller change than it sounds:
+
+1. Add `pm2` as a dependency (or devDependency): `npm install pm2`.
+2. Create an ecosystem.config.js:
+
+    module.exports = {
+      apps: [{
+        name: 'clearport',
+        script: 'node_modules/.bin/next',
+        args: 'start -p 3000',
+        max_memory_restart: '1200M',
+        exp_backoff_restart_delay: 100,
+        min_uptime: '10s',
+        max_restarts: 20,
+        env: { NODE_ENV: 'production' },
+      }],
+    };
+
+3. Replace start-prod.sh and watchdog.sh with `pm2 start ecosystem.config.js` (and
+   `pm2 startup` / `pm2 save` so it survives a box reboot without a custom script).
+4. This gives you, for free: automatic restart on crash with backoff (prevents a
+   crash-loop from hammering the box), memory-based restart before an OOM kill happens
+   instead of after, and `pm2 logs` / `pm2 monit` for basic visibility — all things the
+   current bash loop can't do.
+
+VERIFICATION:
+1. Kill the Next.js process manually and confirm pm2 restarts it within a couple seconds.
+2. Confirm `pm2 logs clearport` shows real request/error output.
+3. Confirm memory-based restart triggers correctly under a synthetic load test if you have
+   time for one — otherwise just confirm the config value is sane for your box's actual RAM.
+
+
+PROMPT 10 — Recover the missing baseline schema (do this before anything else touches the database)
+
+CRITICAL FINDING, higher severity than anything in Prompts 1-2: this repository has NO
+version-controlled definition of its own core tables.
+
+Every migration in supabase/migrations/001 through 016 only ever ALTERs these tables — adds
+a column, enables RLS on a NEW table, etc. Not one of them contains a CREATE TABLE for:
+  - shipments
+  - documents
+  - document_fields
+  - exceptions
+  - operational_rules
+  - audit_logs
+
+Proof: migration 001 opens with `ALTER TABLE shipments ADD COLUMN IF NOT EXISTS org_id...`,
+`ALTER TABLE documents ADD COLUMN...`, `ALTER TABLE exceptions ADD COLUMN...`, etc. — you
+cannot ALTER a table that doesn't already exist, so these six tables were created directly
+against the live Supabase project (dashboard SQL editor or an early un-migrated session)
+before migration-file discipline started, and that original DDL was never committed.
+supabase/schema.sql, despite its own header comment claiming it's "auto-generated from
+migrations," does NOT contain real CREATE TABLE statements for these tables either — it has
+a single commented-out "-- Example org-scoped RLS policy" block, not the actual policy.
+
+CONCRETE CONSEQUENCE: your own README's "Quick Start" instructions ("run all files in
+supabase/migrations/ in order" against a Supabase SQL Editor) will fail on migration 001's
+first ALTER TABLE if run against a fresh project. There is currently no way to recreate this
+database from this git repository alone. If the Supabase project were ever lost, corrupted,
+or you needed a second environment (staging, disaster recovery, a new dev's local setup),
+you would be reconstructing six core tables' schema, constraints, and RLS policies from
+memory.
+
+TASK:
+1. Connect to the live Supabase project (via the SQL editor or `supabase db dump` if the
+   CLI is available to you) and pull the ACTUAL current DDL for these six tables — full
+   column list, types, defaults, constraints, indexes, and every RLS policy currently
+   enabled on them. Do not guess or reconstruct from application code; get the real,
+   currently-running definition. `supabase db dump --schema public -f baseline.sql` (or the
+   dashboard's "Database > Tables > ... > Definition" view per table, plus
+   "Authentication > Policies" for each table's RLS) is the way to do this accurately.
+2. Write this as a new migration: supabase/migrations/000_baseline_schema.sql — numbered
+   000 so it correctly runs FIRST, before 001, on a fresh project. Include full CREATE TABLE
+   statements, all indexes, all constraints, and all RLS policies for shipments, documents,
+   document_fields, exceptions, operational_rules, and audit_logs exactly as they exist live
+   today.
+3. Test this for real: spin up a second, throwaway Supabase project (free tier is fine for
+   this test) and run migrations 000 through 016 against it in order, from nothing. This is
+   the actual acceptance test — if it doesn't succeed end-to-end on an empty project, this
+   isn't done yet.
+4. Update supabase/schema.sql's header comment to stop claiming it's auto-generated (it
+   isn't — it's a hand-maintained summary), or actually make it auto-generated via
+   `supabase db dump` in a script, whichever you'd rather maintain.
+5. Update README's Quick Start to say "run migrations 000 through NNN in order" instead of
+   the current wording.
+
+VERIFICATION: a fresh Supabase project, given only this git repo and nothing else, can run
+every migration in order and end up with a working ClearPort database. This is the real
+test — not just that the file exists.
+
+
+PROMPT 11 — Fix the recurring Google Fonts build failure
+
+CONTEXT: this has apparently been "fixed" before (see worklog / prior notes on "Google Fonts
+CDN failures breaking builds"), but it's back: src/app/layout.tsx imports Inter and
+JetBrains_Mono via `next/font/google`, which fetches font files from fonts.googleapis.com at
+BUILD time, not runtime. Any build environment without unrestricted outbound access to
+Google's font CDN fails the build entirely with "Failed to fetch `Inter` from Google Fonts."
+This is worth fixing permanently rather than re-fixing reactively each time a build
+environment changes, since it's happened at least twice now.
+
+FIX: self-host the font files instead of fetching them at build time.
+1. Download the actual Inter and JetBrains Mono font files (woff2) you want to use and
+   commit them under public/fonts/ or src/app/fonts/.
+2. Replace the next/font/google imports with next/font/local:
+
+    import localFont from 'next/font/local';
+    const inter = localFont({
+      src: [
+        { path: '../../public/fonts/Inter-Regular.woff2', weight: '400', style: 'normal' },
+        { path: '../../public/fonts/Inter-Bold.woff2', weight: '700', style: 'normal' },
+        // ... whichever weights you actually use
+      ],
+      variable: '--font-inter',
+    });
+
+   Same pattern for JetBrains Mono.
+3. This removes the build-time network dependency entirely — the build will succeed
+   identically whether or not the build machine has internet access, and page load no
+   longer depends on Google's font CDN being up either.
+
+VERIFICATION: run `npm run build` with outbound network access to fonts.googleapis.com
+explicitly blocked (e.g. via a hosts-file entry or firewall rule for that one domain) and
+confirm the build still succeeds.
+
+
+PROMPT 12 — Remove dead dependencies
+
+These packages are installed and contribute to install time and audit surface but have zero
+references anywhere in src/: next-auth, zustand, @mdxeditor/editor, @dnd-kit/core,
+@dnd-kit/sortable, @dnd-kit/utilities, z-ai-web-dev-sdk, react-syntax-highlighter,
+@reactuses/core, next-intl.
+
+These are leftovers from whatever starter template this was scaffolded from (next-auth in
+particular is notable — a full second auth library sitting unused while the app actually
+authenticates via Supabase Auth directly is exactly the kind of thing worth removing before
+anyone mistakes it for something load-bearing).
+
+TASK:
+1. Re-verify each one is genuinely unused (`grep -rl "<package-name>" src/` returning
+   nothing) — do this yourself right before removing, in case something changed.
+2. Remove each from package.json and run `npm install` to update the lockfile.
+3. Run the full build + test suite again to confirm nothing was silently relying on one of
+   these (e.g. a global side-effect import).
+
+VERIFICATION: `npm run build` succeeds, `npx tsc --noEmit` unchanged, node_modules and
+install time both shrink measurably.
+
+
+PROMPT 13 — Add fast unit tests that don't need a live Supabase project
+
+CONTEXT: all 54 existing tests (tests/unit/01 through 05) are integration tests that require
+a live Supabase project with real credentials and network access. There are currently zero
+tests that run against pure logic in isolation. This matters for two reasons: (1) it means
+CI is slow and depends on live infrastructure being reachable, which conflicts with your
+zero-budget goal if that infrastructure ever needs to scale test-run volume, and (2) it's
+part of why the bugs in Prompts 1-2 shipped — pure-function bugs in things like
+logRulesUpdate's parameter shape are exactly what a fast unit test catches in milliseconds
+without touching a database.
+
+TASK: add a `tests/unit-pure/` (or similar, clearly separated from the existing live-backend
+tests/unit/) directory covering pure logic that has no Supabase/network dependency:
+  - src/lib/rules/engine.ts — rule evaluation logic
+  - src/lib/mapping/ — broker template transform functions (date_format, round, etc.)
+  - src/lib/validators/shipment.validator.ts
+  - src/lib/services/audit-log.service.ts's message-formatting functions (this would have
+    caught the Prompt 2 bug immediately: assert the exact text of a generated audit log
+    message for a rule-created event)
+  - The regex-based field extraction fallback (regexExtract in extract-document — this can
+    be tested by extracting the pure regex logic into a shared, importable module tested
+    directly, rather than only exercised end-to-end through a live edge function call)
+
+These should run via `vitest run tests/unit-pure` with no environment variables and no
+network access required at all, and should be fast enough to run on every single commit.
+
+VERIFICATION: `vitest run tests/unit-pure` passes with zero network calls (run it with wifi
+off, or in a sandboxed CI runner with no egress, to prove it).
+
+
+Manual action items (not code — no agent prompt can do these for you)
+
+
+Rotate the Supabase Management API token that was scrubbed from git history in an
+earlier session (per worklog.md's PROD-READINESS-FIXES entry). Scrubbing history doesn't
+invalidate the token itself — if it was ever pushed to a remote before the scrub, treat it
+as compromised and rotate it from the Supabase Dashboard regardless. This can't be
+confirmed from the codebase; you need to check the dashboard yourself.
+Confirm which Gemini API tier your key is actually on and what its live rate limits
+are today, from your own AI Studio account page — these change on Google's schedule, not
+yours, and the number that matters is the one on your account, not a number from a blog
+post (including the ones cited earlier in this conversation).
+
+
+
+What this audit did and did not check (read this before assuming "everything")
+
+Checked directly: production build, tsc --noEmit, eslint, the full multi-tenant RLS
+migration history, the extraction pipeline's tier logic, every API route touched by the bugs
+above, dependency usage across the whole src/ tree, and — this round — whether the
+committed migrations can actually reconstruct the database (they can't, see Prompt 10).
+
+NOT done, and worth knowing before treating this as exhaustive: there's no live Supabase
+project or Gemini key available in this audit environment, so nothing has been run
+end-to-end against real infrastructure — no actual document has been uploaded and watched
+through the real pipeline. There was a full manual read of auth.service.ts, the
+export/invite/rules routes, and extract-document, but not the same line-by-line pass on
+math-validate, cross-validate, and schema-validate's internal correctness (checked for the
+same crash pattern and for stub/TODO markers — clean on both — but their validation math
+hasn't been verified correct), nor on the Dashboard, BrokerAnalytics, CrossDocAuditor,
+OperationalRules, or EntryDetailView components beyond what ESLint surfaced. Type-safe logic
+bugs (wrong-but-compiling business logic) won't show up in a tsc/eslint-driven audit like
+this one — only genuine type errors and crash patterns will. Getting that next layer means
+either a live run against a real (even sandboxed/staging) Supabase + Gemini setup, or a
+dedicated line-by-line review of those specific files.

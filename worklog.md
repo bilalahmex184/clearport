@@ -1823,3 +1823,55 @@ Stage Summary:
   - build: succeeds (42s) ✓
   - tests: 208/208 passed ✓
 - §4 ExceptionDesk.tsx split noted as follow-up (not done in this pass — lower priority per the prompt)
+
+---
+Task ID: STEP1-4-FINAL-HARDENING
+Agent: main
+Task: 4-step final production hardening (Dockerfile + eslint pin + reconciliation + deployment path)
+
+Work Log:
+
+Step 1 (Dockerfile fix):
+- Changed deps stage from node:22-slim + npm to oven/bun:1-slim + bun install --frozen-lockfile (deterministic, reads actual bun.lock)
+- Runner stage installs bun via npm, copies mini-services/ alongside standalone build
+- CMD starts BOTH processes: `node server.js & bun mini-services/worker/index.ts & wait -n`
+- If either dies, container exits (no half-alive state)
+- Made worker's import.meta.dir Node-compatible: `typeof import.meta.dir !== 'undefined' ? import.meta.dir : dirname(fileURLToPath(import.meta.url))`
+- Gates: tsc 0, eslint 0, build ✓, tests 208/208
+
+Step 2 (eslint-plugin-react-hooks pin + fix):
+- Added "eslint-plugin-react-hooks": "7.0.1" as exact devDependency (no caret)
+- Enabled "react-hooks/set-state-in-effect": "error" in eslint.config.mjs (was previously disabled)
+- Fixed ClearPortContext.tsx theme: moved from useState('dark') + mount-effect setTheme to lazy useState(() => localStorage read)
+- Fixed use-mobile.ts: moved from useState(undefined) + mount-effect setIsMobile to lazy useState(() => window.innerWidth check)
+- loadData mount effect: rule didn't actually fire on it (loadData is async, not a direct setState) — no disable needed
+- Gates: tsc 0, eslint 0 (0 errors, 0 warnings), build ✓, tests 208/208
+
+Step 3 (Stuck job reconciliation):
+- Created migration 021_reconcile_stuck_jobs.sql:
+  - reclaim_stuck_jobs() function: finds processing_jobs where status='processing' AND claimed_at < NOW() - 5min
+  - If attempts < max_attempts: reset to 'queued' (worker picks it up on next poll)
+  - If attempts >= max_attempts: move to 'dead_letter' with error_history entry noting worker timeout
+  - Scheduled via pg_cron every 5 minutes (same pattern as migration 013)
+- Extended /api/health/alerts with third condition: stuck_processing_job (processing for >5 min, not yet swept by cron)
+- Gates: tsc 0, eslint 0, build ✓, tests 208/208
+
+Step 4 (Deployment path + dead code):
+- README "Deployment" section: Docker is canonical, pm2 is alternative, .zscripts/ is legacy/dev-only
+- Added comments to ecosystem.config.js and start-prod.sh marking them as alternative paths
+- Removed dead runValidation() function from mini-services/worker/index.ts (was never called — only 'extraction' jobs are ever enqueued)
+- Updated processJob() to log + fail unknown job_types (so they dead-letter instead of sitting forever)
+- Gates: tsc 0, eslint 0, build ✓, tests 208/208
+
+Stage Summary — 6-item individual verification:
+1. npx tsc --noEmit → 0 errors ✓
+2. npx eslint . → EXIT 0 (0 errors, 0 warnings, with pinned react-hooks 7.0.1 + set-state-in-effect: error) ✓
+3. bun run build → ✓ Compiled successfully in 34.6s ✓
+4. npx vitest run tests/unit-pure → 208 passed (208) ✓
+5. Server smoke test → HTTP 200 (demo mode) ✓
+6. Dead code check → runValidation removed, grep shows only comments, no function or call site ✓
+
+Manual actions still required (cannot be done from code):
+- Diff 000_baseline_schema.sql against live Supabase db dump
+- Rotate Supabase management token (if ever pushed to remote before scrub)
+- Check Gemini API tier rate limits from your AI Studio account
