@@ -15,6 +15,16 @@
 // ============================================================================
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Clear Supabase env vars BEFORE the module is imported so getSupabase() returns
+// null. vi.hoisted runs before import hoisting, so the module sees no env vars
+// and apiFetch skips the auth calls, going straight to fetch().
+vi.hoisted(() => {
+  delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+  delete process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  delete process.env.NEXT_PUBLIC_DEMO_MODE;
+});
+
 import {
   isDemoMode,
   decideInviteAction,
