@@ -1,0 +1,18 @@
+$ next dev -p 3000
+▲ Next.js 16.1.1 (Turbopack)
+- Local:         http://localhost:3000
+- Network:       http://21.0.7.111:3000
+- Environments: .env
+- Experiments (use with caution):
+  · clientTraceMetadata
+
+✓ Starting...
+✓ Ready in 1621ms
+{"timestamp":"2026-07-20T05:53:08.937Z","level":"info","message":"[middleware] GET /","request_id":"9813f9bf-9db4-49e1-ab72-f10bbe25e219","method":"GET","path":"/"}
+○ Compiling / ...
+{"timestamp":"2026-07-20T05:53:42.388Z","level":"info","message":"[middleware] GET /","request_id":"e1a023ba-b9d1-4bfb-b613-70f4da8ed3ce","method":"GET","path":"/"}
+ GET / 200 in 59ms (compile: 8ms, proxy.ts: 6ms, render: 45ms)
+{"timestamp":"2026-07-20T05:54:43.917Z","level":"info","message":"[middleware] GET /","request_id":"9316596a-c66e-483f-9731-9b2bc8d38307","method":"GET","path":"/"}
+ GET / 200 in 47ms (compile: 5ms, proxy.ts: 6ms, render: 36ms)
+{"timestamp":"2026-07-20T05:54:43.978Z","level":"info","message":"[middleware] GET /","request_id":"55049fe4-6315-4a22-a5cc-e89da8888f60","method":"GET","path":"/"}
+ GET / 200 in 42ms (compile: 4ms, proxy.ts: 5ms, render: 33ms)

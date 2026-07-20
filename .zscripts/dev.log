@@ -158,3 +158,62 @@ Error: listen EADDRINUSE: address already in use :::3000
 }
 [?25h
 error: script "dev" exited with code 1
+==========================================
+[2026-07-20 05:43:16] Starting: bun install
+==========================================
+[BUN] Installing dependencies...
+[0.18ms] ".env"
+bun install v1.3.14 (0d9b296a)
+
+Checked 789 installs across 902 packages (no changes) [229.00ms]
+==========================================
+[2026-07-20 05:43:16] Completed: bun install
+[LOG] Step: bun install | Duration: 0s
+==========================================
+
+==========================================
+[2026-07-20 05:43:16] Starting: Ensuring .env vars
+==========================================
+[ENV] Checking/restoring critical env vars...
+==========================================
+[2026-07-20 05:43:16] Completed: Ensuring .env vars
+[LOG] Step: Ensuring .env vars | Duration: 0s
+==========================================
+
+==========================================
+[2026-07-20 05:43:16] Starting: Starting Next.js dev server
+==========================================
+[BUN] Starting development server...
+$ next dev -p 3000
+==========================================
+[2026-07-20 05:43:16] Completed: Starting Next.js dev server
+[LOG] Step: Starting Next.js dev server | Duration: 0s
+==========================================
+
+==========================================
+[2026-07-20 05:43:16] Starting: Waiting for Next.js dev server
+==========================================
+Waiting for Next.js dev server to be ready on localhost:3000...
+⨯ Failed to start server
+Error: listen EADDRINUSE: address already in use :::3000
+    at <unknown> (Error: listen EADDRINUSE: address already in use :::3000)
+    at new Promise (<anonymous>) {
+  code: 'EADDRINUSE',
+  errno: -98,
+  syscall: 'listen',
+  address: '::',
+  port: 3000
+}
+Next.js dev server is ready!
+==========================================
+[2026-07-20 05:43:18] Completed: Waiting for Next.js dev server
+[LOG] Step: Waiting for Next.js dev server | Duration: 2s
+==========================================
+
+==========================================
+[2026-07-20 05:43:18] Starting: Health check
+==========================================
+[BUN] Performing health check...
+[?25h
+error: script "dev" exited with code 1
+curl: (56) Recv failure: Connection reset by peer

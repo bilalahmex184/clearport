@@ -1,0 +1,3 @@
+{
+  "/api/rules/validation/[id]/route": "app/api/rules/validation/[id]/route.js"
+}

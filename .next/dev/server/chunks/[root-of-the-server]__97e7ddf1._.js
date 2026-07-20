@@ -1,4 +1,4 @@
-;!function(){try { var e="undefined"!=typeof globalThis?globalThis:"undefined"!=typeof global?global:"undefined"!=typeof window?window:"undefined"!=typeof self?self:{},n=(new e.Error).stack;n&&((e._debugIds|| (e._debugIds={}))[n]="b7e058df-d645-27f1-d28a-1e0a31d66293")}catch(e){}}();
+;!function(){try { var e="undefined"!=typeof globalThis?globalThis:"undefined"!=typeof global?global:"undefined"!=typeof window?window:"undefined"!=typeof self?self:{},n=(new e.Error).stack;n&&((e._debugIds|| (e._debugIds={}))[n]="aa237245-8281-6386-058a-96ed9705f74b")}catch(e){}}();
 module.exports = [
 "[externals]/next/dist/server/app-render/work-async-storage.external.js [external] (next/dist/server/app-render/work-async-storage.external.js, cjs)", ((__turbopack_context__, module, exports) => {
 
@@ -525,22 +525,9 @@ async function requestMiddleware(req) {
     // Check for a Supabase session on non-public, non-API routes. If no session
     // and demo mode is off, redirect to /login.
     if (!isPublicRoute(path)) {
-        const demoMode = process.env.NEXT_PUBLIC_DEMO_MODE === 'true';
-        if (!demoMode) {
-            // Read the session token from the supabase auth cookie. The cookie name
-            // follows the pattern sb-<project-ref>-auth-token. We check for its
-            // presence — the actual session validation happens server-side in the
-            // API routes via requireOrgRole(). This is just a redirect guard to
-            // avoid a flash of "logged out" content.
-            const hasAuthCookie = req.cookies.getAll().some((c)=>c.name.startsWith('sb-') && c.name.includes('auth-token'));
-            if (!hasAuthCookie) {
-                const loginUrl = new URL('/login', req.url);
-                loginUrl.searchParams.set('redirect', path);
-                const redirectResponse = __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$next$2f$server$2e$js__$5b$middleware$5d$__$28$ecmascript$29$__["NextResponse"].redirect(loginUrl);
-                redirectResponse.headers.set('X-Request-Id', requestId);
-                return redirectResponse;
-            }
-        }
+        const demoMode = ("TURBOPACK compile-time value", "true") === 'true';
+        if ("TURBOPACK compile-time falsy", 0) //TURBOPACK unreachable
+        ;
     }
     const response = __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$next$2f$server$2e$js__$5b$middleware$5d$__$28$ecmascript$29$__["NextResponse"].next({
         request: {
@@ -701,5 +688,5 @@ const config = {
 }),
 ];
 
-//# debugId=b7e058df-d645-27f1-d28a-1e0a31d66293
+//# debugId=aa237245-8281-6386-058a-96ed9705f74b
 //# sourceMappingURL=%5Broot-of-the-server%5D__97e7ddf1._.js.map

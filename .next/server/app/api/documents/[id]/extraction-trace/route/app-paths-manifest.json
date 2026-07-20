@@ -1,0 +1,3 @@
+{
+  "/api/documents/[id]/extraction-trace/route": "app/api/documents/[id]/extraction-trace/route.js"
+}
