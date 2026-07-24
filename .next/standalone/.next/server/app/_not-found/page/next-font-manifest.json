@@ -1,0 +1,15 @@
+{
+  "pages": {},
+  "app": {
+    "[project]/src/app/_not-found/page": [
+      "static/media/Inter_Regular-s.p.ef73b2a5.woff2",
+      "static/media/Inter_Medium-s.p.142ef487.woff2",
+      "static/media/Inter_SemiBold-s.p.affd22f5.woff2",
+      "static/media/Inter_Bold-s.p.68b4977b.woff2",
+      "static/media/JetBrainsMono_Regular-s.p.675caea2.woff2",
+      "static/media/JetBrainsMono_Bold-s.p.f4df5f59.woff2"
+    ]
+  },
+  "appUsingSizeAdjust": true,
+  "pagesUsingSizeAdjust": false
+}
