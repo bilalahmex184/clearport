@@ -1,4 +1,0 @@
-;!function(){try { var e="undefined"!=typeof globalThis?globalThis:"undefined"!=typeof global?global:"undefined"!=typeof window?window:"undefined"!=typeof self?self:{},n=(new e.Error).stack;n&&((e._debugIds|| (e._debugIds={}))[n]="3e300867-953b-5f3f-3b10-2375509857b3")}catch(e){}}();
-(globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push(["object"==typeof document?document.currentScript:void 0,58298,r=>{"use strict";var e=r.i(43476),t=r.i(71645),o=r.i(62537),a=r.i(39302);function c({error:r,reset:c}){t.useEffect(()=>{try{o.captureException(r,{tags:{source:"app/error.tsx"}})}catch(r){console.error("[app/error.tsx] failed to report to Sentry:",r)}},[r]);let s=t.useCallback(()=>{try{c()}catch(r){console.warn("[app/error.tsx] reset() threw:",r)}window.location.reload()},[c]);return(0,e.jsx)(a.ErrorFallback,{error:r,onReload:s})}r.s(["default",()=>c])}]);
-
-//# debugId=3e300867-953b-5f3f-3b10-2375509857b3

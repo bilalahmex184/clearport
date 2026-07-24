@@ -1,2 +1,65 @@
-skills/
+# Dependencies
 node_modules/
+
+# Build output
+.next/
+out/
+dist/
+build/
+
+# Environment files (NEVER commit real secrets)
+.env
+.env.local
+.env.production
+.env*.local
+
+# Keep .env.example
+!.env.example
+
+# Database
+db/
+*.db
+*.sqlite
+
+# Logs
+*.log
+dev.log
+server.log
+
+# Test results
+test-results/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Supabase
+supabase/.branches
+supabase/.temp
+
+# Playwright
+playwright-report/
+
+# Tool output / scratch files (never commit)
+tool-results/
+upload/
+*.tsbuildinfo
+.zscripts/*.pid
+
+# Stale duplicates / examples removed in repo hygiene pass
+audit/
+download/
+examples/websocket/
+
+# Workspace archives
+*.tar.gz
+clearport-workspace.tar.gz
+
+# Skills (ClawHub skill templates — not part of the app)
+skills/
