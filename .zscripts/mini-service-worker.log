@@ -1,7 +1,7 @@
 [worker] Installing dependencies...
 bun install v1.3.14 (0d9b296a)
 
-Checked 10 installs across 11 packages (no changes) [4.00ms]
+Checked 10 installs across 11 packages (no changes) [6.00ms]
 [worker] Running bun run dev...
 $ bun --hot index.ts
 [worker] FATAL: NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set
