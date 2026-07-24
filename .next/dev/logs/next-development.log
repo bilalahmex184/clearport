@@ -1,3 +1,0 @@
-[00:00:02.367] Server  LOG     ✓ Ready in 2.1s
-[00:00:02.558] Server  INFO    {"timestamp":"2026-07-24T15:52:46.079Z","level":"info","message":"[middleware] GET /","request_id":"c0fa7399-e259-40d4-ba84-6dd783df1e03","method":"GET","path":"/"}
-[00:00:02.591] Server  INFO    {"timestamp":"2026-07-24T15:52:46.113Z","level":"info","message":"[middleware] GET /","request_id":"f17f012a-eedb-49a6-977e-7f9678241ce4","method":"GET","path":"/"}
