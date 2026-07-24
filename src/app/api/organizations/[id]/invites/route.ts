@@ -69,7 +69,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         text: `[invite] User ${getUserEmail(user)} invited ${parsed.data.email} as ${parsed.data.role}`,
         type: 'info',
       });
-    } catch {}
+    } catch (auditErr) {
+      logger.warn('Invite: audit log insert failed', { error: auditErr instanceof Error ? auditErr.message : String(auditErr) });
+    }
 
     logger.info('Invite created', { inviteId: data.id, orgId, email: parsed.data.email, role: parsed.data.role });
 

@@ -165,21 +165,34 @@ async function runExtraction(job: any): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
-// Start polling
+// Start polling — with graceful shutdown
 // ---------------------------------------------------------------------------
 const interval = setInterval(pollOnce, POLL_INTERVAL_MS);
+let shuttingDown = false;
 
-// Allow the process to exit cleanly on SIGTERM/SIGINT (pm2 sends SIGTERM)
-process.on('SIGTERM', () => {
-  console.log('[worker] SIGTERM received — shutting down');
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[worker] ${signal} received — graceful shutdown (waiting for ${activeJobs} in-flight job(s))`);
   clearInterval(interval);
+
+  // Wait up to 30 seconds for in-flight jobs to complete
+  const deadline = Date.now() + 30_000;
+  while (activeJobs > 0 && Date.now() < deadline) {
+    console.log(`[worker] Waiting for ${activeJobs} job(s) to finish…`);
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  if (activeJobs > 0) {
+    console.warn(`[worker] ${activeJobs} job(s) still in-flight after 30s — forcing exit (they will be reclaimed by the reconciliation cron)`);
+  } else {
+    console.log('[worker] All jobs complete — clean exit');
+  }
   process.exit(0);
-});
-process.on('SIGINT', () => {
-  console.log('[worker] SIGINT received — shutting down');
-  clearInterval(interval);
-  process.exit(0);
-});
+}
+
+process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
 
 // Fire one poll immediately on startup
 pollOnce();

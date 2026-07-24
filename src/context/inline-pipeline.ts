@@ -74,7 +74,7 @@ export async function runInlinePipeline(
       await apiFetchOrg('/api/shipments/' + shipmentId, {
         method: 'PATCH',
         body: JSON.stringify({ validation_status: 'failed' }),
-      }).catch(() => {});
+      }).catch((err) => { console.warn('[inline-pipeline] PATCH failed status failed:', err instanceof Error ? err.message : err); });
     } else {
       try {
         await invokeWithRetry('flag-exceptions', { shipmentId, trace_id: traceId });
@@ -87,7 +87,7 @@ export async function runInlinePipeline(
           validation_status: 'completed',
           last_validated_at: new Date().toISOString(),
         }),
-      }).catch(() => {});
+      }).catch((err) => { console.warn('[inline-pipeline] PATCH completed status failed:', err instanceof Error ? err.message : err); });
     }
 
     await refreshShipment(shipmentId);

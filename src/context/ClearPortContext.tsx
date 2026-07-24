@@ -882,7 +882,9 @@ export const ClearPortProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       } catch (err) {
         console.error('[queue] unexpected error writing job:', err);
         // Same fallback — don't let a queue failure prevent extraction
-        void runInlinePipeline(shipmentId, detectedDocType).catch(() => {});
+        void runInlinePipeline(shipmentId, detectedDocType).catch((err) => {
+          console.error('[pipeline] inline fallback failed for', shipmentId, err instanceof Error ? err.message : err);
+        });
       }
 
       // Return immediately — the user has already seen "received, processing".

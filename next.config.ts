@@ -3,25 +3,32 @@ import { withSentryConfig } from "@sentry/nextjs";
 
 const nextConfig: NextConfig = {
   output: "standalone",
-  // P6: ignoreBuildErrors removed — the compiler and linter now gate the build.
-  // All tsc errors in src/ have been fixed. CI runs `tsc --noEmit` + `eslint .`
-  // on every PR to prevent regressions.
-  // P7: reactStrictMode re-enabled — refs are no longer mutated during render,
-  // so React's double-render-in-dev behavior is safe.
   reactStrictMode: true,
+  // Security headers — protect against XSS, clickjacking, MIME sniffing, enforce HTTPS
+  async headers() {
+    return [
+      {
+        source: "/(.*)",
+        headers: [
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          { key: "X-XSS-Protection", value: "1; mode=block" },
+          { key: "Strict-Transport-Security", value: "max-age=31536000; includeSubDomains" },
+          {
+            key: "Content-Security-Policy",
+            value: "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://vision.googleapis.com https://api.sentry.io; frame-ancestors 'none';",
+          },
+          { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },
+        ],
+      },
+    ];
+  },
 };
 
-// S6: Sentry webpack wrapper. Wraps the Next.js config so the Sentry plugin
-// can instrument the client/server/edge bundles and load the matching
-// sentry.{client,server,edge}.config.ts files. Source map uploading is
-// intentionally disabled — we don't have a SENTRY_AUTH_TOKEN in this env.
-// No-op in dev when no DSN is set: the config files guard Sentry.init() on
-// the presence of NEXT_PUBLIC_SENTRY_DSN / SENTRY_DSN.
 export default withSentryConfig(nextConfig, {
-  // Only run Sentry webpack in production (faster dev builds)
   silent: true,
   org: process.env.SENTRY_ORG,
   project: process.env.SENTRY_PROJECT,
-  // Disable source map uploading in dev (no auth token)
   widenClientFileUpload: false,
 });
