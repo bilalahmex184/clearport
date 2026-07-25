@@ -1,7 +1,0 @@
-[00:00:01.344] Server  LOG     ✓ Ready in 1106ms
-[00:00:07.967] Server  INFO    {"timestamp":"2026-07-25T06:51:19.383Z","level":"info","message":"[middleware] GET /","request_id":"6f6a5e3d-de2f-4537-9f63-ba9a36cdf7e5","method":"GET","path":"/"}
-[00:00:10.977] Server  LOG     ○ Compiling / ...
-[00:00:11.928] Server  INFO    {"timestamp":"2026-07-25T06:51:23.344Z","level":"info","message":"[middleware] GET /","request_id":"a67bb867-a8da-462a-b274-1d680bd65df1","method":"GET","path":"/"}
-[00:00:27.165] Server  INFO    {"timestamp":"2026-07-25T06:51:38.581Z","level":"info","message":"[middleware] GET /","request_id":"8500949d-10fc-464c-af59-6e6c4342eb38","method":"GET","path":"/"}
-[00:01:21.254] Server  INFO    {"timestamp":"2026-07-25T06:52:32.671Z","level":"info","message":"[middleware] GET /","request_id":"bffe0013-6df3-4a9a-959a-2a379748d052","method":"GET","path":"/"}
-[00:02:06.153] Server  INFO    {"timestamp":"2026-07-25T06:53:17.569Z","level":"info","message":"[middleware] GET /","request_id":"c6be6fe4-71b7-4cc1-a22e-8244f58677f3","method":"GET","path":"/"}
