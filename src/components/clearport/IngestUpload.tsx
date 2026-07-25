@@ -6,6 +6,7 @@ import { UploadCloud, CheckCircle2, FileText, Loader2, Sparkles, AlertCircle, He
 import { motion, AnimatePresence } from 'framer-motion';
 import { supabase } from '@/lib/supabase';
 import { canUpload, roleLabel } from '@/lib/services/rbac.service';
+import { FirstUploadTooltip } from './OnboardingBanner';
 
 type StepType = 'idle' | 'uploading' | 'processing' | 'done';
 
@@ -78,6 +79,16 @@ export default function IngestUpload() {
     if (!canUploadFiles) {
       setErrorMsg('Your role does not have permission to upload documents.');
       return;
+    }
+
+    // FIX 10: first-upload onboarding — once the user actually starts an
+    // upload, mark the 'clearport-first-upload' flag so the pulsing tooltip
+    // on the drop zone never reappears. This runs before the upload
+    // validation so the flag is set even if the upload later fails — the
+    // user has demonstrably found the upload zone, the tooltip has done its
+    // job.
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('clearport-first-upload', 'true');
     }
 
     const allowedMimeTypes = ['application/pdf', 'image/png', 'image/jpeg', 'image/jpg', 'image/tiff', 'text/plain', 'text/csv'];
@@ -286,12 +297,20 @@ export default function IngestUpload() {
               onDragOver={handleDragOver}
               onDragLeave={handleDragLeave}
               onDrop={handleDrop}
-              className={`border-2 border-dashed rounded-2xl p-6 sm:p-10 md:p-12 text-center flex flex-col items-center justify-center cursor-pointer transition-all aspect-[16/9] max-w-2xl mx-auto w-full select-none ${
+              className={`relative border-2 border-dashed rounded-2xl p-6 sm:p-10 md:p-12 text-center flex flex-col items-center justify-center cursor-pointer transition-all aspect-[16/9] max-w-2xl mx-auto w-full select-none ${
                 isDragging
                   ? 'border-amber-500 bg-amber-950/10'
                   : 'border-gray-800 hover:border-gray-700 bg-black/20 hover:bg-black/40'
               }`}
             >
+              {/* FIX 10: pulsing first-upload hint overlay. Self-manages its
+                  own visibility via the 'clearport-first-upload' localStorage
+                  flag — renders null when dismissed or after the first
+                  upload. pointer-events-none on the overlay so the parent's
+                  drag/click handlers still receive events; only the dismiss
+                  button is pointer-events-auto. */}
+              <FirstUploadTooltip />
+
               <input
                 type="file"
                 ref={fileInputRef}

@@ -1875,3 +1875,210 @@ Manual actions still required (cannot be done from code):
 - Diff 000_baseline_schema.sql against live Supabase db dump
 - Rotate Supabase management token (if ever pushed to remote before scrub)
 - Check Gemini API tier rate limits from your AI Studio account
+
+---
+Task ID: FIX5-7-SPLIT
+Agent: general-purpose
+Task: Split ClearPortContext + ExceptionDesk into focused modules
+
+Work Log:
+
+TASK 1 — Split src/context/ClearPortContext.tsx (1038 → 199 lines):
+
+- src/context/use-theme.ts (48 lines, new): extracted `theme` state + `toggleTheme`. Self-contained — no cross-hook deps. Preserved the lazy useState initializer (reads localStorage at first render, no setState-in-effect flash).
+- src/context/use-shipments.ts (821 lines, new): extracted entries / selectedEntryId / selectedExceptionId / rules / undoStack / auditLogs state, the selectedEntry/selectedException derivations, the selectedEntryIdRef mirror, the audit-log helper, refreshShipment, the 4-second polling effect, selectEntry/selectException, updateException, undoLastAction, acceptAllHighConfidence, runInlinePipeline wrapper, uploadDocuments, updateRules, exportToCSV, and refreshData.
+- src/context/use-org.ts (320 lines, new): extracted supabaseStatus, edgeFunctionStatus, currentUser, currentTime, userRole, userOrgs, currentOrgId state, the apiFetchOrg wrapper, the real-time clock effect, the email-load effect, loadData (the full org-bootstrap + shipment/rules/logs fetch), switchOrg, and the mount loadData effect. Also re-exports the SupabaseStatus + EdgeFunctionStatus types so existing imports from ClearPortContext keep working.
+- src/context/ClearPortContext.tsx (199 lines, rewritten): now a thin composer. Creates four cross-hook refs (apiFetchOrgRef, currentUserRef, loadDataRef, currentOrgIdRef), calls useTheme() + useShipments({refs}) + useOrg({refs + shipments setters}), and assembles the SAME ClearPortContextType value as before. The interface, useClearPort hook, and the type re-exports at the bottom are unchanged — every consuming component (page.tsx + 13 panels) is untouched.
+
+Cross-hook wiring design: useShipments runs first (useOrg needs its setters); useShipments' action callbacks read apiFetchOrg / currentUser / loadData / currentOrgId from refs that useOrg populates via effects after the first commit. Safe because no useShipments action is callable during the first render (they're all user-triggered: clicks, uploads, polls). Using refs instead of `apiFetchOrg` / `currentUser` as useCallback deps makes the action identities strictly more stable (the original recreated them on every currentUser change — that no longer happens).
+
+TASK 2 — Split src/components/clearport/ExceptionDesk.tsx (850 → 115 lines):
+
+- src/components/clearport/exception-desk-utils.ts (33 lines, new): extracted getConfidenceColor + getConfidenceBadge (shared by ExceptionList + ResolutionPanel).
+- src/components/clearport/ExceptionList.tsx (237 lines, new): left panel — header, CSV export, validation status banner, severity/sort filters, batch-accept button, read-only viewer-role notice, scrollable exception list. Owns severityFilter + sortBy locally. Props: selectedEntry, selectedExceptionId, onSelectException, onExportCSV, onAcceptAllHighConfidence, rules, canResolveExceptions, userRole.
+- src/components/clearport/DocumentViewer.tsx (344 lines, new): center panel — data-driven doc tabs, zoom/rotate controls, real-file viewer (image/PDF/text/unknown-with-download), structured-extract fallback, bounding-box overlay. Owns documentMime + isLoadingUrl locally. Runs the signed-URL fetch effect (was in the orchestrator). Props: selectedEntry, selectedException, activeDocTab, setActiveDocTab, documentUrl, setDocumentUrl, zoomLevel, setZoomLevel, rotation, setRotation.
+- src/components/clearport/ResolutionPanel.tsx (353 lines, new): right panel — exception header with severity badge, discrepancy reason + explanation, extracted vs cross-doc comparison, inline manual-override editor, Accept/Modify/Reject buttons (RBAC-gated), collapsible audit trail, keyboard-shortcut footer, and the "All exceptions cleared" empty state. Owns isEditing + editValue + showHistory + inputRef locally + the window keydown handler (Space/E/R/Ctrl+Z). Props: selectedEntry, selectedException, onUpdateException, onUndoLastAction, canResolveExceptions.
+- src/components/clearport/ExceptionDesk.tsx (115 lines, rewritten): thin orchestrator. Pulls the relevant context slice, derives canResolveExceptions, holds the 4 pieces of shared state (activeDocTab, zoomLevel, rotation, documentUrl), syncs activeDocTab to selectedException.docType on selection change, renders the 3 panels with the right props. The "no shipment selected" early return stays here so the sub-components can assume selectedEntry is defined.
+
+Behavior preservation:
+- Same context shape, same UI, same API calls, same state transitions.
+- The original `selectedException` sync effect (setEditValue + setActiveDocTab + setIsEditing) is split: activeDocTab sync stays in the orchestrator (it's shared state); editValue + isEditing sync moved into ResolutionPanel (it's local state). Both effects fire on the same `selectedException?.id` change, so the render count is unchanged.
+- The keyboard handler moved from the orchestrator into ResolutionPanel. Same deps (selectedException, selectedEntry, updateException, undoLastAction, canResolveExceptions) — same behavior, same scope (window-level keydown).
+- The URL fetch effect moved from the orchestrator into DocumentViewer. Same deps (selectedEntry?.id, activeDocTab) — same fetch sequence (edge function → Supabase storage fallback → spinner → fallback view).
+
+ESLint note: react-hooks/preserve-manual-memoization (on by default in pinned react-hooks 7.0.1) flagged useOrg's apiFetchOrg (`[]` deps reading currentOrgIdRef) and switchOrg (`[loadData]` deps reading currentOrgIdRef). The original code didn't trigger the rule because currentOrgIdRef was a local useRef; in the split, it's passed in via deps so the compiler treats it as non-stable. Fix: added currentOrgIdRef explicitly to both callbacks' deps arrays. Refs are stable (useRef contract), so adding them is behaviorally a no-op but satisfies the compiler's inferred-deps check.
+
+Stage Summary — all gates pass:
+1. Baseline `npx vitest run tests/unit-pure/` (before): 208 passed (208) ✓
+2. `npx tsc --noEmit` after both splits: EXIT 0 (0 errors) ✓
+3. `npx eslint .` after both splits: EXIT 0 (0 errors, 0 warnings) ✓
+4. `npx vitest run tests/unit-pure/` after both splits: 208 passed (208) ✓
+5. `bun run build` after both splits: Compiled successfully ✓
+
+Line-count deltas:
+- ClearPortContext.tsx: 1038 → 199 (split into use-theme.ts 48 + use-shipments.ts 821 + use-org.ts 320)
+- ExceptionDesk.tsx: 850 → 115 (split into exception-desk-utils.ts 33 + ExceptionList.tsx 237 + DocumentViewer.tsx 344 + ResolutionPanel.tsx 353)
+- No consuming component changed (page.tsx + 13 panels import useClearPort / ClearPortProvider / ShipmentEntry — all still exported from the same path with the same shapes).
+
+tests/unit-pure/ untouched — the 8 test files (208 tests) ran unchanged before and after.
+
+---
+Task ID: FIX8-9-10-SAAS
+Agent: general-purpose
+Task: Add email notifications, Stripe billing stub, onboarding flow
+
+Work Log:
+
+TASK 1 — Email notification stub (FIX 8):
+
+- src/lib/services/notification.service.ts (new, ~180 lines):
+  - dispatchNotification(client, params) — single point of truth for the
+    $0-budget "email" path: inserts a row into `notifications` AND console-
+    logs a structured JSON line. The single dispatch point means the
+    production email-provider swap (Resend / SendGrid) is a one-file change.
+  - notifyExtractionComplete(client, shipmentId, userEmail, {orgId, userId?,
+    reviewUrl?}) — message: "Your document extraction is complete for
+    shipment X. Review it at [URL]" (or "...in the Exception Desk." when
+    no reviewUrl is available).
+  - notifyExceptionFlagged(client, shipmentId, fieldName, userEmail,
+    {orgId, userId?}) — message: 'An exception was flagged on field "X" in
+    shipment Y. Review it in the Exception Desk.'
+  - notifyInviteAccepted(client, orgId, newMemberEmail, adminEmail,
+    {adminUserId?}) — message: "newMemberEmail joined your organization."
+  - All four are best-effort: DB insert errors are logged + swallowed so a
+    notification failure never breaks the parent operation (extraction,
+    exception flagging, invite acceptance). Schema-not-deployed is the most
+    common dev error — the service logs a hint and continues.
+- supabase/migrations/024_notifications.sql (new):
+  - notifications table: id (UUID PK), org_id (FK organizations, CASCADE),
+    user_id (FK auth.users, CASCADE, nullable for anon sessions), type
+    (TEXT + CHECK: extraction_complete | exception_flagged | invite_accepted),
+    message (TEXT NOT NULL), read (BOOLEAN DEFAULT FALSE), created_at.
+  - Indexes: (org_id, created_at DESC) for the per-org list query;
+    (user_id, created_at DESC) WHERE read=FALSE for the unread-badge query.
+  - RLS: org-scoped (is_org_member). SELECT for org members; INSERT with
+    CHECK for org members (the notification service passes the caller's
+    orgId); UPDATE for mark-as-read. No DELETE policy — notifications are
+    append-only audit-like records; cleanup happens via service-role job.
+
+TASK 2 — Stripe billing stub (FIX 9):
+
+- src/lib/services/billing.service.ts (new, ~190 lines):
+  - Plan type = 'free' | 'pro' | 'enterprise'.
+  - DEFAULT_PLAN_LIMITS: {free: 25, pro: 1_000, enterprise: 100_000} —
+    fallback when usage_limits table is missing (dev). DB is source of truth.
+  - getOrgPlan(client, orgId) — reads org_subscriptions.plan for the org.
+    Returns 'free' when no row exists OR the table doesn't exist (logs +
+    swallows schema-not-deployed errors so the upload path doesn't crash).
+  - checkUsageLimit(client, orgId) — two round-trips: getOrgPlan first
+    (need the plan to know which limit to look up), then count + limit
+    fetch in parallel. Returns {count, limit, exceeded}. Count = documents
+    rows where org_id = $1 AND uploaded_at >= start-of-month. Limit =
+    usage_limits.max_documents_per_month for the plan, falling back to
+    DEFAULT_PLAN_LIMITS on read failure. Fails open (exceeded=false) on
+    count errors so a DB hiccup doesn't block a paying customer.
+  - upgradePlan(orgId, plan) — placeholder that throws AppError(503,
+    'STRIPE_NOT_CONFIGURED') when STRIPE_SECRET_KEY is unset. Even with
+    the key set, throws AppError(501, 'STRIPE_NOT_IMPLEMENTED') because
+    the actual Checkout Session flow is a follow-up task. The throw is the
+    explicit signal that this is the single point a real Stripe integration
+    would replace.
+- supabase/migrations/025_billing.sql (new):
+  - org_subscriptions table: org_id (PK, FK organizations CASCADE), plan
+    (TEXT DEFAULT 'free' + CHECK), stripe_customer_id, stripe_subscription_id,
+    current_period_end, created_at, updated_at. Trigger touch_org_subscriptions_
+    updated_at() auto-bumps updated_at on UPDATE.
+  - usage_limits config table: plan (PK + CHECK), max_documents_per_month
+    (INTEGER + CHECK >= 0), updated_at. Seeded with three rows
+    (free=25, pro=1000, enterprise=100000) via INSERT ... ON CONFLICT DO NOTHING.
+  - RLS on org_subscriptions: org-scoped SELECT + INSERT (members can read
+    + lazily create their org's row as 'free'). NO UPDATE / DELETE policy —
+    plan upgrades flow through Stripe webhooks (service-role, bypasses RLS)
+    only, so a client can never self-upgrade.
+  - RLS on usage_limits: SELECT for all authenticated (config table; the UI
+    needs to read it to render plan options). No INSERT / UPDATE / DELETE
+    policy — config is written by service-role migrations only.
+- .env.example: appended a "Stripe billing (OPTIONAL — currently a stub)"
+  section with 4 commented-out keys (STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
+  STRIPE_PRO_PRICE_ID, STRIPE_ENTERPRISE_PRICE_ID) + a 4-step wiring guide.
+
+TASK 3 — Onboarding flow (FIX 10):
+
+- src/components/clearport/OnboardingBanner.tsx (new, ~175 lines):
+  - Default export OnboardingBanner({onDismiss, onGoToIngest}) — amber
+    banner with the exact spec styling (bg-amber-950/30, border-amber-900/40,
+    text-amber-400) for dark theme, plus matching amber-50/200/800 for
+    light theme (theme pulled from useClearPort so the banner stays legible
+    in either theme). Content: "Welcome to ClearPort! / Upload your first
+    customs document to get started." + "Go to Ingest Desk" button +
+    dismiss X. role="status" + aria-live="polite" for a11y.
+  - Named export FirstUploadTooltip — self-managing pulsing overlay for
+    the Ingest Desk upload zone. Reads localStorage 'clearport-first-upload'
+    via lazy useState initializer (SSR-safe), re-syncs from a mount effect.
+    Renders null when dismissed. Renders an absolute-positioned overlay
+    with `pointer-events-none` (so the parent drag/click handlers still
+    receive events) containing: (1) a pulsing ring-4 ring-amber-500/60
+    animate-pulse around the upload zone edge, (2) a floating chip below
+    with "↑ Upload your first document here" + an X dismiss button
+    (pointer-events-auto). The dismiss button sets localStorage + flips
+    visibility to false.
+- src/components/clearport/ExceptionDesk.tsx (modified):
+  - Added `entries` + `setActiveTab` to the context destructuring.
+  - Added onboardingDismissed state via lazy useState initializer (SSR
+    returns true → banner hidden during SSR, avoiding hydration mismatch).
+    showOnboardingBanner is derived (entries.length === 0 && !dismissed) —
+    no setState-in-effect.
+  - Refactored render: extracted the existing content (no-shipment early-
+    return + 3-panel grid) into a `content` const. When showOnboardingBanner
+    is false, returns content directly (byte-for-byte identical to the
+    pre-onboarding version — no wrapping div, no layout change). When true,
+    wraps in `<div className="flex flex-col h-full"><OnboardingBanner/>
+    <div className="flex-1 min-h-0">{content}</div></div>` so the banner
+    gets its own row and the content fills the rest.
+  - dismissOnboardingBanner persists to localStorage + flips state.
+  - goToIngest calls setActiveTab('ingest').
+- src/components/clearport/IngestUpload.tsx (modified):
+  - Imported FirstUploadTooltip.
+  - Added `relative` to the idle-state motion.div className so the tooltip's
+    `absolute inset-0` overlays the upload zone (not the outer panel).
+  - Mounted <FirstUploadTooltip /> as the first child of the idle motion.div.
+  - handleFileUpload sets localStorage 'clearport-first-upload' = 'true' at
+    the top of the function (before file validation) so the tooltip never
+    reappears after the user's first upload attempt, even if the upload
+    fails. Combined with the tooltip's own mount-effect re-sync, this means
+    the tooltip disappears on first upload and never comes back.
+
+Stage Summary — all gates pass:
+1. npx tsc --noEmit → EXIT 0 (0 errors) ✓
+2. npx eslint . → EXIT 0 (0 errors, 0 warnings — initial run had 1 unused-
+   eslint-disable warning in notification.service.ts, removed) ✓
+3. npx vitest run tests/unit-pure/ → 208 passed (208) ✓
+4. bun run build → ✓ Compiled successfully in 21.7s ✓
+
+Constraints honored:
+- No stripe or @sendgrid/mail in dependencies — both are stubs (the only
+  external touch is `process.env.STRIPE_SECRET_KEY` read inside upgradePlan).
+- No existing behavior changed: ExceptionDesk returns the original content
+  unchanged when the banner is hidden; IngestUpload's only behavioral
+  change is the localStorage write in handleFileUpload (which is additive —
+  no existing code reads that flag) + the tooltip overlay (pointer-events-
+  none, so drag/click events still reach the parent).
+- All new tables have proper org-scoped RLS (notifications: org_id via
+  is_org_member; org_subscriptions: org_id via is_org_member; usage_limits:
+  world-readable config, no writes from clients).
+- All new files pass tsc + eslint.
+
+Follow-ups (not done — out of scope for this task):
+- Wire the notification service into the actual extraction-complete /
+  exception-flagged / invite-accepted code paths (edge functions + API
+  routes). Currently the service exists but isn't called from anywhere —
+  callers need to add the invocation at the right points.
+- Wire checkUsageLimit into the upload path so the org_subscriptions +
+  usage_limits tables actually gate uploads. Currently the read paths work
+  but no caller enforces the limit.
+- Implement the real Stripe Checkout Session flow in upgradePlan + a
+  /api/billing/webhook route that handles customer.subscription.* events.
+  Requires a Stripe account + price IDs.
+- Add an in-app notification center UI that reads the notifications table
+  (badge in the header, dropdown list, mark-as-read). The table + RLS are
+  ready; the UI is a separate task.

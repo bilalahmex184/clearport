@@ -1,14 +1,36 @@
 'use client';
+// ============================================================================
+// ExceptionDesk.tsx — thin orchestrator for the 3-panel exception review UI
+// ============================================================================
+// FIX5-7-SPLIT: the three panels (ExceptionList, DocumentViewer,
+// ResolutionPanel) used to live inline as 600+ lines of JSX. They are now
+// separate components; this file just:
+//   1. Pulls the relevant slice of the ClearPort context.
+//   2. Holds the cross-panel shared state (activeDocTab, zoomLevel, rotation,
+//      documentUrl) — these need to be shared because:
+//        • activeDocTab drives the DocumentViewer's URL fetch AND the
+//          bounding-box overlay (which reacts to selectedException.docType).
+//        • zoomLevel / rotation are controlled by the DocumentViewer's
+//          toolbar but applied to whichever view (real file or structured
+//          extract) is rendered.
+//        • documentUrl is fetched inside DocumentViewer but the parent owns
+//          its identity so the "VIEW FILE" re-fetch button can reset it.
+//   3. Derives canResolveExceptions from the RBAC role.
+//   4. Syncs activeDocTab to selectedException.docType when the selection
+//      changes (so the bounding box + viewer follow the user's pick).
+//   5. Renders the three panels with the right props.
+//
+// No behavior change — the same context slice, the same state, the same UI.
+// ============================================================================
 
 import * as React from 'react';
+import { AlertCircle } from 'lucide-react';
 import { useClearPort } from '@/context/ClearPortContext';
-import {
-  AlertCircle, CheckCircle2, ChevronRight, Eye, RefreshCw, XCircle, FileText,
-  ZoomIn, ZoomOut, RotateCw, Sparkles, Undo2, Loader2, FileSpreadsheet,
-} from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { supabase, invokeEdgeFunction } from '@/lib/supabase';
-import { canResolve, roleLabel } from '@/lib/services/rbac.service';
+import { canResolve } from '@/lib/services/rbac.service';
+import ExceptionList from './ExceptionList';
+import DocumentViewer from './DocumentViewer';
+import ResolutionPanel from './ResolutionPanel';
+import OnboardingBanner from './OnboardingBanner';
 
 export default function ExceptionDesk() {
   const {
@@ -23,828 +45,123 @@ export default function ExceptionDesk() {
     rules,
     userRole,
     exportToCSV,
+    setActiveTab,
   } = useClearPort();
+
+  // --- Onboarding banner visibility (FIX 10) ------------------------------
+  // Derived purely from `entries.length` + a localStorage dismissal flag —
+  // no setState-in-effect. The flag is read lazily on mount (client-only;
+  // SSR returns true so the banner never renders server-side, avoiding
+  // hydration mismatch). Dismissal is persisted to localStorage so the
+  // banner never reappears for this user, even after a reload.
+  const [onboardingDismissed, setOnboardingDismissed] =
+    React.useState<boolean>(() => {
+      if (typeof window === 'undefined') return true; // SSR: hide banner
+      return (
+        window.localStorage.getItem('clearport-onboarding-dismissed') ===
+        'true'
+      );
+    });
+
+  const showOnboardingBanner =
+    entries.length === 0 && !onboardingDismissed;
+
+  const dismissOnboardingBanner = React.useCallback(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(
+        'clearport-onboarding-dismissed',
+        'true',
+      );
+    }
+    setOnboardingDismissed(true);
+  }, []);
+
+  const goToIngest = React.useCallback(() => {
+    setActiveTab('ingest');
+  }, [setActiveTab]);
 
   // RBAC: viewer role cannot resolve exceptions. They can still browse the
   // document viewer + exception list (read-only), but the Accept / Modify /
   // Reject buttons are hidden and the keyboard shortcuts that mutate state
-  // are disabled below.
+  // are disabled below (inside ResolutionPanel).
   const canResolveExceptions = canResolve(userRole);
 
-  const [severityFilter, setSeverityFilter] = React.useState<'All' | 'High' | 'Medium' | 'Low'>('All');
-  const [sortBy, setSortBy] = React.useState<'severity' | 'confidence' | 'fieldName'>('severity');
-  const [isEditing, setIsEditing] = React.useState(false);
-  const [editValue, setEditValue] = React.useState('');
+  // --- Shared cross-panel state (managed here, passed down as props) -------
   const [activeDocTab, setActiveDocTab] = React.useState('');
   const [zoomLevel, setZoomLevel] = React.useState(100);
   const [rotation, setRotation] = React.useState(0);
-  const [showHistory, setShowHistory] = React.useState(false);
   const [documentUrl, setDocumentUrl] = React.useState<string | null>(null);
-  const [documentMime, setDocumentMime] = React.useState<string>('');
-  const [isLoadingUrl, setIsLoadingUrl] = React.useState(false);
-  const inputRef = React.useRef<HTMLInputElement>(null);
 
-  // Fetch signed URL for the active document when tab changes
-  React.useEffect(() => {
-    if (!selectedEntry || !activeDocTab) {
-      setDocumentUrl(null);
-      setDocumentMime('');
-      return;
-    }
-
-    // Find the document matching the active tab
-    const doc = selectedEntry.documents.find(d => d.docType === activeDocTab);
-    if (!doc) {
-      setDocumentUrl(null);
-      setDocumentMime('');
-      return;
-    }
-
-    let cancelled = false;
-    setIsLoadingUrl(true);
-    setDocumentUrl(null);
-    setDocumentMime(doc.mimeType || '');
-
-    (async () => {
-      try {
-        // Try the get-document-url edge function first
-        const response = await invokeEdgeFunction<any>('get-document-url', {
-          storagePath: doc.storagePath,
-        });
-        if (!cancelled && response?.success && response.signedUrl) {
-          setDocumentUrl(response.signedUrl);
-        }
-      } catch (err) {
-        // Fallback: try direct Supabase storage signed URL
-        if (supabase && !cancelled) {
-          try {
-            const { data } = await supabase.storage
-              .from('documents')
-              .createSignedUrl(doc.storagePath, 3600);
-            if (data?.signedUrl) {
-              setDocumentUrl(data.signedUrl);
-            }
-          } catch (e) {
-            console.warn('[doc-url] failed to get signed URL:', e);
-          }
-        }
-      } finally {
-        if (!cancelled) setIsLoadingUrl(false);
-      }
-    })();
-
-    return () => { cancelled = true; };
-  }, [selectedEntry?.id, activeDocTab]);
-
-  // Fix: use useEffect instead of setState-during-render
+  // When the selected exception changes, switch the document viewer to the
+  // exception's source document so the bounding box shows up on the right
+  // page. (editValue + isEditing are owned by ResolutionPanel — they sync
+  // to the same selectedException.id change inside that component.)
   React.useEffect(() => {
     if (selectedException) {
-      setEditValue(selectedException.correctedValue ?? selectedException.extractedValue);
       setActiveDocTab(selectedException.docType);
-      setIsEditing(false);
     }
   }, [selectedException?.id]);
 
-  // Keyboard shortcuts (scoped — only when not typing in input)
-  React.useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const activeEl = document.activeElement;
-      if (activeEl?.tagName === 'INPUT' || activeEl?.tagName === 'TEXTAREA') {
-        if (e.key === 'Escape') {
-          inputRef.current?.blur();
-          setIsEditing(false);
-        }
-        return;
-      }
+  // --- Render --------------------------------------------------------------
+  // The onboarding banner is mounted above the content area when the user
+  // has 0 shipments + hasn't dismissed it. The content (no-shipment state
+  // OR 3-panel grid) is unchanged from the original — we only wrap it in a
+  // flex column when the banner is visible so the banner gets its own row
+  // and the content fills the rest. When the banner is hidden, the layout
+  // is byte-for-byte identical to the pre-onboarding version.
+  const content = !selectedEntry ? (
+    <div className="h-full flex flex-col items-center justify-center text-gray-500 p-6">
+      <AlertCircle className="w-12 h-12 mb-4 text-gray-600 animate-pulse" />
+      <p className="text-sm font-medium">No shipment selected</p>
+      <p className="text-xs text-gray-600 mt-1">Please select an active batch from the Dashboard or sidebar.</p>
+    </div>
+  ) : (
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 lg:gap-5 h-full overflow-y-auto lg:overflow-hidden p-3 sm:p-4 md:p-6 font-sans">
+      <ExceptionList
+        selectedEntry={selectedEntry}
+        selectedExceptionId={selectedExceptionId}
+        onSelectException={selectException}
+        onExportCSV={exportToCSV}
+        onAcceptAllHighConfidence={acceptAllHighConfidence}
+        rules={rules}
+        canResolveExceptions={canResolveExceptions}
+        userRole={userRole}
+      />
 
-      if (!selectedException || !selectedEntry) return;
+      <DocumentViewer
+        selectedEntry={selectedEntry}
+        selectedException={selectedException}
+        activeDocTab={activeDocTab}
+        setActiveDocTab={setActiveDocTab}
+        documentUrl={documentUrl}
+        setDocumentUrl={setDocumentUrl}
+        zoomLevel={zoomLevel}
+        setZoomLevel={setZoomLevel}
+        rotation={rotation}
+        setRotation={setRotation}
+      />
 
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-        // Undo is a resolve-adjacent action — gated by the same RBAC check.
-        if (!canResolveExceptions) return;
-        e.preventDefault();
-        undoLastAction();
-        return;
-      }
+      <ResolutionPanel
+        selectedEntry={selectedEntry}
+        selectedException={selectedException}
+        onUpdateException={updateException}
+        onUndoLastAction={undoLastAction}
+        canResolveExceptions={canResolveExceptions}
+      />
+    </div>
+  );
 
-      // Accept / Modify / Reject shortcuts are no-ops for viewer role.
-      if (!canResolveExceptions) return;
-
-      if (e.key === ' ') {
-        e.preventDefault();
-        updateException(selectedEntry.id, selectedException.id, 'Accepted');
-      }
-
-      if (e.key.toLowerCase() === 'e') {
-        e.preventDefault();
-        setIsEditing(true);
-        setTimeout(() => inputRef.current?.focus(), 50);
-      }
-
-      if (e.key.toLowerCase() === 'r') {
-        e.preventDefault();
-        updateException(selectedEntry.id, selectedException.id, 'Rejected');
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedException, selectedEntry, updateException, undoLastAction, canResolveExceptions]);
-
-  if (!selectedEntry) {
-    return (
-      <div className="h-full flex flex-col items-center justify-center text-gray-500 p-6">
-        <AlertCircle className="w-12 h-12 mb-4 text-gray-600 animate-pulse" />
-        <p className="text-sm font-medium">No shipment selected</p>
-        <p className="text-xs text-gray-600 mt-1">Please select an active batch from the Dashboard or sidebar.</p>
-      </div>
-    );
+  if (!showOnboardingBanner) {
+    return content;
   }
 
-  const exceptions = selectedEntry.exceptions;
-
-  // Filter & Sort
-  const filteredExceptions = exceptions.filter(ex => {
-    if (severityFilter === 'All') return true;
-    if (severityFilter === 'High') return ex.confidence < 60;
-    if (severityFilter === 'Medium') return ex.confidence >= 60 && ex.confidence < 85;
-    if (severityFilter === 'Low') return ex.confidence >= 85;
-    return true;
-  });
-
-  const sortedExceptions = [...filteredExceptions].sort((a, b) => {
-    if (sortBy === 'severity') return a.confidence - b.confidence;
-    if (sortBy === 'confidence') return b.confidence - a.confidence;
-    return a.fieldName.localeCompare(b.fieldName);
-  });
-
-  const totalExceptions = exceptions.length;
-  const resolvedExceptions = exceptions.filter(ex => ex.status !== 'Unresolved').length;
-  const highConfidenceCount = exceptions.filter(ex => ex.status === 'Unresolved' && ex.confidence >= rules.invoiceThreshold).length;
-
-  const getConfidenceColor = (conf: number) => {
-    if (conf < 60) return 'text-red-400 bg-red-950/40 border-red-900/50';
-    if (conf < 85) return 'text-amber-400 bg-amber-950/40 border-amber-900/50';
-    return 'text-green-400 bg-green-950/40 border-green-900/50';
-  };
-
-  const getConfidenceBadge = (conf: number) => {
-    if (conf < 60) return 'RED / CRITICAL';
-    if (conf < 85) return 'AMBER / WARNING';
-    return 'GREEN / COMPLIANT';
-  };
-
-  const handleSaveEdit = () => {
-    if (selectedException && selectedEntry) {
-      updateException(selectedEntry.id, selectedException.id, 'Corrected', editValue);
-      setIsEditing(false);
-    }
-  };
-
-  // Data-driven document tabs (derive from shipment fields, not hardcoded IDs)
-  // Derive available doc types from BOTH fields' sourceDoc AND uploaded documents
-  const availableDocTypes = Array.from(new Set([
-    ...selectedEntry.fields.map(f => f.sourceDoc).filter(Boolean),
-    ...selectedEntry.documents.map(d => d.docType).filter(Boolean),
-  ]));
-
-  // Filter fields by the active doc tab (if multiple doc types exist)
-  const fieldsForActiveTab = availableDocTypes.length > 1
-    ? selectedEntry.fields.filter(f => f.sourceDoc === activeDocTab || !activeDocTab)
-    : selectedEntry.fields;
-
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 lg:gap-5 h-full overflow-y-auto lg:overflow-hidden p-3 sm:p-4 md:p-6 font-sans">
-      {/* LEFT PANEL: EXCEPTION LIST */}
-      <div className="lg:col-span-3 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden min-h-[400px] lg:min-h-0">
-        <div className="p-4 border-b border-gray-900 bg-[#0e1017]">
-          <div className="flex items-center justify-between mb-2">
-            <span className="font-mono text-xs text-gray-500 tracking-wider">EXCEPTIONS DESK</span>
-            <span className="font-mono text-xs text-emerald-400 bg-emerald-950/30 px-2 py-0.5 rounded border border-emerald-900/40">
-              {resolvedExceptions} / {totalExceptions} RESOLVED
-            </span>
-          </div>
-          <h2 className="text-sm font-medium text-gray-200 tracking-tight flex items-center gap-1.5">
-            <FileText className="w-4 h-4 text-gray-400" />
-            {selectedEntry.id}
-          </h2>
-          <p className="text-xs text-gray-500 mt-1 truncate">{selectedEntry.shipper}</p>
-
-          {/* CSV Export Button */}
-          <button
-            onClick={() => exportToCSV(selectedEntry.id)}
-            className="mt-3 w-full flex items-center justify-center gap-1.5 text-[10px] bg-emerald-600 hover:bg-emerald-500 text-black font-bold px-2 py-1.5 rounded-lg transition-all cursor-pointer uppercase tracking-wider"
-          >
-            <FileSpreadsheet className="w-3 h-3" />
-            Export CSV
-          </button>
-
-          {/* (§4) Validation status banner — reads validation_status, not just totalExceptions */}
-          {selectedEntry.validationStatus === 'completed' && totalExceptions === 0 && (
-            <div className="mt-2 p-2 rounded-lg border text-[10px] font-mono flex items-center gap-1.5 bg-emerald-950/30 border-emerald-900/40 text-emerald-400">
-              <CheckCircle2 className="w-3 h-3 shrink-0" />
-              <span>VALIDATED — zero exceptions found. Shipment is clean.</span>
-            </div>
-          )}
-          {selectedEntry.validationStatus === 'completed' && totalExceptions > 0 && (
-            <div className="mt-2 p-2 rounded-lg border text-[10px] font-mono flex items-center gap-1.5 bg-amber-950/30 border-amber-900/40 text-amber-400">
-              <AlertCircle className="w-3 h-3 shrink-0" />
-              <span>VALIDATED — {totalExceptions} exceptions require review.</span>
-            </div>
-          )}
-          {(selectedEntry.validationStatus === 'failed' || selectedEntry.validationStatus === 'degraded') && (
-            <div className="mt-2 p-2 rounded-lg border text-[10px] font-mono flex items-center gap-1.5 bg-red-950/30 border-red-900/40 text-red-400">
-              <AlertCircle className="w-3 h-3 shrink-0" />
-              <span>VALIDATION INCOMPLETE — pipeline error, retry required.</span>
-            </div>
-          )}
-          {(selectedEntry.validationStatus === 'pending' || selectedEntry.validationStatus === 'running' || !selectedEntry.validationStatus) && (
-            <div className="mt-2 p-2 rounded-lg border text-[10px] font-mono flex items-center gap-1.5 bg-blue-950/30 border-blue-900/40 text-blue-400">
-              <Loader2 className="w-3 h-3 shrink-0 animate-spin" />
-              <span>VALIDATION IN PROGRESS — not yet validated.</span>
-            </div>
-          )}
-        </div>
-
-        {/* Filters */}
-        <div className="p-3 border-b border-gray-900 bg-[#090a0f] space-y-2.5">
-          <div className="flex items-center gap-1">
-            {(['All', 'High', 'Medium', 'Low'] as const).map(filter => (
-              <button
-                key={filter}
-                onClick={() => setSeverityFilter(filter)}
-                className={`text-[11px] px-2.5 py-1 rounded-md font-medium transition-all ${
-                  severityFilter === filter
-                    ? 'bg-gray-800 text-white'
-                    : 'text-gray-500 hover:text-gray-300 hover:bg-gray-950'
-                }`}
-              >
-                {filter}
-              </button>
-            ))}
-          </div>
-
-          <div className="flex items-center justify-between gap-2 pt-1">
-            <span className="text-[10px] font-mono text-gray-500 uppercase tracking-widest">SORT BY</span>
-            <select
-              value={sortBy}
-              onChange={e => setSortBy(e.target.value as any)}
-              className="bg-black border border-gray-800 text-gray-300 rounded px-1.5 py-0.5 text-xs focus:outline-none focus:border-gray-700 font-medium"
-            >
-              <option value="severity">Severity (Low Conf)</option>
-              <option value="confidence">Confidence (High)</option>
-              <option value="fieldName">Field Name</option>
-            </select>
-          </div>
-
-          {highConfidenceCount > 0 && canResolveExceptions && (
-            <button
-              onClick={() => acceptAllHighConfidence(selectedEntry.id)}
-              className="w-full flex items-center justify-center gap-1.5 text-xs bg-emerald-950/30 text-emerald-400 border border-emerald-900/50 hover:bg-emerald-900/20 py-2 rounded-md transition-all cursor-pointer font-medium mt-1"
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              Accept {highConfidenceCount} Fields ≥ {rules.invoiceThreshold}% Conf
-            </button>
-          )}
-
-          {!canResolveExceptions && (
-            <div className="mt-1 flex items-start gap-1.5 text-[10px] text-amber-500/90 bg-amber-950/20 border border-amber-900/40 rounded-md p-2 font-mono leading-relaxed">
-              <AlertCircle className="w-3 h-3 shrink-0 mt-0.5" />
-              <span>
-                READ-ONLY ({roleLabel(userRole)}) — Accept / Modify / Reject are
-                disabled. Switch to an operator / admin session to resolve exceptions.
-              </span>
-            </div>
-          )}
-        </div>
-
-        {/* Exceptions list */}
-        <div className="flex-1 overflow-y-auto divide-y divide-gray-950 p-2 space-y-1.5">
-          <AnimatePresence mode="popLayout">
-            {sortedExceptions.map(ex => {
-              const isSelected = ex.id === selectedExceptionId;
-              const severityClass = getConfidenceColor(ex.confidence);
-              const isDone = ex.status !== 'Unresolved';
-
-              return (
-                <motion.div
-                  key={ex.id}
-                  layout
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, scale: 0.95 }}
-                  transition={{ duration: 0.15 }}
-                  onClick={() => selectException(ex.id)}
-                  className={`p-3 rounded-lg cursor-pointer transition-all border ${
-                    isSelected
-                      ? 'bg-gray-950 border-gray-700 shadow-lg shadow-black/40'
-                      : 'bg-transparent border-transparent hover:bg-gray-950/40 hover:border-gray-900'
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-1.5 mb-1.5">
-                    <span className="text-xs font-semibold text-gray-200 tracking-tight leading-tight">
-                      {ex.fieldName}
-                    </span>
-                    {isDone ? (
-                      <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded flex items-center gap-1 shrink-0 ${
-                        ex.status === 'Accepted' ? 'bg-emerald-950 text-emerald-400 border border-emerald-900/30' :
-                        ex.status === 'Rejected' ? 'bg-red-950 text-red-400 border border-red-900/30' :
-                        'bg-blue-950 text-blue-400 border border-blue-900/30'
-                      }`}>
-                        {ex.status.toUpperCase()}
-                      </span>
-                    ) : (
-                      <span className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border shrink-0 ${severityClass}`}>
-                        {ex.confidence}%
-                      </span>
-                    )}
-                  </div>
-
-                  <p className="text-[11px] text-gray-400 leading-normal line-clamp-2">{ex.reason}</p>
-
-                  <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-900/30 text-[10px] text-gray-500 font-mono">
-                    <span>{ex.docType}</span>
-                    <span className="text-gray-600 uppercase">{ex.exceptionType.replace(/_/g, ' ')}</span>
-                  </div>
-                </motion.div>
-              );
-            })}
-          </AnimatePresence>
-
-          {sortedExceptions.length === 0 && (
-            <div className="p-8 text-center text-gray-500 text-xs">
-              No exceptions match the selected filter.
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* CENTER PANEL: DOCUMENT VIEWER */}
-      <div className="lg:col-span-5 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden relative min-h-[500px] lg:min-h-0">
-        {/* Document Tabs (data-driven) */}
-        <div className="px-4 py-2 bg-[#0e1017] border-b border-gray-900 flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-1.5 overflow-x-auto">
-            {availableDocTypes.map(doc => (
-              <button
-                key={doc}
-                onClick={() => setActiveDocTab(doc)}
-                className={`text-xs px-3 py-1.5 rounded-md font-medium transition-all whitespace-nowrap ${
-                  activeDocTab === doc
-                    ? 'bg-gray-800 text-gray-100'
-                    : 'text-gray-500 hover:text-gray-300'
-                }`}
-              >
-                {doc === 'Commercial Invoice' ? 'Invoice' : doc === 'Bill of Lading' ? 'BOL' : doc}
-              </button>
-            ))}
-            {availableDocTypes.length === 0 && (
-              <span className="text-xs text-gray-600">No documents available</span>
-            )}
-          </div>
-
-          <div className="flex items-center gap-1 shrink-0">
-            <button
-              onClick={() => setZoomLevel(prev => Math.max(50, prev - 10))}
-              title="Zoom Out"
-              className="p-1 rounded text-gray-500 hover:text-gray-300 hover:bg-gray-950 transition-all cursor-pointer"
-            >
-              <ZoomOut className="w-4 h-4" />
-            </button>
-            <span className="text-xs font-mono text-gray-500 w-10 text-center">{zoomLevel}%</span>
-            <button
-              onClick={() => setZoomLevel(prev => Math.min(200, prev + 10))}
-              title="Zoom In"
-              className="p-1 rounded text-gray-500 hover:text-gray-300 hover:bg-gray-950 transition-all cursor-pointer"
-            >
-              <ZoomIn className="w-4 h-4" />
-            </button>
-            <button
-              onClick={() => setRotation(prev => (prev + 90) % 360)}
-              title="Rotate 90°"
-              className="p-1 rounded text-gray-500 hover:text-gray-300 hover:bg-gray-950 transition-all cursor-pointer"
-            >
-              <RotateCw className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-
-        {/* Document Board — shows real uploaded file or extracted data view */}
-        <div className="flex-1 overflow-auto bg-[#040406] p-3 sm:p-4 md:p-6 flex items-start justify-center relative">
-          {documentUrl ? (
-            /* Real file viewer — show the actual uploaded document based on MIME type */
-            <div
-              style={{
-                transform: `scale(${zoomLevel / 100}) rotate(${rotation}deg)`,
-                transformOrigin: 'top center',
-                transition: 'transform 0.15s ease-out',
-              }}
-              className="rounded border border-gray-700 shadow-2xl overflow-hidden bg-white relative"
-            >
-              {documentMime.startsWith('text/') ? (
-                /* Text file — show in iframe with monospace styling */
-                <iframe
-                  src={documentUrl}
-                  className="w-full max-w-[500px] h-[400px] sm:h-[500px] md:h-[600px] bg-white"
-                  title="Document text"
-                  style={{ fontFamily: 'monospace', fontSize: '12px' }}
-                />
-              ) : documentMime === 'application/pdf' ? (
-                /* PDF — show in iframe (browser's built-in PDF viewer) */
-                <iframe
-                  src={documentUrl}
-                  className="w-full max-w-[500px] h-[400px] sm:h-[500px] md:h-[600px] bg-white"
-                  title="Document PDF"
-                />
-              ) : documentMime.startsWith('image/') ? (
-                /* Image (PNG, JPEG, TIFF) — show directly with zoom/rotate */
-                <img
-                  src={documentUrl}
-                  alt={`Document: ${activeDocTab}`}
-                  className="max-w-full max-h-[400px] sm:max-h-[500px] md:max-h-[600px] object-contain mx-auto"
-                  onError={(e) => {
-                    console.warn('[doc-viewer] image failed to load:', documentUrl);
-                  }}
-                />
-              ) : (
-                /* Unknown type — provide download link */
-                <div className="w-full max-w-[500px] h-[400px] sm:h-[500px] md:h-[600px] flex flex-col items-center justify-center bg-gray-50 p-4 sm:p-8 text-center">
-                  <FileText className="w-16 h-16 text-gray-400 mb-4" />
-                  <p className="text-sm font-semibold text-gray-700 mb-2">
-                    {activeDocTab || 'Document'}
-                  </p>
-                  <p className="text-xs text-gray-500 mb-4">
-                    Preview not available for this file type ({documentMime || 'unknown'})
-                  </p>
-                  <a
-                    href={documentUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-xs bg-amber-500 hover:bg-amber-600 text-black font-bold px-4 py-2 rounded-lg transition-all"
-                  >
-                    Download File
-                  </a>
-                </div>
-              )}
-
-              {/* Highlighted bounding box overlay */}
-              {selectedException && activeDocTab === selectedException.docType && (
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.95 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  className="absolute border-[2px] border-amber-500 bg-amber-500/10 rounded pointer-events-none shadow-[0_0_12px_rgba(245,158,11,0.4)]"
-                  style={{
-                    left: `${selectedException.boundingBox.x}%`,
-                    top: `${selectedException.boundingBox.y}%`,
-                    width: `${selectedException.boundingBox.w}%`,
-                    height: `${selectedException.boundingBox.h}%`,
-                  }}
-                >
-                  <div className="absolute -top-3.5 left-0 text-[7px] font-mono text-white bg-amber-600 px-1 py-0.5 rounded shadow whitespace-nowrap uppercase tracking-wider font-bold">
-                    FLAGGED: {selectedException.fieldName.toUpperCase()}
-                  </div>
-                </motion.div>
-              )}
-            </div>
-          ) : isLoadingUrl ? (
-            <div className="flex items-center justify-center h-full">
-              <Loader2 className="w-8 h-8 text-amber-500 animate-spin" />
-            </div>
-          ) : (
-            /* Fallback: show extracted data as a structured view (not a fake document) */
-            <div
-              style={{
-                transform: `scale(${zoomLevel / 100}) rotate(${rotation}deg)`,
-                transformOrigin: 'top center',
-                transition: 'transform 0.15s ease-out',
-              }}
-              className="w-full max-w-[500px] bg-[#0c0d12] border border-gray-800 rounded-xl shadow-2xl p-4 sm:p-6 relative"
-            >
-              <div className="flex items-center justify-between mb-4 pb-3 border-b border-gray-800">
-                <div>
-                  <h3 className="text-sm font-bold text-gray-100 uppercase tracking-wider">
-                    {activeDocTab || 'Extracted Data'}
-                  </h3>
-                  <p className="text-[10px] text-gray-500 font-mono mt-0.5">
-                    {selectedEntry.id} • {selectedEntry.documents.length} file(s) uploaded
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  {selectedEntry.documents.length > 0 && (
-                    <button
-                      onClick={() => {
-                        const doc = selectedEntry.documents.find(d => d.docType === activeDocTab) || selectedEntry.documents[0];
-                        if (doc) {
-                          setActiveDocTab(doc.docType);
-                          // Trigger re-fetch by changing tab
-                          setDocumentUrl(null);
-                          // Re-run the effect by toggling
-                          setTimeout(() => setActiveDocTab(doc.docType), 10);
-                        }
-                      }}
-                      className="flex items-center gap-1 text-[9px] font-mono text-amber-400 border border-amber-900/40 px-2 py-1 rounded hover:bg-amber-950/30 transition-all"
-                      title="Load original file"
-                    >
-                      <Eye className="w-3 h-3" />
-                      VIEW FILE
-                    </button>
-                  )}
-                  <span className="text-[9px] font-mono bg-amber-950/40 text-amber-400 border border-amber-900/40 px-2 py-0.5 rounded uppercase">
-                    Structured Extract
-                  </span>
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                {fieldsForActiveTab.map((f, idx) => (
-                  <div key={f.id || idx} className={`flex justify-between items-start p-2 rounded border ${
-                    f.isFlagged ? 'bg-red-950/20 border-red-900/40' : 'bg-black/30 border-gray-900'
-                  }`}>
-                    <div className="flex-1">
-                      <span className="text-[10px] font-mono text-gray-500 uppercase tracking-wider block">{f.label}</span>
-                      <span className={`text-xs font-mono ${f.isFlagged ? 'text-amber-400' : 'text-gray-200'}`}>
-                        {f.value}
-                      </span>
-                      {f.crossDocValue && (
-                        <span className="text-[9px] text-red-400 block mt-0.5">↔ {f.crossDocValue}</span>
-                      )}
-                    </div>
-                    <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${
-                      f.confidence < 60 ? 'bg-red-950 text-red-400' :
-                      f.confidence < 85 ? 'bg-amber-950 text-amber-400' :
-                      'bg-emerald-950 text-emerald-400'
-                    }`}>
-                      {f.confidence}%
-                    </span>
-                  </div>
-                ))}
-              </div>
-
-              {fieldsForActiveTab.length === 0 && (
-                <div className="text-center py-8 text-gray-600 text-xs">
-                  No fields for {activeDocTab || 'this document'}. Upload a {activeDocTab || 'document'} or check another tab.
-                </div>
-              )}
-
-              {selectedException && activeDocTab === selectedException.docType && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  className="mt-4 p-3 bg-amber-950/20 border border-amber-900/40 rounded-lg"
-                >
-                  <div className="text-[10px] font-mono text-amber-400 uppercase tracking-wider mb-1">
-                    ⚠ FLAGGED: {selectedException.fieldName}
-                  </div>
-                  <p className="text-[11px] text-gray-300">{selectedException.reason}</p>
-                </motion.div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* RIGHT PANEL: RESOLUTION DESK */}
-      <div className="lg:col-span-4 bg-[#0c0d12] border border-gray-900 rounded-xl flex flex-col overflow-hidden min-h-[400px] lg:min-h-0">
-        {selectedException ? (
-          <div className="flex-1 flex flex-col justify-between overflow-hidden">
-            <div className="p-4 space-y-4 overflow-y-auto flex-1">
-              {/* Header */}
-              <div className="border-b border-gray-900 pb-3">
-                <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-[10px] font-mono text-gray-500 tracking-wider">EXCEPTION FIELD RESOLUTION</span>
-                  <span className={`text-[9px] font-mono font-bold px-2 py-0.5 rounded border ${
-                    selectedException.status === 'Unresolved'
-                      ? getConfidenceColor(selectedException.confidence)
-                      : 'bg-gray-950 text-gray-400 border-gray-900'
-                  }`}>
-                    {selectedException.status === 'Unresolved'
-                      ? getConfidenceBadge(selectedException.confidence)
-                      : selectedException.status.toUpperCase()}
-                  </span>
-                </div>
-                <h3 className="text-base font-semibold text-gray-100 tracking-tight leading-tight">
-                  {selectedException.fieldName}
-                </h3>
-                <span className="text-[10px] font-mono text-gray-600 uppercase mt-1 block">
-                  Type: {selectedException.exceptionType.replace(/_/g, ' ')}
-                </span>
-              </div>
-
-              {/* Discrepancy reason + explanation */}
-              <div className="bg-[#120f12] border border-red-950/40 p-3.5 rounded-lg">
-                <h4 className="text-[11px] font-mono text-red-400 tracking-wider uppercase mb-1 flex items-center gap-1.5">
-                  <AlertCircle className="w-3.5 h-3.5" />
-                  DISCREPANCY WHY:
-                </h4>
-                <p className="text-xs text-gray-300 leading-normal">{selectedException.reason}</p>
-                {selectedException.explanation && selectedException.explanation !== selectedException.reason && (
-                  <div className="mt-2 pt-2 border-t border-red-950/30">
-                    <span className="text-[9px] font-mono text-amber-400 uppercase tracking-wider block mb-0.5">EXPLANATION:</span>
-                    <p className="text-[11px] text-amber-300/90 leading-relaxed">{selectedException.explanation}</p>
-                  </div>
-                )}
-              </div>
-
-              {/* Data comparison */}
-              <div className="grid grid-cols-2 gap-3">
-                <div className="bg-black border border-gray-900 p-3 rounded-lg">
-                  <span className="text-[10px] text-gray-500 block uppercase tracking-wider font-mono">EXTRACTED (OCR)</span>
-                  <span className="text-sm font-mono font-bold text-gray-200 block mt-1">
-                    {selectedException.extractedValue}
-                  </span>
-                  <span className="text-[9px] font-mono text-gray-600 block mt-0.5">
-                    Confidence: {selectedException.confidence}%
-                  </span>
-                </div>
-                <div className="bg-black border border-gray-900 p-3 rounded-lg">
-                  <span className="text-[10px] text-gray-500 block uppercase tracking-wider font-mono">CROSS-DOC SOURCE</span>
-                  <span className="text-sm font-mono font-bold text-gray-400 block mt-1">
-                    {selectedException.crossDocValue || '—'}
-                  </span>
-                  <span className="text-[9px] font-mono text-gray-600 block mt-0.5">
-                    Source: {selectedException.docType}
-                  </span>
-                </div>
-              </div>
-
-              {/* Inline editor */}
-              <div className="space-y-1.5">
-                <label className="text-[11px] text-gray-400 font-mono tracking-wider block uppercase">
-                  MANUAL / OVERRIDE VALUE:
-                </label>
-                {isEditing ? (
-                  <div className="flex gap-2">
-                    <input
-                      ref={inputRef}
-                      type="text"
-                      value={editValue}
-                      onChange={e => setEditValue(e.target.value)}
-                      onKeyDown={e => {
-                        if (e.key === 'Enter') handleSaveEdit();
-                        if (e.key === 'Escape') setIsEditing(false);
-                      }}
-                      className="flex-1 bg-black text-gray-200 border border-gray-700 px-3 py-2 text-sm rounded-lg focus:outline-none focus:border-amber-500 font-mono tracking-tight"
-                    />
-                    <button
-                      onClick={handleSaveEdit}
-                      className="bg-amber-600 hover:bg-amber-500 text-black px-3 py-1.5 rounded-lg font-medium text-xs transition-all cursor-pointer"
-                    >
-                      Apply
-                    </button>
-                    <button
-                      onClick={() => setIsEditing(false)}
-                      className="text-gray-400 hover:text-white border border-gray-800 px-3 py-1.5 rounded-lg text-xs transition-all cursor-pointer"
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                ) : (
-                  <div className="flex items-center justify-between bg-black border border-gray-900 rounded-lg p-2.5">
-                    <span className="font-mono text-sm font-bold text-emerald-400">{editValue}</span>
-                    {canResolveExceptions ? (
-                      <button
-                        onClick={() => {
-                          setIsEditing(true);
-                          setTimeout(() => inputRef.current?.focus(), 50);
-                        }}
-                        className="text-xs text-gray-400 hover:text-white bg-gray-900 hover:bg-gray-800 border border-gray-800 px-2 py-1 rounded transition-all cursor-pointer"
-                      >
-                        Edit Field
-                      </button>
-                    ) : (
-                      <span className="text-[10px] font-mono uppercase text-gray-600 px-2 py-1">
-                        Read-only
-                      </span>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Action buttons — gated by canResolve. Viewer role sees a
-                  locked notice instead of the Accept / Modify / Reject row. */}
-              {canResolveExceptions ? (
-                <div className="pt-3 grid grid-cols-3 gap-2">
-                  <button
-                    onClick={() => updateException(selectedEntry.id, selectedException.id, 'Accepted')}
-                    className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
-                      selectedException.status === 'Accepted'
-                        ? 'bg-emerald-950 text-emerald-400 border-emerald-800'
-                        : 'bg-black border-gray-900 text-emerald-500 hover:bg-emerald-950/20'
-                    }`}
-                  >
-                    <CheckCircle2 className="w-4 h-4" />
-                    <span>Accept [Space]</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      setIsEditing(true);
-                      setTimeout(() => inputRef.current?.focus(), 50);
-                    }}
-                    className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
-                      selectedException.status === 'Corrected'
-                        ? 'bg-blue-950 text-blue-400 border-blue-800'
-                        : 'bg-black border-gray-900 text-blue-500 hover:bg-blue-950/20'
-                    }`}
-                  >
-                    <RefreshCw className="w-4 h-4" />
-                    <span>Modify [E]</span>
-                  </button>
-                  <button
-                    onClick={() => updateException(selectedEntry.id, selectedException.id, 'Rejected')}
-                    className={`py-2 px-1 text-xs rounded-lg font-medium border cursor-pointer transition-all flex flex-col items-center justify-center gap-1 ${
-                      selectedException.status === 'Rejected'
-                        ? 'bg-red-950 text-red-400 border-red-800'
-                        : 'bg-black border-gray-900 text-red-500 hover:bg-red-950/20'
-                    }`}
-                  >
-                    <XCircle className="w-4 h-4" />
-                    <span>Reject [R]</span>
-                  </button>
-                </div>
-              ) : (
-                <div className="pt-3 grid grid-cols-3 gap-2">
-                  <div className="py-2 px-1 text-xs rounded-lg font-medium border bg-black/40 border-gray-900 text-gray-600 flex flex-col items-center justify-center gap-1 opacity-60 cursor-not-allowed">
-                    <CheckCircle2 className="w-4 h-4" />
-                    <span>Accept</span>
-                  </div>
-                  <div className="py-2 px-1 text-xs rounded-lg font-medium border bg-black/40 border-gray-900 text-gray-600 flex flex-col items-center justify-center gap-1 opacity-60 cursor-not-allowed">
-                    <RefreshCw className="w-4 h-4" />
-                    <span>Modify</span>
-                  </div>
-                  <div className="py-2 px-1 text-xs rounded-lg font-medium border bg-black/40 border-gray-900 text-gray-600 flex flex-col items-center justify-center gap-1 opacity-60 cursor-not-allowed">
-                    <XCircle className="w-4 h-4" />
-                    <span>Reject</span>
-                  </div>
-                </div>
-              )}
-
-              {/* Audit trail */}
-              <div className="pt-4 border-t border-gray-900">
-                <button
-                  onClick={() => setShowHistory(!showHistory)}
-                  className="flex items-center justify-between w-full text-xs text-gray-500 font-mono tracking-wider hover:text-gray-300 py-1"
-                >
-                  <span>AUDIT TRAIL ({selectedException.history.length})</span>
-                  <span>{showHistory ? '[-]' : '[+]'}</span>
-                </button>
-                {showHistory && (
-                  <div className="mt-2 text-[11px] text-gray-400 bg-[#090a0f] p-3 rounded-lg border border-gray-900 space-y-2 max-h-32 overflow-y-auto">
-                    {selectedException.history.length === 0 ? (
-                      <p className="text-gray-600 italic">No previous reviews logged for this field.</p>
-                    ) : (
-                      selectedException.history.map((h, idx) => (
-                        <div key={idx} className="border-b border-gray-900/40 pb-1.5 last:border-b-0">
-                          <div className="flex justify-between items-center text-gray-500 font-mono text-[9px] mb-0.5">
-                            <span>{h.user}</span>
-                            <span suppressHydrationWarning>{new Date(h.timestamp).toLocaleTimeString()}</span>
-                          </div>
-                          <div className="flex items-center gap-1">
-                            <span className="font-semibold text-gray-300">{h.action}:</span>
-                            <span className="line-through text-gray-600 font-mono">{h.oldValue}</span>
-                            <ChevronRight className="w-3 h-3 text-gray-700" />
-                            <span className="text-emerald-400 font-mono font-semibold">{h.newValue}</span>
-                          </div>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* Keyboard shortcuts footer */}
-            <div className="p-3 bg-black/40 border-t border-gray-900 flex justify-between items-center text-[10px] text-gray-500 font-mono select-none">
-              <div className="flex items-center gap-1">
-                <kbd className={`bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 font-bold uppercase ${canResolveExceptions ? 'text-gray-300' : 'text-gray-700'}`}>Space</kbd>
-                <span className={canResolveExceptions ? '' : 'text-gray-700'}>Accept</span>
-                <kbd className={`bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 font-bold uppercase ml-2 ${canResolveExceptions ? 'text-gray-300' : 'text-gray-700'}`}>E</kbd>
-                <span className={canResolveExceptions ? '' : 'text-gray-700'}>Edit</span>
-                <kbd className={`bg-gray-950 px-1.5 py-0.5 rounded border border-gray-800 font-bold uppercase ml-2 ${canResolveExceptions ? 'text-gray-300' : 'text-gray-700'}`}>R</kbd>
-                <span className={canResolveExceptions ? '' : 'text-gray-700'}>Reject</span>
-              </div>
-              <button
-                onClick={canResolveExceptions ? undoLastAction : undefined}
-                disabled={!canResolveExceptions}
-                className={`flex items-center gap-1 text-[11px] border px-2 py-1 rounded font-bold uppercase transition-all ${
-                  canResolveExceptions
-                    ? 'text-gray-400 hover:text-white hover:bg-gray-900 border-gray-800 cursor-pointer'
-                    : 'text-gray-700 border-gray-900 bg-gray-950/50 cursor-not-allowed'
-                }`}
-              >
-                <Undo2 className="w-3.5 h-3.5 text-gray-500" />
-                Undo [Ctrl+Z]
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-gray-500">
-            <CheckCircle2 className="w-12 h-12 text-gray-600 mb-2" />
-            <p className="text-sm font-semibold text-gray-300">All exceptions cleared</p>
-            <p className="text-xs text-gray-600 max-w-xs mt-1">
-              Select another shipment or upload invoices to run compliance tests.
-            </p>
-          </div>
-        )}
-      </div>
+    <div className="flex flex-col h-full">
+      <OnboardingBanner
+        onDismiss={dismissOnboardingBanner}
+        onGoToIngest={goToIngest}
+      />
+      <div className="flex-1 min-h-0">{content}</div>
     </div>
   );
 }
