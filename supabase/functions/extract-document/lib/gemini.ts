@@ -7,66 +7,81 @@
 
 import { GoogleGenAI } from "npm:@google/genai@2";
 
-export const GEMINI_PROMPT = `You are a strict customs document OCR engine. Extract structured fields from this document.
+export const GEMINI_PROMPT = `You are a production-grade document extraction engine specialized in messy, low-quality OCR text from customs documents.
 
-STRICT OUTPUT CONTRACT — read carefully:
-1. Return ONLY a JSON array. Do NOT wrap it in markdown fences. Do NOT add any prose, explanation, or commentary before or after the array.
-2. Every object in the array MUST have EXACTLY these four keys (no more, no less):
-   - "field_key": string (one of the allowed keys listed below)
-   - "field_label": string (the human-readable label listed below)
-   - "extracted_value": string (the verbatim value read from the document) OR null
-   - "confidence": integer between 0 and 100
-3. If a field is NOT present in the document, OMIT it from the array entirely. Do NOT include it with a null value.
-4. If you cannot clearly read a value, OMIT that field. Do NOT guess, infer, hallucinate, or fabricate values. Only extract fields that are clearly visible in the document.
-5. Confidence must reflect your actual certainty about BOTH the field's presence AND the accuracy of the extracted value:
-   - 95-100: very clear, unambiguous, legible text, no possible doubt
-   - 80-94:  clear, but minor ambiguity (e.g. partial obscuring, slight blur)
-   - 60-79:  somewhat clear, value readable but with some uncertainty
-   - below 60: uncertain — you should usually OMIT the field rather than return it
-6. Use the EXACT field_key strings below (case-sensitive). Do not invent new keys.
+Your job is to:
+1. Correct OCR errors in the input text
+2. Extract structured data with per-field confidence
+3. Ensure numerical accuracy
+4. Flag uncertainty
+5. Never fail completely — partial output with low confidence is always better than no output
 
-SPECIAL HANDLING RULES:
+OCR ERROR CORRECTION (CRITICAL):
+The input text comes from OCR and may contain these errors — fix them before extracting:
+- Fix broken words: "inv0ice" → "invoice", "sh1pper" → "shipper", "0r1gin" → "origin"
+- Fix number splits: "5 2,150" → "52,150", "1 234.56" → "1234.56"
+- Fix currency splits: "$ 52,150" → "$52,150"
+- Remove random symbols/noise characters that aren't part of any field
+- Merge lines that were incorrectly split by OCR
 
-A. MULTI-LINE TABLE ROWS:
-   - Commercial invoices often have line-item tables where a single item spans multiple rows.
-   - Secondary rows under a line item (e.g. "Shipping Cost", "Insurance", "Handling Fee") belong to the PRECEDING line item, NOT as separate items.
-   - If a table row has no QTY or HS Code, it is a secondary row — merge it with the line item above.
-   - Extract only the PRIMARY line item's HTS Code (field_key: "htsCode"), not secondary rows.
+MULTI-PASS REASONING:
+Step 1: Read the raw OCR text and mentally correct obvious errors
+Step 2: Identify which fields are present and where
+Step 3: Extract each field value from the corrected text
+Step 4: Validate internally (do totals match? are dates realistic?)
+Step 5: Assign confidence based on OCR quality + extraction certainty
 
-B. CURRENCY & NUMBERS:
-   - Always include the currency symbol in extracted_value (e.g. "$52,150.75", not "52150.75").
-   - Accept $, €, £, ¥ as valid currency prefixes.
-   - If the total is labeled "Total", "Grand Total", "Invoice Total", or "Total Declared Value", extract it as field_key "declaredValue".
+OUTPUT FORMAT (STRICT JSON ONLY):
+Return ONLY valid JSON — no markdown, no explanations, no extra text.
 
-C. FOREIGN CHARACTERS (UTF-8):
-   - Documents may contain foreign characters: German ß, ü, ö, ä; French é, è; Spanish ñ; etc.
-   - Preserve the original UTF-8 characters in extracted_value (e.g. "Industriestraße 14" stays as-is).
-   - Do NOT transliterate or strip foreign characters — the system handles UTF-8 normalization downstream.
-   - If a name contains special characters, extract it verbatim.
+{
+  "document_type": "Commercial Invoice | Packing List | Bill of Lading | Certificate of Origin | Unknown",
+  "fields": {
+    "invoiceNo": { "value": "string or null", "confidence": 0.0-1.0, "source": "exact text snippet from document", "reasoning": "how value was inferred" },
+    "invoiceDate": { "value": "YYYY-MM-DD or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." },
+    "shipper": { "value": "string or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." },
+    "consignee": { "value": "string or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." },
+    "consigneeAddress": { "value": "string or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." },
+    "declaredValue": { "value": "number or null", "currency": "USD|EUR|GBP|JPY|CNY or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." },
+    "htsCode": { "value": "XXXX.XX.XXXX or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." },
+    "netWeight": { "value": "string with unit (e.g. '1234 kg') or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." },
+    "grossWeight": { "value": "string with unit or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." },
+    "portOfEntry": { "value": "string or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." },
+    "carrier": { "value": "string or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." },
+    "billOfLading": { "value": "string or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." },
+    "countryOfOrigin": { "value": "ISO 3166-1 alpha-2 (2 uppercase letters) or null", "confidence": 0.0-1.0, "source": "...", "reasoning": "..." }
+  },
+  "meta": {
+    "overall_confidence": 0.0-1.0,
+    "extraction_quality": "high | medium | low",
+    "warnings": ["list of any issues encountered"],
+    "missing_fields": ["fields that could not be extracted"],
+    "ambiguities": ["fields where multiple interpretations were possible"]
+  }
+}
 
-D. BOUNDING BOX ISOLATION — "OFFICIAL CBP USE" AREA:
-   - Many customs documents have an "Official CBP Use Only" box (usually bottom-left or bottom-right).
-   - This box is for CBP officers to stamp/sign — it is NOT data to extract.
-   - Do NOT extract signatures, stamps, or handwriting from the "Official CBP Use" box.
-   - If a signature appears NEXT TO but OUTSIDE the CBP box, do not associate it with the box.
-   - Only extract typed/printed field values from the main document body, not from official-use boxes.
+NORMALIZATION RULES:
+- Dates → ISO format (YYYY-MM-DD)
+- Currency → numeric value + ISO currency code (e.g. 52150.75 USD)
+- HTS Code → format XXXX.XX.XXXX
+- Country → 2-letter ISO code (CN, US, DE, etc.)
+- Weights → include unit (kg, lbs)
+- Text → trimmed, no leading/trailing whitespace
 
-Allowed fields (field_key → field_label):
-- invoiceNo         → "Commercial Invoice #"
-- invoiceDate       → "Invoice Date"
-- shipper           → "Shipper/Exporter"
-- consignee         → "Consignee/Importer"
-- consigneeAddress  → "Consignee Address"
-- declaredValue     → "Total Declared Value"  (include currency symbol: $1,234.56)
-- htsCode           → "HTS Code"               (format XXXX.XX.XXXX, e.g. 8108.90.3060)
-- netWeight         → "Net Weight"             (include unit, e.g. "1234 kg" or "1234 lbs")
-- grossWeight       → "Gross Weight"           (include unit)
-- portOfEntry       → "Port of Entry"
-- carrier           → "Carrier"
-- billOfLading      → "Bill of Lading #"
-- countryOfOrigin   → "Country of Origin"      (ISO 3166-1 alpha-2, 2 uppercase letters, e.g. "CN")
+CONFIDENCE RUBRIC:
+- 0.90-1.0: Clear, unambiguous, directly stated, OCR quality is high
+- 0.70-0.89: Readable but minor ambiguity (partial obscuring, OCR artifact)
+- 0.50-0.69: Inferred from context, OCR errors corrected with medium certainty
+- 0.00-0.49: Best guess from limited information, OCR severely degraded
 
-Output ONLY the JSON array. No markdown fences. No prose.`;
+VALIDATION (perform internally before returning):
+- If line items are present: sum(quantity × unit_price) should ≈ subtotal
+- subtotal + tax should ≈ total_amount
+- Dates should not be in the future
+- Net weight should not exceed gross weight
+- If any of these fail, add to warnings and lower confidence
+
+Return ONLY the JSON object. No markdown fences. No prose.`;
 
 export function getGeminiClient(): GoogleGenAI | null {
   const apiKey = Deno.env.get("GEMINI_API_KEY");

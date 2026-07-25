@@ -48,6 +48,8 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { preprocessImage } from '@/lib/processing/preprocess';
+import { postprocessOcrText, estimateOcrConfidence } from '@/lib/processing/postprocess';
 
 const execFileAsync = promisify(execFile);
 
@@ -432,14 +434,29 @@ export async function POST(req: Request): Promise<Response> {
   try {
     const result = await Promise.race([tesseractPromise, timeoutPromise]);
     const elapsedMs = Date.now() - startedAt;
+
+    // Postprocess: clean up OCR artifacts (broken words, split numbers, noise)
+    const cleanedText = postprocessOcrText(result.text);
+    const ocrConfidence = estimateOcrConfidence(cleanedText);
+
     logger.info('OCR route — success', {
       route: '/api/internal/ocr',
       mimeType,
-      textLength: result.text.length,
-      confidence: result.confidence,
+      textLength: cleanedText.length,
+      tesseractConfidence: result.confidence,
+      estimatedConfidence: Math.round(ocrConfidence * 100) / 100,
+      postprocessed: cleanedText !== result.text,
       elapsedMs,
     });
-    return NextResponse.json(result);
+
+    // Return cleaned text + confidence estimate (0-1 scale)
+    // The edge function uses this to decide whether to skip AI (smart mode switch)
+    return NextResponse.json({
+      text: cleanedText,
+      confidence: result.confidence,
+      ocr_confidence: ocrConfidence, // 0-1 estimate for smart mode switch
+      smart_mode_skip_ai: ocrConfidence > 0.9, // if true, regex extraction may suffice
+    });
   } catch (err) {
     const elapsedMs = Date.now() - startedAt;
     const message = (err as Error)?.message || String(err);
