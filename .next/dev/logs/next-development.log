@@ -1,4 +1,0 @@
-[00:00:01.942] Server  LOG     ✓ Ready in 1684ms
-[00:00:02.127] Server  INFO    {"timestamp":"2026-07-25T06:03:09.244Z","level":"info","message":"[middleware] GET /","request_id":"c6af09b1-334c-4c6b-a225-c273fc9e4a8e","method":"GET","path":"/"}
-[00:00:02.156] Server  INFO    {"timestamp":"2026-07-25T06:03:09.275Z","level":"info","message":"[middleware] GET /","request_id":"b721cc6a-d2b3-4e04-a8fe-420d716d415b","method":"GET","path":"/"}
-[00:00:03.517] Server  INFO    {"timestamp":"2026-07-25T06:03:10.636Z","level":"info","message":"[middleware] GET /","request_id":"2fd19ab9-3166-47e8-8f86-b1710750ca51","method":"GET","path":"/"}
