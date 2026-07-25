@@ -1,3 +1,4 @@
-[00:00:02.367] Server  LOG     ✓ Ready in 2.1s
-[00:00:02.558] Server  INFO    {"timestamp":"2026-07-24T15:52:46.079Z","level":"info","message":"[middleware] GET /","request_id":"c0fa7399-e259-40d4-ba84-6dd783df1e03","method":"GET","path":"/"}
-[00:00:02.591] Server  INFO    {"timestamp":"2026-07-24T15:52:46.113Z","level":"info","message":"[middleware] GET /","request_id":"f17f012a-eedb-49a6-977e-7f9678241ce4","method":"GET","path":"/"}
+[00:00:01.942] Server  LOG     ✓ Ready in 1684ms
+[00:00:02.127] Server  INFO    {"timestamp":"2026-07-25T06:03:09.244Z","level":"info","message":"[middleware] GET /","request_id":"c6af09b1-334c-4c6b-a225-c273fc9e4a8e","method":"GET","path":"/"}
+[00:00:02.156] Server  INFO    {"timestamp":"2026-07-25T06:03:09.275Z","level":"info","message":"[middleware] GET /","request_id":"b721cc6a-d2b3-4e04-a8fe-420d716d415b","method":"GET","path":"/"}
+[00:00:03.517] Server  INFO    {"timestamp":"2026-07-25T06:03:10.636Z","level":"info","message":"[middleware] GET /","request_id":"2fd19ab9-3166-47e8-8f86-b1710750ca51","method":"GET","path":"/"}
