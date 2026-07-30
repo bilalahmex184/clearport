@@ -565,126 +565,65 @@ export function useShipments(deps: UseShipmentsDeps): UseShipmentsResult {
         return { shipmentId, success: true };
       }
 
-      // Real pipeline
+      // Real pipeline — ASYNC: upload + fire extraction, return immediately
       await ensureAuthenticated();
+      let waitRetries = 0;
+      while (!apiFetchOrgRef.current && waitRetries < 50) { await new Promise(r => setTimeout(r, 100)); waitRetries++; }
 
-      // Step 1: Upload each file to Storage via edge function
-      for (const file of files) {
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('shipment_id', shipmentId);
-
-        try {
-          if (supabase) {
-            const { error } = await supabase.functions.invoke('upload-document', {
-              body: formData,
-            });
-            if (error) throw error;
-          }
-        } catch (err) {
-          console.warn('[upload] edge function failed for file:', err);
-          // Continue — extraction will still try to work on whatever was uploaded
-        }
-      }
-
-      // Step 2: Create the shipment row in DB with validation_status = 'pending'
-      // so the UI can show "received, processing" the moment the upload lands —
-      // NOT after the full extraction + validation chain finishes.
-      if (supabase) {
-        await supabase.from('shipments').upsert({
-          id: shipmentId,
-          shipper: 'Pending Extraction',
-          consignee: 'Pending Extraction',
-          status: 'Under Review',
-          docs_count: files.length,
-          urgency: '08:30:00',
-          initial_confidence: 0,
-          current_confidence: 0,
-          validation_status: 'pending',
-        }).then(({ error }) => {
-          if (error) console.warn('[upload] shipment upsert:', error.message);
-        });
-      }
-
-      // Detect document type from the first file's name
       const detectDocType = (fileName: string): string => {
-        const lower = fileName.toLowerCase();
-        if (lower.includes('packing') || lower.includes('pack')) return 'Packing List';
-        if (lower.includes('lading') || lower.includes('bol')) return 'Bill of Lading';
-        if (lower.includes('origin') || lower.includes('coo')) return 'Certificate of Origin';
+        const l = fileName.toLowerCase();
+        if (l.includes('packing') || l.includes('pack')) return 'Packing List';
+        if (l.includes('lading') || l.includes('bol')) return 'Bill of Lading';
+        if (l.includes('origin') || l.includes('coo')) return 'Certificate of Origin';
         return 'Commercial Invoice';
       };
-      const detectedDocType = files.length > 0 ? detectDocType(files[0].name) : 'Commercial Invoice';
 
-      // ── IMMEDIATE RESPONSE: add a placeholder entry + select it ──
-      // The user sees "received, processing" right away. The background
-      // pipeline (below) + the polling effect keep the entry fresh as the
-      // chain progresses: pending → running → completed/failed/degraded.
-      const placeholderEntry: ShipmentEntry = {
-        id: shipmentId,
-        shipper: 'Pending Extraction',
-        consignee: 'Pending Extraction',
-        status: 'Under Review',
-        docsCount: files.length,
-        urgency: '08:30:00',
-        initialConfidence: 0,
-        currentConfidence: 0,
-        createdAt: new Date().toISOString(),
-        documents: [],
-        exceptions: [],
-        fields: [],
-        validationStatus: 'pending',
-      };
-      setEntries(prev => [placeholderEntry, ...prev.filter(e => e.id !== shipmentId)]);
-      setSelectedEntryId(shipmentId);
-      setSelectedExceptionId('');
-      addAuditLog(`Shipment ${shipmentId} received — processing started.`, 'info', shipmentId);
-
-      // ── QUEUE-BASED PIPELINE (§3) ──
-      // Instead of running extraction inline from the request path, write a
-      // 'queued' processing_jobs row. The standalone worker process
-      // (mini-services/worker/) polls this table, claims the job via
-      // SELECT ... FOR UPDATE SKIP LOCKED, and runs the extraction + validation
-      // pipeline with a time budget that isn't constrained by the edge
-      // function's request-scoped CPU limit.
-      //
-      // The polling effect (every 4s) refreshes the selected shipment's status
-      // from the DB as the worker progresses: pending → running →
-      // completed/failed/degraded. This is the durable async processing layer
-      // — the upload returns immediately, the worker handles the rest.
-      try {
-        const traceId = typeof crypto !== 'undefined' ? crypto.randomUUID() : `trace-${Date.now()}`;
-        if (!supabase) throw new Error('Supabase client not initialized');
-        const { error: jobErr } = await supabase.from('processing_jobs').insert({
-          shipment_id: shipmentId,
-          org_id: currentOrgIdRef.current,
-          job_type: 'extraction',
-          status: 'queued',
-          trace_id: traceId,
-        });
-        if (jobErr) {
-          console.warn('[queue] failed to write processing_jobs row:', jobErr.message);
-          // Fallback: if the processing_jobs table doesn't exist yet (migration
-          // not run), fall back to the old inline pipeline so extraction still
-          // works. This is a safety net, not the primary path.
-          addAuditLog('[queue] processing_jobs table not available — falling back to inline extraction', 'warning', shipmentId);
-          void runInlinePipeline(shipmentId, detectedDocType).catch(err => {
-            console.error('[pipeline] inline fallback failed:', err);
-          });
-        } else {
-          addAuditLog(`[queue] Extraction job queued for ${shipmentId} (trace: ${traceId.slice(0, 8)})`, 'info', shipmentId);
-        }
-      } catch (err) {
-        console.error('[queue] unexpected error writing job:', err);
-        // Same fallback — don't let a queue failure prevent extraction
-        void runInlinePipeline(shipmentId, detectedDocType).catch((err) => {
-          console.error('[pipeline] inline fallback failed for', shipmentId, err instanceof Error ? err.message : err);
-        });
+      if (supabase) {
+        const { data: { user } } = await supabase.auth.getUser();
+        await supabase.from('shipments').upsert({
+          id: shipmentId, org_id: currentOrgIdRef.current, user_id: user?.id || null,
+          shipper: 'Pending Extraction', consignee: 'Pending Extraction', status: 'Under Review',
+          docs_count: files.length, urgency: '08:30:00', initial_confidence: 0, current_confidence: 0,
+          validation_status: 'pending',
+        }).then(({ error }) => { if (error) console.warn('[upload] upsert:', error.message); });
       }
 
-      // Return immediately — the user has already seen "received, processing".
-      // The worker process will pick up the job and run the extraction + validation
-      // pipeline. The polling effect (every 4s) keeps the UI in sync with the DB.
+      const docsPayload: Array<{ documentId: string; textContent: string; fileName: string; docType: string; mimeType: string; fileData?: string }> = [];
+      for (const file of files) {
+        const docType = detectDocType(file.name);
+        const docId = typeof crypto !== 'undefined' ? crypto.randomUUID() : `doc-${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
+        let mimeType = file.type || '';
+        if (!mimeType) { const ext = file.name.split('.').pop()?.toLowerCase() || ''; mimeType = { pdf:'application/pdf', png:'image/png', jpg:'image/jpeg', txt:'text/plain', csv:'text/csv' }[ext] || 'application/octet-stream'; }
+
+        // Read file content FIRST (before async storage ops)
+        let textContent = '';
+        let fileData: string | undefined;
+        if (mimeType === 'application/pdf') {
+          try { const ab = await file.arrayBuffer(); const bytes = new Uint8Array(ab); let bin = ''; for (let i = 0; i < bytes.length; i += 0x8000) { bin += String.fromCharCode.apply(null, bytes.subarray(i, i+0x8000) as unknown as number[]); } fileData = btoa(bin); } catch (err) { console.warn('[upload] base64:', err); }
+        } else if (mimeType.startsWith('text/')) { try { textContent = await file.text(); } catch {} }
+
+        // Storage upload (best-effort)
+        try { if (supabase) { const { error: ue } = await supabase.storage.from('documents').upload(`${currentOrgIdRef.current||'demo'}/${shipmentId}/${docId}-${file.name}`, file, { upsert: false }); if (ue) console.warn('[upload] storage:', ue.message); } } catch {}
+        // Documents row (best-effort)
+        try { if (supabase) { const { data: { user } } = await supabase.auth.getUser(); await supabase.from('documents').insert({ id: docId, shipment_id: shipmentId, user_id: user?.id||null, org_id: currentOrgIdRef.current, doc_type: docType, file_name: file.name, storage_path: `${currentOrgIdRef.current||'demo'}/${shipmentId}/${docId}-${file.name}`, file_size: file.size, mime_type: mimeType }).then(({ error }) => { if (error) console.warn('[upload] doc:', error.message); }); } } catch {}
+
+        docsPayload.push({ documentId: docId, textContent, fileName: file.name, docType, mimeType, ...(fileData ? { fileData } : {}) });
+      }
+
+      const placeholderEntry: ShipmentEntry = { id: shipmentId, shipper: 'Pending Extraction', consignee: 'Pending Extraction', status: 'Under Review', docsCount: files.length, urgency: '08:30:00', initialConfidence: 0, currentConfidence: 0, createdAt: new Date().toISOString(), documents: [], exceptions: [], fields: [], validationStatus: 'pending' };
+      setEntries(prev => [placeholderEntry, ...prev.filter(e => e.id !== shipmentId)]);
+      setSelectedEntryId(shipmentId); setSelectedExceptionId('');
+      addAuditLog(`Shipment ${shipmentId} received — processing started.`, 'info', shipmentId);
+
+      const apiFetchOrg = apiFetchOrgRef.current;
+      if (apiFetchOrg) {
+        void (async () => {
+          try {
+            await apiFetchOrg('/api/internal/extract-and-validate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ shipmentId, documents: docsPayload }) });
+            addAuditLog(`Extraction started for ${shipmentId}.`, 'info', shipmentId);
+          } catch (err) { console.error('[pipeline] failed:', err); addAuditLog(`Extraction error: ${err instanceof Error ? err.message : String(err)}`, 'error', shipmentId); await refreshShipment(shipmentId).catch(() => {}); }
+        })();
+      }
       return { shipmentId, success: true };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : 'Upload pipeline failed';

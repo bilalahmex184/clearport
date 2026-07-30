@@ -1,2 +1,47 @@
-skills/
+# Dependencies
 node_modules/
+
+# Next.js build output
+.next/
+
+# Environment variables (NEVER commit these)
+.env
+.env.local
+.env.*.local
+
+# Production
+build/
+dist/
+
+# Test files
+test-results/
+*.tsbuildinfo
+
+# Misc
+.DS_Store
+*.pem
+skills/
+
+# Debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local databases
+db/
+*.db
+*.sqlite
+
+# Uploads
+upload/
+
+# Logs
+dev.log
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Agent browser
+agent-browser/

@@ -13,6 +13,7 @@ import { type UserRole } from '@/lib/services/rbac.service';
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const DEMO_MODE = process.env.NEXT_PUBLIC_DEMO_MODE === 'true';
 
 /**
  * Build a Supabase client scoped to the caller's JWT. RLS policies on every
@@ -164,24 +165,29 @@ export async function requireOrgRole(
   minRole: 'viewer' | 'operator' | 'admin',
 ): Promise<{ user: User; client: SupabaseClient; orgId: string; role: UserRole }> {
   const { user, client } = await requireUserClient(req);
-
-  const orgId = await getOrgId(req, client, user);
-  if (!orgId) {
-    throw new AppError('No organization membership found. Please contact your administrator.', 403, 'NO_ORG_MEMBERSHIP');
-  }
-
-  const role = await getUserRole(client, user, orgId);
-  if (!role) {
-    throw new AppError('Forbidden: not a member of this organization', 403, 'FORBIDDEN_ORG');
-  }
-
-  // Check role hierarchy
+  let orgId = await getOrgId(req, client, user);
+  if (!orgId && DEMO_MODE) { orgId = await ensureDemoOrg(client, user); }
+  if (!orgId) { throw new AppError('No organization membership found. Please contact your administrator.', 403, 'NO_ORG_MEMBERSHIP'); }
+  let role = await getUserRole(client, user, orgId);
+  if (!role && DEMO_MODE) { role = 'admin' as UserRole; }
+  if (!role) { throw new AppError('Forbidden: not a member of this organization', 403, 'FORBIDDEN_ORG'); }
   const roleLevel: Record<UserRole, number> = { viewer: 1, operator: 2, admin: 3 };
-  if (roleLevel[role] < roleLevel[minRole]) {
-    throw new AppError(`Forbidden: requires ${minRole} role or higher`, 403, 'INSUFFICIENT_ROLE');
-  }
-
+  if (roleLevel[role] < roleLevel[minRole]) { throw new AppError(`Forbidden: requires ${minRole} role or higher`, 403, 'INSUFFICIENT_ROLE'); }
   return { user, client, orgId, role };
+}
+
+async function ensureDemoOrg(client: SupabaseClient, user: User): Promise<string | null> {
+  const shortId = user.id.slice(0, 8);
+  const orgName = `Demo Workspace (${shortId})`;
+  try {
+    const { data: rpcResult, error: rpcErr } = await client.rpc('create_organization', { p_org_name: orgName, p_creator_uid: user.id });
+    if (rpcErr || !rpcResult || rpcResult.length === 0) { const orgs = await getUserOrgs(client, user); return orgs.length > 0 ? orgs[0].org_id : null; }
+    logger.info('Demo org auto-provisioned', { orgId: rpcResult[0].org_id, orgName, userId: user.id });
+    return rpcResult[0].org_id;
+  } catch (err) {
+    logger.warn('ensureDemoOrg error', { userId: user.id, error: err instanceof Error ? err.message : String(err) });
+    const orgs = await getUserOrgs(client, user); return orgs.length > 0 ? orgs[0].org_id : null;
+  }
 }
 
 /**

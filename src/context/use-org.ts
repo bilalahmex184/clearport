@@ -25,6 +25,7 @@ import {
   ensureAuthenticated,
   getCurrentUserEmail,
   apiFetch,
+  isDemoMode,
 } from '@/lib/supabase';
 import type {
   ShipmentEntry,
@@ -204,13 +205,18 @@ export function useOrg(deps: UseOrgDeps): UseOrgResult {
             setCurrentOrgId(first.org_id);
             currentOrgIdRef.current = first.org_id;
             setUserRole(first.role);
+          } else if (isDemoMode()) {
+            try {
+              const createRes = await apiFetch<{ organization: { id: string; name: string }; role: UserRole }>('/api/organizations', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Demo Workspace' }),
+              });
+              if (createRes?.organization?.id) {
+                const newOrg = { org_id: createRes.organization.id, org_name: createRes.organization.name, role: createRes.role };
+                setUserOrgs([newOrg]); setCurrentOrgId(newOrg.org_id); currentOrgIdRef.current = newOrg.org_id; setUserRole(newOrg.role);
+              } else { setSupabaseStatus('connected'); setEdgeFunctionStatus('fallback'); return; }
+            } catch (createErr) { console.warn('[ctx] Demo org creation failed:', createErr); setSupabaseStatus('connected'); setEdgeFunctionStatus('fallback'); return; }
           } else {
-            // No org memberships — fall back to seed data with a warning.
-            // The user can still see the demo data; they just can't mutate it.
-            console.warn('[ctx] No org memberships found — falling back to seed data. Create or join an organization to enable live mode.');
-            setSupabaseStatus('connected');
-            setEdgeFunctionStatus('fallback');
-            return;
+            setSupabaseStatus('connected'); setEdgeFunctionStatus('fallback'); return;
           }
         } catch (orgErr) {
           // 403 (no org membership) or network / schema error — fall back to
