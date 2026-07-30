@@ -6,7 +6,7 @@
 // No generic "Something went wrong" allowed.
 // ============================================================================
 
-import { logger } from '@/lib/observability/logger';
+import { logger } from '@/lib/utils/logger';
 
 // ---------------------------------------------------------------------------
 // Error Severity

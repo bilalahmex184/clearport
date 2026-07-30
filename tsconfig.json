@@ -42,6 +42,8 @@
     "examples",
     "skills",
     "supabase/functions",
-    "mini-services"
+    "deprecated",
+    "apps",
+    "packages"
   ]
 }

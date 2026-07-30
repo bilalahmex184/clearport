@@ -498,13 +498,9 @@ export function useShipments(deps: UseShipmentsDeps): UseShipmentsResult {
   // queue + worker — this is the safety net so extraction still works during
   // the migration period.
   //
-  // (§4 refactor: extracted to src/context/inline-pipeline.ts — behavior preserved)
-  const runInlinePipeline = React.useCallback(async (shipmentId: string, _detectedDocType: string) => {
-    const apiFetchOrg = apiFetchOrgRef.current;
-    if (!apiFetchOrg) return;
-    const { runInlinePipeline: runPipeline } = await import('./inline-pipeline');
-    await runPipeline(shipmentId, apiFetchOrg, refreshShipment);
-  }, [apiFetchOrgRef, refreshShipment]);
+  // NOTE: The old inline-pipeline (edge function cascade) has been quarantined
+  // to /deprecated/. The live upload flow now calls /api/internal/extract-and-validate
+  // which runs the full pipeline in the Next.js Node runtime (async 202 pattern).
 
   // --- Upload documents ---
   const uploadDocuments = React.useCallback(async (files: File[]): Promise<{ shipmentId: string; success: boolean; error?: string }> => {
@@ -630,7 +626,7 @@ export function useShipments(deps: UseShipmentsDeps): UseShipmentsResult {
       addAuditLog(`Upload failed for ${shipmentId}: ${errMsg}`, 'error', shipmentId);
       return { shipmentId, success: false, error: errMsg };
     }
-  }, [rules, addAuditLog, refreshShipment, runInlinePipeline, currentOrgIdRef]);
+  }, [rules, addAuditLog, refreshShipment, currentOrgIdRef]);
 
   // --- Update rules ---
   const updateRules = React.useCallback((newRules: Partial<OperationalRules>) => {

@@ -1,0 +1,26 @@
+{
+  "name": "@clearport/consumer",
+  "private": true,
+  "scripts": {
+    "dev": "echo 'Phase 3: Cloudflare Worker for queue consumer'",
+    "deploy": "echo 'Phase 3: wrangler deploy'"
+  },
+  "dependencies": {
+    "@clearport/shared": "workspace:*"
+  }
+}
+
+cat > packages/shared/package.json << 'EOF'
+{
+  "name": "@clearport/shared",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./env": "./src/env.ts",
+    "./schema": "./src/schema.ts",
+    "./constants": "./src/constants.ts"
+  }
+}

@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - run: bun run lint
+      - run: bunx tsc --noEmit
+
+  deprecated-import-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check no file outside /deprecated/ imports from /deprecated/
+        run: |
+          # Search for imports from deprecated/ in any .ts/.tsx file outside deprecated/
+          VIOLATIONS=$(grep -r --include='*.ts' --include='*.tsx' \
+            -l 'from.*deprecated/\|import.*deprecated/' \
+            src/ apps/ packages/ 2>/dev/null || true)
+          if [ -n "$VIOLATIONS" ]; then
+            echo "ERROR: The following files import from /deprecated/ — this is forbidden:"
+            echo "$VIOLATIONS"
+            exit 1
+          fi
+          echo "OK: No imports from /deprecated/ found outside the quarantine zone."

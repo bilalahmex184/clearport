@@ -45,3 +45,6 @@ dev.log
 
 # Agent browser
 agent-browser/
+eng.traineddata
+worklog.md
+*.traineddata

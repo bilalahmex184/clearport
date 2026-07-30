@@ -2,7 +2,7 @@
 import { NextResponse } from 'next/server';
 import { requireOrgRole, getUserEmail } from '@/lib/services/auth.service';
 import { regexExtract } from '@/lib/extraction/regex-extract';
-import { callGeminiExtraction, isGeminiConfigured } from '@/lib/extraction/gemini-extract';
+import { callAIExtraction, isAIProviderConfigured } from '@/lib/extraction/ai-extract';
 import { mapToCanonicalSchema, type CanonicalField } from '@/lib/extraction/canonical-schema';
 import { runPipeline, type ShipmentDocument, type PipelineException } from '@/lib/extraction/pipeline';
 import { errorResponse } from '@/lib/utils/error-handler';
@@ -45,7 +45,7 @@ async function processExtraction(client: any, userId: string, orgId: string, shi
     if (!text && doc.fileData && (doc.mimeType === 'application/pdf' || doc.fileName.toLowerCase().endsWith('.pdf'))) { logger.info('Extracting PDF text', { fileName: doc.fileName }); text = (await extractPdfText(doc.fileData)).trim(); logger.info('PDF text extracted', { fileName: doc.fileName, length: text.length }); }
     if (!text) { logger.warn('No text for document', { fileName: doc.fileName }); continue; }
     let fields: CanonicalField[] = []; let extractionSource = 'regex_fallback';
-    if (isGeminiConfigured()) { try { const aiResult = await callGeminiExtraction(text); if (aiResult.fields.length > 0) { fields = mapToCanonicalSchema(aiResult.fields); extractionSource = `ai_${aiResult.model}`; logger.info('AI extraction succeeded', { fileName: doc.fileName, model: aiResult.model, fields: fields.length }); } } catch (err) { logger.warn('AI failed, regex fallback', { fileName: doc.fileName }); } }
+    if (isAIProviderConfigured()) { try { const aiResult = await callAIExtraction(text); if (aiResult.fields.length > 0) { fields = mapToCanonicalSchema(aiResult.fields); extractionSource = `ai_${aiResult.model}`; logger.info('AI extraction succeeded', { fileName: doc.fileName, model: aiResult.model, fields: fields.length }); } } catch (err) { logger.warn('AI failed, regex fallback', { fileName: doc.fileName }); } }
     if (fields.length === 0) { const rf = regexExtract(text); fields = mapToCanonicalSchema(rf.map(f => ({ field_key: f.field_key, field_label: f.field_label, value: f.extracted_value, confidence: f.confidence / 100 }))); if (fields.length === 0) continue; }
     const fieldsMap: Record<string, string> = {}; for (const f of fields) fieldsMap[f.field_key] = f.value;
     const shipDoc: ShipmentDocument = { source_shipment_id: shipmentId, doc_type: doc.docType.toLowerCase().replace(/[^a-z_]/g, '_') as any, fields: fieldsMap, raw_text: text };

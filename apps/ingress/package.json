@@ -1,0 +1,11 @@
+{
+  "name": "@clearport/ingress",
+  "private": true,
+  "scripts": {
+    "dev": "echo 'Phase 3: Cloudflare Worker for upload ingress'",
+    "deploy": "echo 'Phase 3: wrangler deploy'"
+  },
+  "dependencies": {
+    "@clearport/shared": "workspace:*"
+  }
+}

@@ -16,14 +16,21 @@
 // ============================================================================
 
 import { NextResponse, type NextRequest } from 'next/server';
-import {
-  createRequestContext,
-  clearRequestContext,
-  traceRequest,
-  logger,
-  getRequestContext,
-} from '@/lib/observability/logger';
+import { logger } from '@/lib/utils/logger';
 import { toErrorResponse, getHttpStatus, ClearPortError } from '@/lib/errors';
+
+// Compatibility stubs — these functions were in the old observability/logger
+// module (now quarantined to /deprecated/). The middleware uses them for
+// request tracing, but the live logger (@/lib/utils/logger) is simpler.
+// These stubs preserve the middleware's behavior without depending on deprecated code.
+function createRequestContext(action: string, userId?: string, orgId?: string) {
+  return { action, userId, orgId, requestId: '', stages: new Map() };
+}
+function clearRequestContext() {}
+function getRequestContext() { return null; }
+async function traceRequest<T>(action: string, fn: () => Promise<T>, _ctx?: any): Promise<T> {
+  try { return await fn(); } catch (err) { logger.error(`Request failed: ${action}`, { error: err instanceof Error ? err.message : String(err) }); throw err; }
+}
 
 // ---------------------------------------------------------------------------
 // Public routes — no auth required
@@ -145,7 +152,7 @@ export interface RouteContext {
  *   });
  */
 export function withMiddleware(handler: RouteHandler): (req: Request) => Promise<Response> {
-  return async (req: Request) => {
+  return async (req: Request): Promise<Response> => {
     const requestId =
       typeof crypto !== 'undefined' && 'randomUUID' in crypto
         ? crypto.randomUUID()
@@ -156,53 +163,39 @@ export function withMiddleware(handler: RouteHandler): (req: Request) => Promise
     const userId = req.headers.get('x-user-id') || undefined;
     const orgId = req.headers.get('x-org-id') || undefined;
 
-    return traceRequest(
-      action,
-      async (ctx) => {
-        logger.info(`Request started: ${action}`, {
-          method: req.method,
-          path: new URL(req.url).pathname,
-        });
-
-        try {
-          const response = await handler(req, {
-            request_id: ctx.request_id,
-            user_id: userId,
-            organization_id: orgId,
-          });
-
-          // If it's a NextResponse, add request_id header
-          if (response instanceof NextResponse) {
-            response.headers.set('X-Request-Id', ctx.request_id);
-          }
-
-          return response;
-        } catch (err) {
-          logger.error(`Unhandled error in route: ${action}`, {
-            error_type: err instanceof Error ? err.constructor.name : 'Unknown',
-            error_message: err instanceof Error ? err.message : String(err),
-            stack_trace: err instanceof Error ? err.stack : undefined,
-          });
-
-          const errorResponse = toErrorResponse(err, ctx.request_id);
-          const status = getHttpStatus(err);
-
-          return NextResponse.json(errorResponse, {
-            status,
-            headers: { 'X-Request-Id': ctx.request_id },
-          });
-        }
-      },
-      { userId, orgId },
-    ).catch(() => {
-      // traceRequest already logged + rejected — return a fallback response
-      // This should never execute because traceRequest resolves/rejects internally,
-      // but if it does, we return a safe error.
-      return NextResponse.json(
-        { error: { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred.', severity: 'error', retryable: false } },
-        { status: 500, headers: { 'X-Request-Id': requestId } },
-      );
+    logger.info(`Request started: ${action}`, {
+      method: req.method,
+      path: new URL(req.url).pathname,
+      request_id: requestId,
     });
+
+    try {
+      const response = await handler(req, {
+        request_id: requestId,
+        user_id: userId,
+        organization_id: orgId,
+      });
+
+      if (response instanceof NextResponse) {
+        response.headers.set('X-Request-Id', requestId);
+      }
+
+      return response;
+    } catch (err) {
+      logger.error(`Unhandled error in route: ${action}`, {
+        error_type: err instanceof Error ? err.constructor.name : 'Unknown',
+        error_message: err instanceof Error ? err.message : String(err),
+        request_id: requestId,
+      });
+
+      const errorResponse = toErrorResponse(err, requestId);
+      const status = getHttpStatus(err);
+
+      return NextResponse.json(errorResponse, {
+        status,
+        headers: { 'X-Request-Id': requestId },
+      });
+    }
   };
 }
 

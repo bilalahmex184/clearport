@@ -6,7 +6,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '@/lib/utils/logger';
-import type { RuleEvaluationResult, DecisionTrace } from '@/lib/pipeline/types';
+import type { RuleEvaluationResult, DecisionTrace } from '@/lib/rules/types';
 
 export interface ValidationRule {
   id: string;
