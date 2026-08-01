@@ -53,24 +53,68 @@ export function newProjectConfig(env: Env): ProjectConfig {
 // ---------------------------------------------------------------------------
 // resolveProject — the per-request credential selector.
 // ---------------------------------------------------------------------------
-// Steps:
-//   1. Always read the use_new_pipeline flag from the OLD project (the OLD
-//      project is authoritative for org metadata during the transition).
-//   2. If TRUE → return the NEW project config (the org's data lives there).
-//   3. If FALSE → return the OLD project config (the org hasn't been migrated).
-//   4. On error (flag check fails, org doesn't exist) → fail safe to OLD.
-//      A failed flag check should NOT route to the new pipeline (which might
-//      not have the org's data yet) — the old path is the known-good fallback.
+// Phase 2.5 Step 3 fix (#48): resolveProject NO LONGER depends on the OLD
+// project being alive for already-migrated orgs.
 //
-// The flag check is a REST call to the OLD project's is_org_on_new_pipeline
-// RPC (defined in 007_feature_flag_cutover.sql). Uses the OLD service-role
-// key to bypass RLS on the organizations table.
+// Steps:
+//   1. Check the NEW project's organizations table for this org_id.
+//      - If the org EXISTS in the NEW project → it's been migrated. Return
+//        the NEW project config. The OLD project is NOT queried.
+//      - This means once Phase 6 Step 5 decommissions the OLD project,
+//        already-migrated orgs keep working with zero code changes.
+//   2. If the org does NOT exist in the NEW project → it hasn't been migrated
+//      yet. Fall back to checking the OLD project's use_new_pipeline flag.
+//      - If the OLD project says TRUE (shouldn't happen if the org isn't in
+//        the NEW project, but defensive) → return NEW config anyway.
+//      - If FALSE or OLD project is unreachable → return OLD config (the
+//        known-good path for un-migrated orgs).
+//   3. On any error → fail safe to OLD (the old path is the known-good fallback
+//      for orgs that haven't been migrated yet).
+//
+// This is option (a) from the spec: mirror the flag into the NEW project's
+// organizations table during migration (Phase 6 Step 3 sets use_new_pipeline=
+// TRUE there), and check the NEW project first. The OLD project is only
+// queried for orgs NOT yet in the NEW project — so decommissioning the OLD
+// project only affects un-migrated orgs (which shouldn't exist post-cutover).
 // ---------------------------------------------------------------------------
 export async function resolveProject(env: Env, orgId: string): Promise<ProjectConfig> {
+  const newConfig = newProjectConfig(env);
   const oldConfig = oldProjectConfig(env);
 
+  // --- Step 1: Check the NEW project first ---
+  // If the org exists in the NEW project's organizations table, it's been
+  // migrated. Return the NEW config WITHOUT querying the OLD project.
   try {
-    // Read the flag from the OLD project.
+    const newOrgRes = await fetch(
+      `${newConfig.supabaseUrl}/rest/v1/organizations?select=id,use_new_pipeline&id=eq.${encodeURIComponent(orgId)}`,
+      {
+        headers: {
+          'apikey': newConfig.supabaseAnonKey,
+          'Authorization': `Bearer ${newConfig.supabaseServiceRoleKey}`,
+        },
+      },
+    );
+
+    if (newOrgRes.ok) {
+      const newOrgData = await newOrgRes.json() as Array<{ id: string; use_new_pipeline: boolean }>;
+      if (Array.isArray(newOrgData) && newOrgData.length > 0) {
+        // Org exists in the NEW project — it's migrated. Use the NEW project.
+        console.log(`[project-config] org ${orgId} found in NEW project — routing to NEW`);
+        return newConfig;
+      }
+    }
+    // If the NEW project returns an error or the org isn't there, fall through
+    // to the OLD project check.
+  } catch (err) {
+    // NEW project unreachable — fall through to OLD project check.
+    console.warn(
+      `[project-config] NEW project check failed for org ${orgId}:`,
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+
+  // --- Step 2: Org not in NEW project — check the OLD project's flag ---
+  try {
     const flagRes = await fetch(
       `${oldConfig.supabaseUrl}/rest/v1/rpc/is_org_on_new_pipeline`,
       {
@@ -85,23 +129,25 @@ export async function resolveProject(env: Env, orgId: string): Promise<ProjectCo
     );
 
     if (!flagRes.ok) {
-      // Flag check failed — fail safe to OLD. Log the error.
-      console.warn(`[project-config] flag check failed for org ${orgId}: ${flagRes.status} — routing to OLD project`);
+      // Flag check failed — fail safe to OLD.
+      console.warn(`[project-config] OLD project flag check failed for org ${orgId}: ${flagRes.status} — routing to OLD project`);
       return oldConfig;
     }
 
     const flagData = await flagRes.json() as unknown;
-    // PostgREST returns a bare boolean for a boolean-returning function.
     const useNew = flagData === true || (Array.isArray(flagData) && flagData[0] === true);
 
     if (useNew) {
-      return newProjectConfig(env);
+      // Flag is TRUE but org isn't in the NEW project — this is a race
+      // condition (migration in progress). Route to NEW anyway.
+      return newConfig;
     }
     return oldConfig;
   } catch (err) {
-    // Network error / parse error — fail safe to OLD.
+    // OLD project also unreachable — fail safe to OLD config (the org
+    // hasn't been migrated, so OLD is the right place even if it's down).
     console.warn(
-      `[project-config] flag check error for org ${orgId}:`,
+      `[project-config] OLD project flag check error for org ${orgId}:`,
       err instanceof Error ? err.message : String(err),
     );
     return oldConfig;
