@@ -23,7 +23,7 @@ import {
   type UpdateExceptionInput,
 } from '@/lib/services/exception.service';
 import { updateExceptionSchema } from '@/lib/validators/exception.validator';
-import { errorResponse } from '@/lib/utils/error-handler';
+import { errorResponse } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 
 export async function PATCH(

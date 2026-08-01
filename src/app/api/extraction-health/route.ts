@@ -33,7 +33,7 @@
 
 import { NextResponse } from 'next/server';
 import { requireOrgRole } from '@/lib/services/auth.service';
-import { errorResponse } from '@/lib/utils/error-handler';
+import { errorResponse } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 
 export interface TierStat {

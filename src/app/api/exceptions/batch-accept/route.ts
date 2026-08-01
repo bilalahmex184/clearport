@@ -18,7 +18,7 @@ import {
   batchAcceptExceptions,
 } from '@/lib/services/exception.service';
 import { batchAcceptSchema } from '@/lib/validators/exception.validator';
-import { errorResponse } from '@/lib/utils/error-handler';
+import { errorResponse } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 
 // ---------------------------------------------------------------------------

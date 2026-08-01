@@ -1,0 +1,80 @@
+# ============================================================================
+# wrangler.toml — Cloudflare Worker config for the ClearPort ingress Worker
+# ============================================================================
+# This Worker is the front-door of the Phase 3 async-202 upload flow:
+#   1. Verifies the caller's JWT + org membership.
+#   2. Validates the uploaded file (magic bytes / size / extension).
+#   3. Computes an idempotency key from the file's SHA-256 bytes.
+#   4. Calls get_or_create_job (idempotent — byte-identical re-uploads return
+#      the same job_id without re-processing).
+#   5. Uploads the bytes to Supabase Storage (`documents` bucket — Phase 2
+#      decided to stay on Supabase Storage, NOT Cloudflare R2).
+#   6. Inserts a `documents` row + updates the job's `document_id`.
+#   7. Enqueues `{ job_id }` to the `extraction-jobs` Cloudflare Queue. The
+#      consumer Worker (separate, built in parallel) reads the queue and
+#      performs the heavy extraction off the request path.
+#   8. Returns HTTP 202 immediately.
+#
+# SECURITY
+#   SUPABASE_SERVICE_ROLE_KEY is set via `wrangler secret put` in production.
+#   It is NEVER committed here. It is NEVER logged. The Worker is a trusted
+#   server-side runtime — the service-role key bypasses RLS for the org-
+#   membership check, job RPC, Storage upload, and documents insert. Without
+#   it, the Worker would need to use anon + JWT per request (which is fine for
+#   the auth.getUser call) but cannot do cross-org job/Storage ops.
+# ============================================================================
+
+name = "clearport-ingress"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Environment variables — non-secret values can live here. Anything sensitive
+# (SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY) is set via:
+#     wrangler secret put SUPABASE_ANON_KEY
+#     wrangler secret put SUPABASE_SERVICE_ROLE_KEY
+# SUPABASE_URL is project-scoped (not a secret per se), but we set it via
+# secret too so the same wrangler.toml works across dev/staging/prod without
+# check-in churn.
+[vars]
+SUPABASE_URL = ""  # set via `wrangler secret put SUPABASE_URL` in prod
+
+# Cloudflare Queue binding — the consumer Worker reads from this queue.
+# The queue itself is created with `wrangler queues create extraction-jobs`.
+# The producer binding lets this Worker call `env.EXTRACTION_QUEUE.send(...)`.
+[[queues.producers]]
+queue = "extraction-jobs"
+binding = "EXTRACTION_QUEUE"
+
+# ----------------------------------------------------------------------------
+# Rate limiting (Phase 5 Step 1) — 50 extractions / hour / org.
+# ----------------------------------------------------------------------------
+# Keyed by org_id (NOT source IP) so:
+#   - A whole org sharing one office NAT IP isn't penalized as one client.
+#   - A single malicious org rotating exit IPs can't evade the limit.
+# The org_id comes from the verified JWT (Step 1 of the Worker), so the
+# rate-limit check runs AFTER auth and BEFORE file validation.
+#
+# KV key shape:  rate_limit:{org_id}:{hour_bucket}
+#   - hour_bucket = floor(Date.now() / 3_600_000) — epoch-aligned hour
+#   - TTL = 3600s — KV auto-expires the key at the bucket boundary
+#
+# KV is eventually consistent (~60s global propagation), so a brief overage
+# during propagation is possible. This is ACCEPTABLE: the rate limiter is a
+# SOFT guard for fast feedback (429 in <50ms on abuse). The HARD cap on
+# usage is enforceUsageLimitOrThrow in billing.service.ts (Phase 2 Step 4),
+# enforced synchronously in Postgres with row locks.
+#
+# Create the namespace in prod with:
+#   wrangler kv:namespace create RATE_LIMIT_KV
+# Then paste the returned id below (the empty id is fine for `wrangler dev`).
+[[kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "f3cd412fefca4b219ab40d67b65cc917"  # RATE_LIMIT_KV
+
+# R2 is NOT bound here. Phase 2 decided to stay on Supabase Storage
+# (see docs/phase2-migration-guide.md §"Staying on Supabase Storage"). If a
+# future phase migrates to R2, bind it as:
+#   [[r2_buckets]]
+#   binding = "DOCUMENTS_BUCKET"
+#   bucket_name = "clearport-documents"

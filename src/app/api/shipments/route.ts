@@ -25,7 +25,7 @@ import {
   createShipmentSchema,
 } from '@/lib/validators/shipment.validator';
 import { paginationSchema } from '@/lib/validators/pagination.validator';
-import { errorResponse } from '@/lib/utils/error-handler';
+import { errorResponse } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@
 // ============================================================================
 
 import { createClient, type SupabaseClient, type User } from '@supabase/supabase-js';
-import { AppError } from '@/lib/utils/error-handler';
+import { AppError } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 import { type UserRole } from '@/lib/services/rbac.service';
 

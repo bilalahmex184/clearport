@@ -48,3 +48,5 @@ agent-browser/
 eng.traineddata
 worklog.md
 *.traineddata
+.env.phase6
+.zscripts/dev.pid

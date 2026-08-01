@@ -30,7 +30,7 @@ import type {
 } from '@/lib/clearport-types';
 import { mapDbToException } from '@/lib/supabase';
 import { logger } from '@/lib/utils/logger';
-import { AppError } from '@/lib/utils/error-handler';
+import { AppError } from '@/lib/errors';
 import { insertAuditLog } from '@/lib/services/audit-log.service';
 
 const CONFIDENCE_BOOST = 30; // total headroom reserved for resolving exceptions

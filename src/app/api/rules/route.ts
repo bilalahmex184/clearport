@@ -21,7 +21,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { requireOrgRole, getUserEmail } from '@/lib/services/auth.service';
 import { updateRulesSchema } from '@/lib/validators/rules.validator';
 import { logRulesUpdate } from '@/lib/services/audit-log.service';
-import { errorResponse, AppError } from '@/lib/utils/error-handler';
+import { errorResponse, AppError } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 import type {
   OperationalRules,

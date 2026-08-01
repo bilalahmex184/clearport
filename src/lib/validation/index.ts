@@ -6,7 +6,7 @@
 // ============================================================================
 
 import { z, ZodError } from 'zod';
-import { ValidationError } from '@/lib/errors';
+import { AppError } from '@/lib/errors';
 
 // ---------------------------------------------------------------------------
 // Validation Result
@@ -242,16 +242,22 @@ export function validateSchema<T>(
 }
 
 /**
- * Validate and throw ValidationError on failure.
+ * Validate and throw an AppError (VALIDATION_ERROR) on failure.
  */
 export function validateOrThrow<T>(schema: z.ZodSchema<T>, data: unknown): T {
   const result = validateSchema(schema, data);
   if (!result.success) {
     const firstError = result.errors[0];
-    throw new ValidationError(firstError.field, firstError.reason, {
-      suggestion: firstError.suggestion,
-      context: { all_errors: result.errors },
-    });
+    throw new AppError(
+      firstError.reason,
+      422,
+      'VALIDATION_ERROR',
+      {
+        field: firstError.field,
+        suggestion: firstError.suggestion,
+        all_errors: result.errors,
+      },
+    );
   }
   return result.data;
 }

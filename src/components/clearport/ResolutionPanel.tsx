@@ -51,7 +51,7 @@ export default function ResolutionPanel({
       setEditValue(selectedException.correctedValue ?? selectedException.extractedValue);
       setIsEditing(false);
     }
-  }, [selectedException?.id]);
+  }, [selectedException?.id, selectedException]);
 
   // Keyboard shortcuts (scoped — only when not typing in input)
   React.useEffect(() => {

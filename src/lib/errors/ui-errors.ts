@@ -90,9 +90,50 @@ const ERROR_MESSAGES: Record<string, { message: string; suggestion?: string }> =
 
 /**
  * Convert an API error response to a UI-safe error.
+ *
+ * Accepts BOTH the canonical flat shape produced by `errorResponse()` in
+ * @/lib/errors:
+ *   { error: <message>, code: <code>, details: <details> }
+ * AND (for backward-compat) the legacy nested shape from the old
+ * ClearPortError taxonomy:
+ *   { error: { code, message, severity, retryable, field?, suggestion?, ... } }
+ *
+ * Also accepts an ApiFetchError (from @/lib/supabase) which carries code +
+ * details directly on the thrown error object.
  */
 export function toUIError(error: any): UIError {
-  // If it's already a structured error from our API
+  // ApiFetchError (thrown by apiFetch) — carries code/details on the error
+  // itself, no .error wrapper.
+  if (error?.code && typeof error.code === 'string' && error?.message) {
+    const code = error.code;
+    const mapped = ERROR_MESSAGES[code];
+    return {
+      type: mapCodeToType(code),
+      message: mapped?.message || error.message || 'An error occurred.',
+      suggestion: mapped?.suggestion,
+      field: error?.details?.field,
+      severity:
+        (error?.details?.severity === 'warning' ? 'warning' : 'error'),
+      retryable: error?.details?.retryable,
+    };
+  }
+
+  // Canonical flat shape: { error: <string>, code: <string>, details: {...} }
+  if (error?.error && typeof error.error === 'string' && error?.code) {
+    const code = error.code;
+    const mapped = ERROR_MESSAGES[code];
+    return {
+      type: mapCodeToType(code),
+      message: mapped?.message || error.error || 'An error occurred.',
+      suggestion: mapped?.suggestion,
+      field: error?.details?.field,
+      severity:
+        error?.details?.severity === 'warning' ? 'warning' : 'error',
+      retryable: error?.details?.retryable,
+    };
+  }
+
+  // Legacy nested shape: { error: { code, message, severity, ... } }
   if (error?.error?.code) {
     const code = error.error.code;
     const mapped = ERROR_MESSAGES[code];
@@ -100,7 +141,7 @@ export function toUIError(error: any): UIError {
     return {
       type: mapCodeToType(code),
       message: mapped?.message || error.error.message || 'An error occurred.',
-      suggestion: mapped?.suggestion,
+      suggestion: mapped?.suggestion || error.error.suggestion,
       field: error.error.field,
       severity: error.error.severity === 'warning' ? 'warning' : 'error',
       retryable: error.error.retryable,

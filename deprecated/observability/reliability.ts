@@ -6,7 +6,7 @@
 // ============================================================================
 
 import { logger } from '@/lib/observability/logger';
-import { InfrastructureError, ExternalAPIError } from '@/lib/errors';
+import { AppError } from '@/lib/errors';
 
 // ---------------------------------------------------------------------------
 // Retry Strategy
@@ -90,8 +90,10 @@ export async function withRetry<T>(
 }
 
 function isRetryableError(err: unknown): boolean {
-  if (err instanceof InfrastructureError) return err.retryable;
-  if (err instanceof ExternalAPIError) return err.retryable;
+  // AppError carries an explicit `retryable` flag — the consolidated error
+  // system uses this instead of the old InfrastructureError/ExternalAPIError
+  // subclasses.
+  if (err instanceof AppError) return err.retryable;
   // Network errors, timeouts
   if (err instanceof Error) {
     const msg = err.message.toLowerCase();

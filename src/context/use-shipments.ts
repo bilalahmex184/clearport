@@ -180,7 +180,11 @@ export function useShipments(deps: UseShipmentsDeps): UseShipmentsResult {
       // as 'failed' so polling stops. This handles the edge case where the
       // shipment row upsert failed but a 'pending' placeholder was already
       // added to the UI — without this, the polling effect would retry forever.
-      if (/404|not found/i.test(errMsg)) {
+      // Match on the structured `code` first (apiFetch now throws ApiFetchError
+      // with code='NOT_FOUND'); fall back to the message regex for non-API
+      // errors (network, etc.).
+      const errCode = (err as { code?: string })?.code;
+      if (errCode === 'NOT_FOUND' || /404|not found/i.test(errMsg)) {
         setEntries(prev => {
           const idx = prev.findIndex(e => e.id === shipmentId);
           if (idx === -1) return prev;
@@ -566,6 +570,87 @@ export function useShipments(deps: UseShipmentsDeps): UseShipmentsResult {
       let waitRetries = 0;
       while (!apiFetchOrgRef.current && waitRetries < 50) { await new Promise(r => setTimeout(r, 100)); waitRetries++; }
 
+      // Phase 6 cutover: if the ingress Worker URL is configured, route the
+      // upload through it (the new pipeline). The Worker handles Storage
+      // upload, job creation, queue enqueue, and returns 202. Otherwise, fall
+      // back to the old direct-Supabase + /api/internal/extract-and-validate path.
+      const ingressUrl = process.env.NEXT_PUBLIC_INGRESS_URL;
+      if (ingressUrl) {
+        // === NEW PIPELINE (Phase 6) ===
+        // The ingress Worker handles everything: auth, file validation, Storage
+        // upload, job creation, queue enqueue. We just POST the file + shipment_id.
+        try {
+          const apiFetchOrg = apiFetchOrgRef.current;
+          if (!apiFetchOrg) throw new Error('apiFetchOrg not ready');
+
+          // Create the shipment row first (the Worker expects it to exist).
+          if (supabase) {
+            const { data: { user } } = await supabase.auth.getUser();
+            await supabase.from('shipments').upsert({
+              id: shipmentId, org_id: currentOrgIdRef.current, user_id: user?.id || null,
+              shipper: 'Pending Extraction', consignee: 'Pending Extraction', status: 'Under Review',
+              docs_count: files.length, urgency: '08:30:00', initial_confidence: 0, current_confidence: 0,
+              validation_status: 'pending',
+            }).then(({ error }) => { if (error) console.warn('[upload] upsert:', error.message); });
+          }
+
+          // Upload each file to the ingress Worker.
+          for (const file of files) {
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('shipment_id', shipmentId);
+
+            // The apiFetchOrg wrapper adds the X-Org-Id + Authorization headers.
+            // But the ingress Worker is on a different origin (workers.dev), so
+            // we use a direct fetch with the same headers.
+            const { data: { user } } = await supabase!.auth.getUser();
+            const authRes = await supabase!.auth.getSession();
+            const jwt = authRes.data.session?.access_token || '';
+            const orgId = currentOrgIdRef.current || '';
+
+            const res = await fetch(`${ingressUrl}/`, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${jwt}`,
+                'X-Org-Id': orgId,
+              },
+              body: formData,
+            });
+
+            if (!res.ok) {
+              const errBody = await res.json().catch(() => ({ error: 'unknown' }));
+              console.error('[upload] ingress Worker error:', res.status, errBody);
+              throw new Error(`Upload failed: ${errBody.error || res.statusText}`);
+            }
+
+            const result = await res.json();
+            console.log('[upload] ingress accepted:', result);
+          }
+
+          // Add a placeholder entry so the UI shows the shipment immediately.
+          const placeholderEntry: ShipmentEntry = {
+            id: shipmentId, shipper: 'Pending Extraction', consignee: 'Pending Extraction',
+            status: 'Under Review', docsCount: files.length, urgency: '08:30:00',
+            initialConfidence: 0, currentConfidence: 0, createdAt: new Date().toISOString(),
+            documents: [], exceptions: [], fields: [], validationStatus: 'pending',
+          };
+          setEntries(prev => [placeholderEntry, ...prev.filter(e => e.id !== shipmentId)]);
+          setSelectedEntryId(shipmentId); setSelectedExceptionId('');
+          addAuditLog(`Shipment ${shipmentId} uploaded via new pipeline — processing started.`, 'info', shipmentId);
+
+          return { shipmentId, success: true };
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : 'New pipeline upload failed';
+          console.error('[upload] new pipeline error:', errMsg);
+          addAuditLog(`Upload error (new pipeline): ${errMsg}`, 'error', shipmentId);
+          // Fall through to the old pipeline as a safety net.
+          console.warn('[upload] falling back to old pipeline');
+        }
+      }
+
+      // === OLD PIPELINE (legacy, used when NEXT_PUBLIC_INGRESS_URL is not set
+      // or the new pipeline failed) ===
+
       const detectDocType = (fileName: string): string => {
         const l = fileName.toLowerCase();
         if (l.includes('packing') || l.includes('pack')) return 'Packing List';
@@ -626,7 +711,7 @@ export function useShipments(deps: UseShipmentsDeps): UseShipmentsResult {
       addAuditLog(`Upload failed for ${shipmentId}: ${errMsg}`, 'error', shipmentId);
       return { shipmentId, success: false, error: errMsg };
     }
-  }, [rules, addAuditLog, refreshShipment, currentOrgIdRef]);
+  }, [addAuditLog, refreshShipment, currentOrgIdRef, apiFetchOrgRef]);
 
   // --- Update rules ---
   const updateRules = React.useCallback((newRules: Partial<OperationalRules>) => {

@@ -77,7 +77,7 @@ export default function BrokerTemplates() {
     } finally {
       setIsLoading(false);
     }
-  }, [currentOrgId]);
+  }, [currentOrgId, apiFetchOrg]);
 
   React.useEffect(() => {
     loadTemplates();

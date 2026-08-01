@@ -21,7 +21,7 @@ import {
   mapDbToException,
 } from '@/lib/supabase';
 import { logger } from '@/lib/utils/logger';
-import { AppError } from '@/lib/utils/error-handler';
+import { AppError } from '@/lib/errors';
 
 export interface PaginatedResult<T> {
   data: T[];

@@ -5,7 +5,7 @@ import { regexExtract } from '@/lib/extraction/regex-extract';
 import { callAIExtraction, isAIProviderConfigured } from '@/lib/extraction/ai-extract';
 import { mapToCanonicalSchema, type CanonicalField } from '@/lib/extraction/canonical-schema';
 import { runPipeline, type ShipmentDocument, type PipelineException } from '@/lib/extraction/pipeline';
-import { errorResponse } from '@/lib/utils/error-handler';
+import { errorResponse } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 
 const HTS_FIELDS = new Set(['htsCode','htsCodes','hts','hs_codes']);

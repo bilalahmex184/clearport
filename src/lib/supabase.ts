@@ -263,14 +263,106 @@ export function redirectToLogin(reason: string): void {
   window.location.href = loginUrl.href;
 }
 
+// ---------------------------------------------------------------------------
+// ApiFetchError — structured error thrown by apiFetch on non-2xx responses
+// ---------------------------------------------------------------------------
+// Reads the canonical ClearPort error-response shape produced by
+// `errorResponse()` in @/lib/errors:
+//   { error: <message>, code: <code>, details: <details|undefined> }
+//
+// Carries the structured fields (code, details, statusCode) so callers can
+// pattern-match on `err.code === 'NOT_FOUND'` etc. instead of regex-matching
+// the message text. Subclasses Error so existing `error.message` reads keep
+// working unchanged.
+// ---------------------------------------------------------------------------
+
+export class ApiFetchError extends Error {
+  readonly statusCode: number;
+  readonly code?: string;
+  readonly details?: unknown;
+
+  constructor(
+    message: string,
+    statusCode: number,
+    code?: string,
+    details?: unknown,
+  ) {
+    super(message);
+    this.name = 'ApiFetchError';
+    this.statusCode = statusCode;
+    this.code = code;
+    this.details = details;
+    Object.setPrototypeOf(this, ApiFetchError.prototype);
+  }
+}
+
+/**
+ * Parse a non-2xx Response body for the canonical { error, code, details }
+ * shape. Returns `{ parsed, rawText }` — `parsed` is null if the body isn't
+ * JSON or doesn't match the shape so callers can fall back to `rawText`.
+ * Reads the body exactly once (the Response body is a one-shot stream).
+ * Never throws.
+ */
+async function parseApiErrorBody(
+  res: Response,
+): Promise<{
+  parsed: { error?: string; code?: string; details?: unknown } | null;
+  rawText: string;
+}> {
+  let rawText = '';
+  try {
+    rawText = await res.text();
+  } catch {
+    /* ignore — body already consumed or not readable */
+    return { parsed: null, rawText: '' };
+  }
+  if (!rawText) return { parsed: null, rawText };
+  try {
+    const parsed = JSON.parse(rawText);
+    if (parsed && typeof parsed === 'object') {
+      // Accept the canonical flat shape { error, code, details } and (for
+      // backward-compat) the legacy nested shape { error: { code, message } }.
+      if (typeof (parsed as any).error === 'string') {
+        return {
+          parsed: {
+            error: (parsed as any).error,
+            code: (parsed as any).code,
+            details: (parsed as any).details,
+          },
+          rawText,
+        };
+      }
+      if (
+        (parsed as any).error &&
+        typeof (parsed as any).error === 'object' &&
+        typeof (parsed as any).error.message === 'string'
+      ) {
+        return {
+          parsed: {
+            error: (parsed as any).error.message,
+            code: (parsed as any).error.code,
+            details: (parsed as any).error.context,
+          },
+          rawText,
+        };
+      }
+    }
+  } catch {
+    /* not JSON — fall through with parsed=null */
+  }
+  return { parsed: null, rawText };
+}
+
 /**
  * Thin fetch() wrapper that:
- *  1. Ensures the session exists (so a JWT is available).
- *  2. Attaches `Authorization: Bearer <jwt>` to every request.
- *  3. Sets `Content-Type: application/json` for requests with a body.
- *  4. On 401: redirects the browser to /login (session expired), then throws.
- *  5. Throws an Error on other non-2xx responses (with the response body text
- *     for debugging) so callers can try/catch and fall back to seed data.
+ *   1. Ensures the session exists (so a JWT is available).
+ *   2. Attaches `Authorization: Bearer <jwt>` to every request.
+ *   3. Sets `Content-Type: application/json` for requests with a body.
+ *   4. On 401: redirects the browser to /login (session expired), then throws.
+ *   5. On other non-2xx responses: parses the canonical { error, code, details }
+ *      JSON shape and throws an ApiFetchError carrying those fields so callers
+ *      can pattern-match on `err.code` (e.g. 'NOT_FOUND') instead of regex-
+ *      matching the message text.
  *
  * Returns the parsed JSON body. For non-JSON responses (e.g. CSV), pass
  * `raw: true` to get the Response object back instead.
@@ -307,17 +399,30 @@ export async function apiFetch<T = any>(
   // Still throw so calling code with its own error handling isn't swallowed.
   if (res.status === 401) {
     redirectToLogin('API returned 401 — session expired');
-    throw new Error(`API ${path} failed (401): session expired`);
+    throw new ApiFetchError(
+      `API ${path} failed (401): session expired`,
+      401,
+      'UNAUTHORIZED',
+    );
   }
 
   if (!res.ok) {
-    let detail = '';
-    try {
-      detail = await res.text();
-    } catch {
-      /* ignore */
+    // Parse the canonical { error, code, details } shape so callers can
+    // pattern-match on err.code instead of regex-matching the message.
+    const { parsed, rawText } = await parseApiErrorBody(res);
+    if (parsed?.error) {
+      throw new ApiFetchError(
+        `API ${path} failed (${res.status}): ${parsed.error}`,
+        res.status,
+        parsed.code,
+        parsed.details,
+      );
     }
-    throw new Error(`API ${path} failed (${res.status}): ${detail}`);
+    // Body isn't JSON or doesn't match the shape — fall back to raw text.
+    throw new ApiFetchError(
+      `API ${path} failed (${res.status}): ${rawText}`,
+      res.status,
+    );
   }
 
   if (options.raw) {

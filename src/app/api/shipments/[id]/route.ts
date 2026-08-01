@@ -20,8 +20,8 @@ import {
 } from '@/lib/services/shipment.service';
 import { logDelete } from '@/lib/services/audit-log.service';
 import { updateShipmentSchema } from '@/lib/validators/shipment.validator';
-import { errorResponse } from '@/lib/utils/error-handler';
-import { AppError } from '@/lib/utils/error-handler';
+import { errorResponse } from '@/lib/errors';
+import { AppError } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 
 // ---------------------------------------------------------------------------

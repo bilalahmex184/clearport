@@ -1,5 +1,4 @@
 import type { NextConfig } from "next";
-import { withSentryConfig } from "@sentry/nextjs";
 
 const nextConfig: NextConfig = {
   output: "standalone",
@@ -26,9 +25,9 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default withSentryConfig(nextConfig, {
-  silent: true,
-  org: process.env.SENTRY_ORG,
-  project: process.env.SENTRY_PROJECT,
-  widenClientFileUpload: false,
-});
+// Sentry wrapper disabled for dev (causes webpack/turbopack conflicts in Next 16).
+// To re-enable in production:
+//   import { withSentryConfig } from "@sentry/nextjs";
+//   export default withSentryConfig(nextConfig, { silent: true });
+
+export default nextConfig;

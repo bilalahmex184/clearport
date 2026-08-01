@@ -4,7 +4,7 @@
 
 import { NextResponse } from 'next/server';
 import { requireOrgRole, getUserEmail } from '@/lib/services/auth.service';
-import { errorResponse, AppError } from '@/lib/utils/error-handler';
+import { errorResponse, AppError } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 import { applyTransform } from '@/lib/mapping/transform';
 

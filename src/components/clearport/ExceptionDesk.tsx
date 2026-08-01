@@ -100,7 +100,7 @@ export default function ExceptionDesk() {
     if (selectedException) {
       setActiveDocTab(selectedException.docType);
     }
-  }, [selectedException?.id]);
+  }, [selectedException?.id, selectedException]);
 
   // --- Render --------------------------------------------------------------
   // The onboarding banner is mounted above the content area when the user

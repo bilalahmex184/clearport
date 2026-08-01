@@ -17,7 +17,7 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireOrgRole } from '@/lib/services/auth.service';
 import { getAuditLogs } from '@/lib/services/audit-log.service';
-import { errorResponse } from '@/lib/utils/error-handler';
+import { errorResponse } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 
 const querySchema = z.object({

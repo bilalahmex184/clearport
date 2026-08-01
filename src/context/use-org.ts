@@ -120,7 +120,10 @@ export function useOrg(deps: UseOrgDeps): UseOrgResult {
   const userOrgsRef = React.useRef<typeof userOrgs>([]);
   React.useEffect(() => {
     currentOrgIdRef.current = currentOrgId;
-  }, [currentOrgId]);
+  }, [currentOrgId, currentOrgIdRef]);
+  React.useEffect(() => {
+    userOrgsRef.current = userOrgs;
+  }, [userOrgs, userOrgsRef]);
   React.useEffect(() => {
     userOrgsRef.current = userOrgs;
   }, [userOrgs]);
@@ -150,10 +153,10 @@ export function useOrg(deps: UseOrgDeps): UseOrgResult {
   // always fires after mount) sees the populated refs.
   React.useEffect(() => {
     apiFetchOrgRef.current = apiFetchOrg;
-  }, [apiFetchOrg]);
+  }, [apiFetchOrg, apiFetchOrgRef]);
   React.useEffect(() => {
     currentUserRef.current = currentUser;
-  }, [currentUser]);
+  }, [currentUser, currentUserRef]);
 
   // --- Real-time clock ---
   React.useEffect(() => {
@@ -287,7 +290,7 @@ export function useOrg(deps: UseOrgDeps): UseOrgResult {
   // the latest loadData without depending on it directly.
   React.useEffect(() => {
     loadDataRef.current = loadData;
-  }, [loadData]);
+  }, [loadData, loadDataRef]);
 
   // --- switchOrg: change the active org context and reload data ---
   const switchOrg = React.useCallback((orgId: string) => {
@@ -310,7 +313,7 @@ export function useOrg(deps: UseOrgDeps): UseOrgResult {
   // not a cascading render.
   React.useEffect(() => {
     loadData();
-  }, [loadData]);
+  }, [loadData, loadDataRef]);
 
   return {
     userOrgs,

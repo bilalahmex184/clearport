@@ -1,6 +1,5 @@
 import nextCoreWebVitals from "eslint-config-next/core-web-vitals";
 import nextTypescript from "eslint-config-next/typescript";
-import reactHooks from "eslint-plugin-react-hooks";
 import { dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -8,9 +7,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
-  plugins: {
-    "react-hooks": reactHooks,
-  },
+  // NOTE: "react-hooks" plugin is already registered by eslint-config-next
+  // (via nextTypescript above). Redefining it here triggers ESLint 9's
+  // "Cannot redefine plugin" error, so we only set rules below.
   rules: {
     // TypeScript rules
     "@typescript-eslint/no-explicit-any": "off",
@@ -20,9 +19,10 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "@typescript-eslint/prefer-as-const": "off",
     "@typescript-eslint/no-unused-disable-directive": "off",
     
-    // React rules — exhaustive-deps is off (too noisy for this codebase),
-    // but set-state-in-effect stays ON (real bug catcher)
-    "react-hooks/exhaustive-deps": "off",
+    // React rules — exhaustive-deps re-enabled (Phase 7 Step 2).
+    // This rule caught real shipped bugs in this repo's history.
+    // Do NOT disable it to make CI green faster — fix the warnings.
+    "react-hooks/exhaustive-deps": "warn",
     "react-hooks/purity": "off",
     "react-hooks/set-state-in-effect": "error",
     "react/no-unescaped-entities": "off",

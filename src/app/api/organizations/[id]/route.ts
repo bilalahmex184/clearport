@@ -15,7 +15,7 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireUserClient, getUserRole, getUserEmail } from '@/lib/services/auth.service';
-import { errorResponse, AppError } from '@/lib/utils/error-handler';
+import { errorResponse, AppError } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 import type { UserRole } from '@/lib/services/rbac.service';
 

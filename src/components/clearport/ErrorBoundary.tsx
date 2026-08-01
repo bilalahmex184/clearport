@@ -1,7 +1,7 @@
 'use client';
 
 import * as React from 'react';
-import * as Sentry from '@sentry/nextjs';
+
 
 // ---------------------------------------------------------------------------
 // ErrorBoundary — class component that catches render-time exceptions in its
@@ -47,7 +47,7 @@ export default class ErrorBoundary extends React.Component<
     // Report to Sentry. Wrapped in try/catch so a Sentry init failure can
     // never block the user's path to the Reload button.
     try {
-      Sentry.captureException(error, {
+      console.error("[ErrorBoundary]", error, {
         contexts: {
           react: { componentStack: errorInfo.componentStack },
         },

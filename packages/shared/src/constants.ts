@@ -17,7 +17,11 @@ export const DEFAULT_THRESHOLDS = {
   parties_threshold: 75,
 } as const;
 
-export const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
+// NOTE: MAX_FILE_SIZE_BYTES used to live here as `50 * 1024 * 1024` (50MB).
+// It has been superseded by the canonical 20MB server-side limit in
+// `./file-validation.ts` (which matches the `documents` bucket
+// `file_size_limit` set in supabase/migrations/016_bucket_size_limit.sql).
+// Import MAX_FILE_SIZE_BYTES from './file-validation' going forward.
 export const ALLOWED_MIME_TYPES = [
   'application/pdf',
   'image/png',

@@ -104,7 +104,7 @@ export default function DocumentViewer({
     })();
 
     return () => { cancelled = true; };
-  }, [selectedEntry?.id, activeDocTab, setDocumentUrl]);
+  }, [selectedEntry?.id, selectedEntry, activeDocTab, setDocumentUrl]);
 
   // Data-driven document tabs (derive from shipment fields, not hardcoded IDs)
   // Derive available doc types from BOTH fields' sourceDoc AND uploaded documents

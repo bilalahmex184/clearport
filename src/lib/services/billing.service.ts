@@ -10,9 +10,16 @@
 // What this stub does today:
 //   - getOrgPlan(client, orgId) — reads the plan from the org_subscriptions
 //     table (migration 025). Defaults to 'free' when no row exists.
-//   - checkUsageLimit(client, orgId) — counts documents the org has
-//     processed this calendar month, returns { count, limit, exceeded }.
-//     The limit comes from the usage_limits config table (plan → max_docs).
+//   - checkUsageLimit(client, orgId) — READ path. Counts documents the
+//     org has processed this calendar month, returns { count, limit,
+//     exceeded }. Used by the UI to render the usage progress bar. NOT
+//     race-safe — see enforceUsageLimitOrThrow for the write path.
+//   - enforceUsageLimitOrThrow(client, orgId) — WRITE path. Calls the
+//     enforce_usage_limit SQL function (migration 026), which acquires
+//     a FOR UPDATE lock on the org's usage_limits row inside the same
+//     transaction that performs the count + comparison. Throws
+//     UsageLimitExceededError (HTTP 429) when the org is at or over
+//     its monthly cap. Race-safe against concurrent enforcement calls.
 //   - upgradePlan(orgId, plan) — placeholder that throws a clear error so
 //     callers know Stripe isn't configured. This is the single point that
 //     a real Stripe integration would replace (Stripe Checkout Session
@@ -28,7 +35,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '@/lib/utils/logger';
-import { AppError } from '@/lib/utils/error-handler';
+import { AppError } from '@/lib/errors';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -52,6 +59,20 @@ export interface OrgSubscriptionRow {
   stripe_subscription_id: string | null;
   current_period_end: string | null;
   created_at: string;
+}
+
+/**
+ * Result of an atomic usage-limit enforcement check (write path).
+ * Mirrors the row returned by the `enforce_usage_limit` SQL function
+ * (migration 026). The `remaining` field is useful for surfacing a
+ * "N documents left this month" hint to the user before they hit the
+ * wall.
+ */
+export interface UsageEnforcementResult {
+  plan: Plan;
+  count: number;
+  limit: number;
+  remaining: number;
 }
 
 // Plan limits — mirrored in the usage_limits config table (migration 025).
@@ -177,6 +198,148 @@ export async function checkUsageLimit(
 
   const count = countRes.count ?? 0;
   return { count, limit, exceeded: count >= limit };
+}
+
+// ---------------------------------------------------------------------------
+// UsageLimitExceededError — typed error for the 429 path
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown by enforceUsageLimitOrThrow when an org has hit its monthly
+ * document cap. Maps to HTTP 429 (Too Many Requests). The code
+ * 'USAGE_LIMIT_EXCEEDED' matches the message raised by the
+ * enforce_usage_limit SQL function (migration 026) so the client can
+ * pattern-match on either the error.code or the HTTP status.
+ *
+ * Carries { orgId, count, limit } in `details` so the caller can
+ * surface "you've used 25 of 25 documents" in the upgrade prompt
+ * without a follow-up DB read.
+ */
+export class UsageLimitExceededError extends AppError {
+  constructor(orgId: string, count: number, limit: number) {
+    super(
+      `Monthly document limit reached (${count}/${limit}). Upgrade your plan to continue.`,
+      429,
+      'USAGE_LIMIT_EXCEEDED',
+      { orgId, count, limit },
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// enforceUsageLimitOrThrow — atomic write-path enforcement
+// ---------------------------------------------------------------------------
+//
+// DISTINCTION FROM checkUsageLimit:
+//   checkUsageLimit (above) is the READ path. It counts documents and
+//   returns { count, limit, exceeded } so the UI can render a progress
+//   bar ("12 / 25 documents this month"). It is NOT race-safe — 50
+//   concurrent upload requests can all read count=24, all see
+//   exceeded=false, and all proceed to insert, blowing past the cap by
+//   up to 50.
+//
+//   enforceUsageLimitOrThrow (below) is the WRITE path. It calls the
+//   enforce_usage_limit SQL function (migration 026), which acquires a
+//   FOR UPDATE lock on the org's usage_limits config row inside the
+//   same transaction that performs the count + comparison. Concurrent
+//   calls serialize on the lock, so the second call cannot read the
+//   count until the first call's transaction commits.
+//
+//   IMPORTANT CAVEAT: when called as a bare RPC (as this wrapper does),
+//   the lock is held only for the duration of the RPC. If the caller
+//   then does an application-level INSERT (e.g., a separate
+//   `client.from('documents').insert(...)`), that INSERT is NOT
+//   protected by the lock — the race window re-opens between the RPC
+//   return and the INSERT commit. For a fully race-safe write path,
+//   callers should use the insert_job_with_usage_check SQL function
+//   (also migration 026), which performs the check AND the INSERT
+//   inside a single transaction.
+//
+//   This wrapper is still useful as:
+//     - A fast pre-check before uploading bytes to storage (reject
+//       obviously-over-limit orgs before the upload).
+//     - The UI read path (when combined with checkUsageLimit for the
+//       progress bar).
+//     - The error path for non-upload endpoints that need to enforce
+//       the limit (e.g., a "process this shipment" action).
+// ---------------------------------------------------------------------------
+
+/**
+ * Atomically enforce the org's monthly document usage limit using a
+ * server-side FOR UPDATE lock. Throws UsageLimitExceededError (HTTP 429)
+ * if the org is at or over its limit. Call this inside the upload path
+ * BEFORE creating any document row or storage upload.
+ *
+ * This is the race-safe replacement for the read-only checkUsageLimit.
+ * The lock is held inside the Postgres function for the duration of the
+ * enforcement check, preventing concurrent requests from all passing.
+ */
+export async function enforceUsageLimitOrThrow(
+  client: SupabaseClient,
+  orgId: string,
+): Promise<UsageEnforcementResult> {
+  const { data, error } = await client.rpc('enforce_usage_limit', {
+    p_org_id: orgId,
+  });
+
+  if (error) {
+    // 42901 is the custom SQLSTATE raised by enforce_usage_limit when
+    // count >= limit. Map it to a typed 429 error so the API layer's
+    // errorResponse() can return a proper 429 to the client.
+    //
+    // For ANY other error code (DB connection lost, function not
+    // deployed, RLS denial, etc.), we rethrow rather than fail open.
+    // Failing open on an unexpected error would silently bypass the
+    // usage cap — the exact bug this enforcement is meant to prevent.
+    // Surface the error so it shows up in logs and Sentry.
+    if (error.code === '42901') {
+      // The RPC error doesn't carry the count/limit values back
+      // (RAISE EXCEPTION discards the function's RETURN values).
+      // We pass 0/0 as placeholders; the message is still actionable
+      // ("upgrade your plan"). If the caller needs exact numbers for
+      // the UI, they can call checkUsageLimit separately (it's cheap).
+      throw new UsageLimitExceededError(orgId, 0, 0);
+    }
+
+    logger.error('BillingService: enforce_usage_limit RPC failed', {
+      orgId,
+      errorCode: error.code,
+      errorMessage: error.message,
+    });
+    throw new AppError(
+      `Usage limit enforcement check failed: ${error.message}`,
+      500,
+      'USAGE_ENFORCEMENT_ERROR',
+      { orgId, errorCode: error.code },
+    );
+  }
+
+  // The RPC returns an array of rows (PostgREST convention for
+  // set-returning functions). enforce_usage_limit returns exactly one
+  // row on success. Normalize to a single object.
+  const row = Array.isArray(data) ? data[0] : data;
+
+  if (!row) {
+    // Should not happen — the function either returns a row or raises.
+    // Treat as an unexpected error (fail closed, not open).
+    logger.error('BillingService: enforce_usage_limit returned no row', {
+      orgId,
+      data,
+    });
+    throw new AppError(
+      'Usage limit enforcement check returned no result',
+      500,
+      'USAGE_ENFORCEMENT_ERROR',
+      { orgId },
+    );
+  }
+
+  return {
+    plan: isPlan(row.plan) ? row.plan : DEFAULT_PLAN,
+    count: Number(row.count) || 0,
+    limit: Number(row.limit) || 0,
+    remaining: Number(row.remaining) || 0,
+  };
 }
 
 // ---------------------------------------------------------------------------

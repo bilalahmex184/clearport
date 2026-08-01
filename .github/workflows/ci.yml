@@ -1,34 +1,51 @@
+# ============================================================================
+# CI — Continuous Integration checks
+# ============================================================================
+# Runs on every push + PR. Fails fast on:
+#   1. bun.lock out of sync with package.json (frozen-lockfile)
+#   2. Lint errors
+#   3. Unit tests
+# ============================================================================
+
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
 
 jobs:
-  lint-and-typecheck:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install
-      - run: bun run lint
-      - run: bunx tsc --noEmit
 
-  deprecated-import-guard:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check no file outside /deprecated/ imports from /deprecated/
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Step 4: Fail if package.json and bun.lock are out of sync.
+      # --frozen-lockfile means bun install will fail if the lockfile
+      # doesn't match package.json. This prevents accidental drift.
+      - name: Install dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Type check
+        run: bun run typecheck
+
+      - name: Unit tests
+        run: bun run test
+
+      # Phase 1 quarantine check: no file outside /deprecated/ may import from it.
+      - name: Check no imports from /deprecated/
         run: |
-          # Search for imports from deprecated/ in any .ts/.tsx file outside deprecated/
-          VIOLATIONS=$(grep -r --include='*.ts' --include='*.tsx' \
-            -l 'from.*deprecated/\|import.*deprecated/' \
-            src/ apps/ packages/ 2>/dev/null || true)
-          if [ -n "$VIOLATIONS" ]; then
-            echo "ERROR: The following files import from /deprecated/ — this is forbidden:"
-            echo "$VIOLATIONS"
+          if grep -r "from.*deprecated/" --include="*.ts" --include="*.tsx" src/ apps/ packages/ 2>/dev/null; then
+            echo "❌ Found imports from /deprecated/ in live code"
             exit 1
+          else
+            echo "✅ No imports from /deprecated/"
           fi
-          echo "OK: No imports from /deprecated/ found outside the quarantine zone."

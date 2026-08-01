@@ -17,7 +17,7 @@
 
 import { NextResponse, type NextRequest } from 'next/server';
 import { logger } from '@/lib/utils/logger';
-import { toErrorResponse, getHttpStatus, ClearPortError } from '@/lib/errors';
+import { errorResponse as buildErrorResponse } from '@/lib/errors';
 
 // Compatibility stubs — these functions were in the old observability/logger
 // module (now quarantined to /deprecated/). The middleware uses them for
@@ -188,13 +188,12 @@ export function withMiddleware(handler: RouteHandler): (req: Request) => Promise
         request_id: requestId,
       });
 
-      const errorResponse = toErrorResponse(err, requestId);
-      const status = getHttpStatus(err);
-
-      return NextResponse.json(errorResponse, {
-        status,
-        headers: { 'X-Request-Id': requestId },
-      });
+      // Build the canonical { error, code, details } JSON response via the
+      // consolidated errorResponse() helper. The X-Request-Id header is
+      // attached so the client can correlate the failure with a log line.
+      const response = buildErrorResponse(err);
+      response.headers.set('X-Request-Id', requestId);
+      return response;
     }
   };
 }

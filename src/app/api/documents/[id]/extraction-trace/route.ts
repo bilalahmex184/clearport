@@ -22,7 +22,7 @@
 
 import { NextResponse } from 'next/server';
 import { requireOrgRole } from '@/lib/services/auth.service';
-import { errorResponse, AppError } from '@/lib/utils/error-handler';
+import { errorResponse, AppError } from '@/lib/errors';
 import { logger } from '@/lib/utils/logger';
 
 export interface ExtractionAttempt {

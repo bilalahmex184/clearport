@@ -2,10 +2,14 @@
   "name": "@clearport/ingress",
   "private": true,
   "scripts": {
-    "dev": "echo 'Phase 3: Cloudflare Worker for upload ingress'",
-    "deploy": "echo 'Phase 3: wrangler deploy'"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@clearport/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
   }
 }

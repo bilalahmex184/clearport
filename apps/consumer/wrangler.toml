@@ -1,0 +1,62 @@
+# ============================================================================
+# wrangler.toml — ClearPort consumer Worker (Phase 3, Step 2)
+# ============================================================================
+# Triggered by:
+#   1. Cloudflare Queue "extraction-jobs" — each message is { job_id }.
+#      Written by the ingress Worker (Phase 3 Step 1) after a successful
+#      upload. The consumer claims the job race-safely via claim_job RPC,
+#      runs the extraction pipeline, and records every tier attempt to the
+#      job_attempts audit ledger.
+#   2. Cron Trigger every 1 minute — calls reclaim_stuck_jobs_v2() to
+#      reset any 'processing' job past the 5-minute TTL back to 'pending'.
+#      This is the dead-job recovery sweep (Phase 3 Step 3): a job that
+#      needs this sweep is a signal something upstream is slow or crashing
+#      — the scheduled() handler logs every reset at WARN.
+#
+# TODO(phase-4): after measuring p99 pipeline latency, tune the TTL threshold
+#   to ~2x p99. Update reclaim_stuck_jobs_v2() in 002_async_jobs.sql AND
+#   the claim_job WHERE clause (both currently use 5 minutes). The spec says
+#   "do not guess this number, measure it first" — Phase 4 measures.
+# ============================================================================
+
+name = "clearport-consumer"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+SUPABASE_URL = ""
+# SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY → secrets (set via
+# `wrangler secret put`). The service-role key bypasses RLS and is
+# server-side only — never logged, never in client builds.
+
+# Queue consumer binding — reads from the queue the ingress Worker writes to.
+# Each message body is { job_id: string }. The consumer calls claim_job RPC
+# to atomically claim; if another consumer already claimed (or the job is
+# already terminal), claim_job returns zero rows and the consumer acks the
+# message without doing any work. This is the race-safe pattern.
+[[queues.consumers]]
+queue = "extraction-jobs"
+max_batch_size = 1           # one message per batch (one document)
+max_concurrency = 3          # conservative — tune upward after Phase 5 metrics
+max_retries = 3              # queue-level retry (DB-level retry is in jobs.attempts)
+
+# Cron Trigger — dead-job recovery every 1 minute (Phase 3 Step 3).
+# reclaim_stuck_jobs_v2() resets 'processing' jobs past the 5-min TTL back
+# to 'pending' so a crashed consumer doesn't permanently block the queue.
+[triggers]
+crons = ["* * * * *"]
+
+# KV namespace for the OpenRouter circuit breaker (Phase 5 Step 2).
+# Stores the breaker state (closed/open/half_open), consecutive failure
+# count, and opened-at timestamp per provider. The breaker is a SOFT guard
+# (KV is eventually consistent) — it avoids wasting the 18s tier-1 latency
+# budget on a provider that's down; the next tier (PDF text / Tesseract)
+# is the real fallback.
+#
+# The namespace ID is empty in the repo. Create it per-environment:
+#   wrangler kv:namespace create CIRCUIT_BREAKER_KV
+# Then paste the returned ID below (or set it via wrangler env / CI).
+[[kv_namespaces]]
+binding = "CIRCUIT_BREAKER_KV"
+id = "a974a932f1b84a9aae0a571e0ce99b1f"  # CIRCUIT_BREAKER_KV

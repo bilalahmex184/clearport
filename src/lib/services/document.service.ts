@@ -9,7 +9,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { DbDocument } from '@/lib/clearport-types';
 import { logger } from '@/lib/utils/logger';
-import { AppError } from '@/lib/utils/error-handler';
+import { AppError } from '@/lib/errors';
 
 const SIGNED_URL_TTL_SECONDS = 3600; // 1 hour — matches the edge function
 const STORAGE_BUCKET = 'documents';
