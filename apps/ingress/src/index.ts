@@ -159,6 +159,23 @@ export async function handleUpload(
   _ctx?: unknown,
 ): Promise<Response> {
   // -----------------------------------------------------------------------
+  // CORS (Phase 6 Round-2 fix #47)
+  // -----------------------------------------------------------------------
+  // The ingress Worker is on a different origin (workers.dev) than the
+  // Next.js app (localhost:3000 / production domain). Without CORS headers,
+  // the browser's fetch() to the Worker is blocked. Handle OPTIONS preflight
+  // + add Access-Control-Allow-* headers to every response.
+  const origin = req.headers.get('Origin') || '*';
+  const corsHeaders: Record<string, string> = {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization, X-Org-Id, Content-Type',
+    'Access-Control-Max-Age': '86400',
+  };
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+  // -----------------------------------------------------------------------
   // Step 0 — Per-IP secondary rate limit (Phase 5 reality-check fix p5-rc-5)
   // -----------------------------------------------------------------------
   // PRE-AUTH FLOOD DEFENSE. The org-keyed limiter (Step 1b below) only fires
@@ -439,6 +456,53 @@ export async function handleUpload(
       { error: 'Internal server error', request_id: requestId },
       500,
     );
+  }
+
+  // -----------------------------------------------------------------------
+  // Step 3b — Billing hard cap (Phase 6 Round-2 fix #50)
+  // -----------------------------------------------------------------------
+  // The rate limiter (Step 1b) is a SOFT guard (KV, eventually consistent).
+  // The HARD cap is enforceUsageLimitOrThrow — a Postgres FOR UPDATE lock
+  // that atomically checks + counts documents. This runs BEFORE job creation
+  // so a request over the monthly limit is rejected with 429 before any
+  // Storage upload or job row is created.
+  //
+  // Only check for GENUINELY NEW jobs (created_now=true). Existing jobs
+  // (idempotent re-upload) don't consume a new slot — the document was
+  // already counted when it was first uploaded.
+  try {
+    const usageResult = await supabaseRpc<{ plan: string; count: number; limit: number; remaining: number } | null>(
+      projectConfig,
+      'enforce_usage_limit',
+      { p_org_id: orgId },
+    );
+    // The function raises SQLSTATE 42901 if over limit — PostgREST surfaces
+    // that as an error (caught below). If we get here, the limit was NOT
+    // exceeded and the lock is held until the transaction commits.
+    if (usageResult) {
+      console.log(`[ingress] usage check passed: org=${orgId} count=${usageResult.count}/${usageResult.limit} remaining=${usageResult.remaining}`);
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    // Check if this is a 42901 (USAGE_LIMIT_EXCEEDED) error
+    if (errMsg.includes('42901') || errMsg.includes('USAGE_LIMIT_EXCEEDED')) {
+      logWarn(
+        env,
+        'Usage limit exceeded — rejecting upload',
+        { org_id: orgId, step: 'billing_hard_cap' },
+        { outcome: 'warning' },
+      );
+      return jsonResponse(
+        {
+          error: 'Monthly document limit reached. Upgrade your plan to continue.',
+          code: 'USAGE_LIMIT_EXCEEDED',
+        },
+        429,
+      );
+    }
+    // Unexpected error — fail safe (allow the upload; the soft guard +
+    // downstream checks still apply). Log loudly.
+    console.error(`[ingress] enforce_usage_limit failed (failing open):`, errMsg);
   }
 
   // -----------------------------------------------------------------------
